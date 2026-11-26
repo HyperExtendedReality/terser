@@ -1,13 +1,74 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Terser">
   <defs>
-    <linearGradient id="terserGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#14B8A6"/>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="55%" stop-color="#0B1120"/>
+      <stop offset="100%" stop-color="#090D1A"/>
+    </linearGradient>
+    <linearGradient id="rimGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2DD4BF" stop-opacity="0.7"/>
+      <stop offset="50%" stop-color="#06B6D4" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#818CF8" stop-opacity="0.7"/>
+    </linearGradient>
+    <radialGradient id="coreGlow" cx="50%" cy="46%" r="48%">
+      <stop offset="0%" stop-color="#14B8A6" stop-opacity="0.32"/>
+      <stop offset="55%" stop-color="#6366F1" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#0B1120" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="topBarGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2DD4BF"/>
+      <stop offset="50%" stop-color="#22D3EE"/>
+      <stop offset="100%" stop-color="#818CF8"/>
+    </linearGradient>
+    <linearGradient id="stemGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#22D3EE"/>
+      <stop offset="55%" stop-color="#14B8A6"/>
       <stop offset="100%" stop-color="#6366F1"/>
     </linearGradient>
+    <linearGradient id="chevronL" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5EEAD4"/>
+      <stop offset="100%" stop-color="#0D9488"/>
+    </linearGradient>
+    <linearGradient id="chevronR" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#A5B4FC"/>
+      <stop offset="100%" stop-color="#6366F1"/>
+    </linearGradient>
+    <linearGradient id="diamondGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ECFEFF"/>
+      <stop offset="45%" stop-color="#5EEAD4"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
   </defs>
-  <rect x="24" y="24" width="208" height="208" rx="44" fill="url(#terserGrad)"/>
-  <circle cx="96" cy="108" r="34" fill="none" stroke="#FFFFFF" stroke-width="14"/>
-  <circle cx="160" cy="108" r="34" fill="none" stroke="#FFFFFF" stroke-width="14"/>
-  <circle cx="128" cy="160" r="34" fill="none" stroke="#FFFFFF" stroke-width="14"/>
-  <polygon points="128,112 114,136 126,136 121,154 142,128 130,128" fill="#FDE047"/>
+
+  <!-- Obsidian squircle badge -->
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#bgGrad)"/>
+  <rect x="14" y="14" width="228" height="228" rx="52" fill="none" stroke="url(#rimGrad)" stroke-width="3"/>
+
+  <!-- Ambient center glow -->
+  <circle cx="128" cy="122" r="96" fill="url(#coreGlow)"/>
+
+  <!-- Subtle outer noisy token ticks (representing uncompressed input on top) -->
+  <g opacity="0.38" fill="#5EEAD4">
+    <rect x="48" y="48" width="22" height="5" rx="2.5"/>
+    <rect x="78" y="48" width="38" height="5" rx="2.5"/>
+    <rect x="124" y="48" width="18" height="5" rx="2.5"/>
+    <rect x="150" y="48" width="34" height="5" rx="2.5"/>
+    <rect x="192" y="48" width="16" height="5" rx="2.5"/>
+  </g>
+
+  <!-- Stylized T compression funnel top bar -->
+  <path d="M52 68 H204 L186 94 H70 Z" fill="url(#topBarGrad)"/>
+
+  <!-- Inward compression chevrons (code brackets squeezing context) -->
+  <path d="M54 114 L92 142 L54 170 L68 170 L106 142 L68 114 Z" fill="url(#chevronL)" opacity="0.92"/>
+  <path d="M202 114 L164 142 L202 170 L188 170 L150 142 L188 114 Z" fill="url(#chevronR)" opacity="0.92"/>
+
+  <!-- Central tapered T stem (funneling into condensed signal) -->
+  <path d="M111 102 H145 L139 178 L128 194 L117 178 Z" fill="url(#stemGrad)"/>
+
+  <!-- Luminous lossless core diamond -->
+  <polygon points="128,122 142,142 128,162 114,142" fill="url(#diamondGrad)"/>
+
+  <!-- Razor-sharp distilled output pulse -->
+  <rect x="108" y="206" width="40" height="6" rx="3" fill="#2DD4BF" opacity="0.9"/>
 </svg>
