@@ -94,13 +94,6 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
             raw = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 cfg.update(raw)
-                for old_k, new_k in (
-                    ("codemunch_auto_reindex", "index_auto_reindex"),
-                    ("codemunch_grep_answer", "index_grep_answer"),
-                    ("codemunch_surface", "index_surface"),
-                ):
-                    if old_k in raw and new_k not in raw:
-                        cfg[new_k] = raw[old_k]
     except (OSError, json.JSONDecodeError, ValueError):
         pass
 

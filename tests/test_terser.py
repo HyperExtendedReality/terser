@@ -367,8 +367,7 @@ class LoopGuardAndHostDispatchTests(unittest.TestCase):
         for rel in ("mcp_config.json", ".mcp.json", ".claude-plugin/plugin.json"):
             doc = json.loads((ROOT / rel).read_text(encoding="utf-8"))
             env_map = doc["mcpServers"]["terser-index"]["env"]
-            self.assertEqual(env_map["JCODEMUNCH_TOOL_SURFACE"], "counter")
-            self.assertEqual(env_map["JCODEMUNCH_SHARE_SAVINGS"], "0")
+            self.assertEqual(env_map["TERSER_TOOL_SURFACE"], "counter")
 
         # Verify AGENTS.md stays lean and includes quality-preserving guardrails
         agents_md = (ROOT / "rules" / "AGENTS.md").read_text(encoding="utf-8")
@@ -691,6 +690,26 @@ class NativeFastPathTests(unittest.TestCase):
         self.assertIsNotNone(exp)
         assert exp is not None
         self.assertIn("L1: beta unique_needle", exp)
+
+    def test_builtin_terser_index_mcp_server(self) -> None:
+        from runtime import index_mcp
+
+        ws = self.tmp / "indexed_ws"
+        ws.mkdir()
+        (ws / "calc.py").write_text(
+            "class Calculator:\n    def add_numbers(self, a, b):\n        return a + b\n",
+            encoding="utf-8",
+        )
+        res = index_mcp.index_folder(str(ws), env=self.env)
+        self.assertEqual(res["files"], 1)
+        self.assertGreaterEqual(res["symbols"], 2)
+        repo = res["repo"]
+
+        found = index_mcp.dispatch_action("search_symbols", {"repo": repo, "query": "add_numbers"}, env=self.env)
+        self.assertTrue(found["matches"])
+        sym_id = found["matches"][0]["id"]
+        src = index_mcp.dispatch_action("get_symbol_source", {"repo": repo, "symbol_id": sym_id}, env=self.env)
+        self.assertIn("return a + b", src["source"])
 
 
 if __name__ == "__main__":

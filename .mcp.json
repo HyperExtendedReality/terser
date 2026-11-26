@@ -1,13 +1,16 @@
 {
   "mcpServers": {
     "terser-index": {
-      "command": "uvx",
+      "command": "python3",
       "args": [
-        "jcodemunch-mcp"
+        "-E",
+        "-s",
+        "-X",
+        "utf8",
+        "${CLAUDE_PLUGIN_ROOT}/runtime/index_mcp.py"
       ],
       "env": {
-        "JCODEMUNCH_TOOL_SURFACE": "counter",
-        "JCODEMUNCH_SHARE_SAVINGS": "0"
+        "TERSER_TOOL_SURFACE": "counter"
       }
     }
   }

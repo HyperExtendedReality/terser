@@ -84,7 +84,7 @@ def audit_workspace(cwd: str, *, home: Path | None = None) -> dict[str, Any]:
     ag_plugins = home_dir / ".gemini" / "config" / "plugins"
     if ag_plugins.is_dir():
         legacy = [
-            name for name in ("jcodemunch", "token-optimizer", "tokeneconomizer")
+            name for name in ("token-fusion", "token-optimizer", "tokeneconomizer")
             if (ag_plugins / name).is_dir()
         ]
         if (ag_plugins / "terser").is_dir() and legacy:

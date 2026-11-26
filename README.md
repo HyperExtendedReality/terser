@@ -81,8 +81,8 @@ flowchart LR
 
 ## Requirements
 
-- **Python 3.10+** (pure stdlib — no `pip install` required for the core runtime)
-- Optional (for the 6-tool AST index front door): `uvx` (or the AST code-index MCP binary) available on `PATH`
+- **Python 3.10+** (pure stdlib — zero `pip install` or external MCP packages required; the `terser-index` AST MCP server is built in)
+- Optional: **Rust (`cargo`)** to compile the default-on `terser-fast` hot-path locally (prebuilt binaries are also fetched from GitHub Releases automatically)
 
 ---
 

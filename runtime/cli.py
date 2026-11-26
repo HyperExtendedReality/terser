@@ -226,15 +226,19 @@ def _cmd_doctor(host: str, cwd: str) -> int:
         print(f"  [PASS] AST Index MCP   : {' '.join(idx_cmd)}")
     else:
         print("  [WARN] AST Index MCP   : AST code-index MCP binary / `uvx` not found on PATH")
-    for label, p in (
-        ("Antigravity manifest", _PLUGIN_ROOT / "plugin.json"),
-        ("Antigravity hooks", _PLUGIN_ROOT / "hooks.json"),
-        ("Antigravity MCP", _PLUGIN_ROOT / "mcp_config.json"),
-        ("Claude manifest", _PLUGIN_ROOT / ".claude-plugin" / "plugin.json"),
-        ("Claude hooks", _PLUGIN_ROOT / "hooks" / "hooks.json"),
-        ("Codex manifest", _PLUGIN_ROOT / ".codex-plugin" / "plugin.json"),
-        ("Codex hooks", _PLUGIN_ROOT / "hooks" / "codex-hooks.json"),
-    ):
+    is_repo_root = (_PLUGIN_ROOT / ".claude-plugin").is_dir() or (_PLUGIN_ROOT / ".codex-plugin").is_dir()
+    checks: list[tuple[str, Path, bool]] = [
+        ("Antigravity manifest", _PLUGIN_ROOT / "plugin.json", host == "antigravity" or is_repo_root),
+        ("Antigravity hooks", _PLUGIN_ROOT / "hooks.json", host == "antigravity" or is_repo_root),
+        ("Antigravity MCP", _PLUGIN_ROOT / "mcp_config.json", host == "antigravity" or is_repo_root),
+        ("Claude manifest", _PLUGIN_ROOT / ".claude-plugin" / "plugin.json", host == "claude" or is_repo_root),
+        ("Claude hooks", _PLUGIN_ROOT / "hooks" / "hooks.json", host == "claude" or is_repo_root),
+        ("Codex manifest", _PLUGIN_ROOT / ".codex-plugin" / "plugin.json", host == "codex" or is_repo_root),
+        ("Codex hooks", _PLUGIN_ROOT / "hooks" / "codex-hooks.json", host == "codex" or is_repo_root),
+    ]
+    for label, p, required in checks:
+        if not required and not p.is_file():
+            continue
         try:
             json.loads(p.read_text(encoding="utf-8"))
             print(f"  [PASS] {label:<20}: {p.relative_to(_PLUGIN_ROOT)}")

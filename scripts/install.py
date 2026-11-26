@@ -165,23 +165,17 @@ def _build_antigravity_hooks(plugin_dir: Path, python_exe: str) -> dict[str, Any
     }
 
 
-def _build_mcp_config(client_id: str) -> dict[str, Any]:
-    idx_bin = shutil.which("jcodemunch-mcp")
-    if idx_bin:
-        command = idx_bin
-        args: list[str] = []
-    else:
-        command = shutil.which("uvx") or "uvx"
-        args = ["jcodemunch-mcp"]
+def _build_mcp_config(client_id: str, plugin_dir: Path | None = None) -> dict[str, Any]:
+    root = plugin_dir or PLUGIN_ROOT
+    index_mcp = str(root / "runtime" / "index_mcp.py")
     return {
         "mcpServers": {
             "terser-index": {
-                "command": command,
-                "args": args,
+                "command": _resolve_python(),
+                "args": ["-E", "-s", "-X", "utf8", index_mcp],
                 "env": {
-                    "JCODEMUNCH_CLIENT_ID": client_id,
-                    "JCODEMUNCH_TOOL_SURFACE": "counter",
-                    "JCODEMUNCH_SHARE_SAVINGS": "0",
+                    "TERSER_CLIENT_ID": client_id,
+                    "TERSER_TOOL_SURFACE": "counter",
                 },
             }
         }
@@ -218,8 +212,8 @@ def install_antigravity(*, dest_root: Path | None = None, dry_run: bool = False)
         # Write platform-native direct-Python hooks.json (eliminates shell-fallback latency on Windows)
         hooks_doc = _build_antigravity_hooks(target, python_exe)
         (target / "hooks.json").write_text(json.dumps(hooks_doc, indent=2) + "\n", encoding="utf-8")
-        # Write machine-resolved mcp_config.json with Counter front door enforced
-        mcp_doc = _build_mcp_config("antigravity")
+        # Write machine-resolved mcp_config.json with bundled terser-index Counter front door
+        mcp_doc = _build_mcp_config("antigravity", plugin_dir=target)
         (target / "mcp_config.json").write_text(json.dumps(mcp_doc, indent=2) + "\n", encoding="utf-8")
         # Record Antigravity consent so bundled rollup works seamlessly
         to_cfg = _antigravity_home() / "token-optimizer" / "config.json"
@@ -267,13 +261,13 @@ _CODEX_END = "# END terser"
 def _render_codex_toml_block() -> str:
     mcp = _build_mcp_config("codex")["mcpServers"]["terser-index"]
     cmd = str(mcp["command"]).replace("\\", "\\\\")
-    args_toml = ", ".join(f'"{a}"' for a in mcp["args"])
+    args_toml = ", ".join('"' + str(a).replace("\\", "\\\\") + '"' for a in mcp["args"])
     return (
         f"{_CODEX_BEGIN}\n"
         "[mcp_servers.terser-index]\n"
         f'command = "{cmd}"\n'
         f"args = [{args_toml}]\n"
-        'env = { JCODEMUNCH_CLIENT_ID = "codex", JCODEMUNCH_TOOL_SURFACE = "counter", JCODEMUNCH_SHARE_SAVINGS = "0" }\n'
+        'env = { TERSER_CLIENT_ID = "codex", TERSER_TOOL_SURFACE = "counter" }\n'
         f"{_CODEX_END}\n"
     )
 

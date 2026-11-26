@@ -1,12 +1,17 @@
 {
   "mcpServers": {
     "terser-index": {
-      "command": "jcodemunch-mcp",
-      "args": [],
+      "command": "python",
+      "args": [
+        "-E",
+        "-s",
+        "-X",
+        "utf8",
+        "runtime/index_mcp.py"
+      ],
       "env": {
-        "JCODEMUNCH_CLIENT_ID": "antigravity",
-        "JCODEMUNCH_TOOL_SURFACE": "counter",
-        "JCODEMUNCH_SHARE_SAVINGS": "0"
+        "TERSER_CLIENT_ID": "antigravity",
+        "TERSER_TOOL_SURFACE": "counter"
       }
     }
   }
