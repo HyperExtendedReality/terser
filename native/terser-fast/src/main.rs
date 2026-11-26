@@ -102,6 +102,12 @@ fn delegate_to_python(args: &Args, raw_stdin: &[u8]) -> i32 {
         return EXIT_DELEGATE;
     };
     let mut cmd = Command::new(py);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     cmd.args(["-E", "-s", "-X", "utf8", script]);
     if let Some(ref h) = args.host {
         cmd.args(["--host", h]);
@@ -393,7 +399,15 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
     let prog_args = &raw_args[idx + 1..];
     let cmd_str = raw_args[idx..].join(" ");
 
-    let output = match Command::new(prog).args(prog_args).output() {
+    let mut cmd = Command::new(prog);
+    cmd.args(prog_args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = match cmd.output() {
         Ok(o) => o,
         Err(e) => {
             let _ = writeln!(io::stderr(), "[Terser] Failed to execute {prog}: {e}");
