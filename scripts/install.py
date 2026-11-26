@@ -42,6 +42,7 @@ def _codex_home() -> Path:
 
 
 _HOT_EVENTS = frozenset({"PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart"})
+_RELEASE_BASE = "https://github.com/HyperExtendedReality/terser/releases/latest/download"
 
 
 def _native_bin_name() -> str:
@@ -52,17 +53,60 @@ def _native_bin_path(plugin_dir: Path) -> Path:
     return plugin_dir / "bin" / _native_bin_name()
 
 
+def _release_asset_name() -> str | None:
+    import platform
+
+    arch = platform.machine().lower()
+    if sys.platform == "win32" and arch in ("amd64", "x86_64"):
+        return "terser-fast-windows-x86_64.exe"
+    if sys.platform == "darwin" and arch in ("arm64", "aarch64"):
+        return "terser-fast-macos-aarch64"
+    if sys.platform.startswith("linux") and arch in ("x86_64", "amd64"):
+        return "terser-fast-linux-x86_64"
+    return None
+
+
+def _download_native() -> Path | None:
+    """Download prebuilt terser-fast binary from GitHub Releases (fail-open)."""
+    import stat
+    import urllib.request
+
+    asset = _release_asset_name()
+    if not asset:
+        return None
+    url = f"{_RELEASE_BASE}/{asset}"
+    dest = _native_bin_path(PLUGIN_ROOT)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": "terser-installer/1.2"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if getattr(resp, "status", 200) != 200:
+                return None
+            data = resp.read()
+        if len(data) < 32_768:
+            return None
+        tmp.write_bytes(data)
+        if os.name != "nt":
+            tmp.chmod(tmp.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        os.replace(tmp, dest)
+        print(f"[Native] Downloaded prebuilt hot-path binary from Releases ({dest.stat().st_size:,} B)")
+        return dest
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+
 def build_native() -> Path | None:
-    """Compile the optional Rust hot-path accelerator (terser-fast) into bin/."""
+    """Compile the Rust hot-path accelerator (terser-fast) into bin/."""
     import subprocess
 
     cargo = shutil.which("cargo")
     manifest = PLUGIN_ROOT / "native" / "terser-fast" / "Cargo.toml"
-    if not cargo:
-        print("[Native] `cargo` not found on PATH — skipping Rust hot-path build (pure-Python fallback active).")
-        return None
-    if not manifest.is_file():
-        print(f"[Native] Cargo manifest missing at {manifest}")
+    if not cargo or not manifest.is_file():
         return None
     print(f"[Native] Building Rust hot-path accelerator ({manifest})...")
     proc = subprocess.run([cargo, "build", "--release", "--manifest-path", str(manifest)])
@@ -71,13 +115,27 @@ def build_native() -> Path | None:
         return None
     built = PLUGIN_ROOT / "native" / "terser-fast" / "target" / "release" / _native_bin_name()
     if not built.is_file():
-        print(f"[Native] Expected binary not found at {built}")
         return None
     dest = _native_bin_path(PLUGIN_ROOT)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(built, dest)
     print(f"  Installed native binary at {dest} ({dest.stat().st_size:,} B)")
     return dest
+
+
+def ensure_native(*, force_rebuild: bool = False) -> Path | None:
+    """Ensure bin/terser-fast is ready: reuse existing -> build with cargo -> download release -> Python fallback."""
+    existing = _native_bin_path(PLUGIN_ROOT)
+    if existing.is_file() and not force_rebuild:
+        return existing
+    built = build_native()
+    if built:
+        return built
+    downloaded = _download_native()
+    if downloaded:
+        return downloaded
+    print("[Native] Rust hot-path unavailable (no cargo / offline) — using pure-Python fallback.")
+    return None
 
 
 def _build_antigravity_hooks(plugin_dir: Path, python_exe: str) -> dict[str, Any]:
@@ -406,7 +464,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--claude", action="store_true", help="Print Claude Code plugin install/update commands")
     ap.add_argument("--all", action="store_true", help="Install/configure for Antigravity 2.0, Codex, and Claude Code")
     ap.add_argument("--build-dist", action="store_true", help="Build standalone dist/ bundles for all 3 platforms")
-    ap.add_argument("--build-native", action="store_true", help="Build optional Rust hot-path accelerator (bin/terser-fast)")
+    ap.add_argument("--build-native", action="store_true", help="Force-rebuild the Rust hot-path accelerator (bin/terser-fast)")
+    ap.add_argument("--no-native", action="store_true", help="Skip Rust hot-path accelerator and use pure-Python hooks")
     ap.add_argument("--bump", choices=("patch", "minor"), default=None, help="Bump version across all manifests so Claude/Codex plugin caches refresh cleanly")
     ap.add_argument("--uninstall", action="store_true", help="Uninstall from selected targets")
     ap.add_argument("--dry-run", action="store_true", help="Preview changes without writing")
@@ -419,7 +478,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.bump:
         bump_version(args.bump)
     if args.build_native:
-        build_native()
+        ensure_native(force_rebuild=True)
+    elif not args.no_native and not args.uninstall and not args.dry_run and any((args.antigravity, args.codex, args.all)):
+        ensure_native(force_rebuild=False)
     if args.build_dist:
         build_dist()
     if args.antigravity or args.all:

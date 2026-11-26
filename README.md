@@ -204,16 +204,16 @@ python scripts/benchmark.py
 # Bump semantic version across all manifests & rebuild standalone dist/ bundles
 python scripts/install.py --bump patch --build-dist
 
-# Optional: build the native Rust hot-path accelerator (~10ms hook latency, 14x faster)
+# Force-rebuild the Rust hot-path accelerator (~10ms hook latency, 14x faster)
 python scripts/install.py --build-native --antigravity
 
 # Run Rust unit tests
 cargo test --manifest-path native/terser-fast/Cargo.toml
 ```
 
-### Optional Native Rust Hot-Path (`terser-fast`)
+### Native Rust Hot-Path (`terser-fast`, Default-On)
 
-Terser works out-of-the-box with pure Python stdlib. If you have Rust (`cargo`) installed—or download a prebuilt binary from [GitHub Releases](https://github.com/HyperExtendedReality/terser/releases)—the ~390 KB native binary (`native/terser-fast/` → `bin/terser-fast`) cuts `PreToolUse` hook latency from **~147 ms → ~10 ms (14.1× faster)**:
+`scripts/install.py` enables the ~390 KB native Rust hot-path binary (`native/terser-fast/` → `bin/terser-fast`) **by default** (reusing an existing build, compiling with `cargo` if installed, or downloading the matching prebuilt binary from [GitHub Releases](https://github.com/HyperExtendedReality/terser/releases)), cutting `PreToolUse` hook latency from **~147 ms → ~10 ms (14.1× faster)**. Pass `--no-native` (or install offline without Rust) to fall back seamlessly to pure Python stdlib.
 
 - **Native fast paths:** Read Funnel T0/T3, MCP refetch dedup, Loop Guard, `SubagentStart` brief, `terser-fast compress` (ANSI/OSC-8 strip, lockfile diff elision, Cargo/Go/pytest/npm/pnpm/pip/uv stream filters, duplicate-line collapse), and `terser-fast exec` (zero-overhead Antigravity `run_command` wrapper with tee-on-failure).
 - **Transparent Python fallback:** Cold-path and rich operations (AST outlines, unified diffs, FormRepair, command delta-diff, SQLite FTS5 archival, audit/dashboard) delegate seamlessly to Python while sharing the exact same `~/.terser/` state files.
