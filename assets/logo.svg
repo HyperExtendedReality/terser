@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Terser">
+  <defs>
+    <linearGradient id="terserGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#14B8A6"/>
+      <stop offset="100%" stop-color="#6366F1"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="208" height="208" rx="44" fill="url(#terserGrad)"/>
+  <circle cx="96" cy="108" r="34" fill="none" stroke="#FFFFFF" stroke-width="14"/>
+  <circle cx="160" cy="108" r="34" fill="none" stroke="#FFFFFF" stroke-width="14"/>
+  <circle cx="128" cy="160" r="34" fill="none" stroke="#FFFFFF" stroke-width="14"/>
+  <polygon points="128,112 114,136 126,136 121,154 142,128 130,128" fill="#FDE047"/>
+</svg>

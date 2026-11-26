@@ -1,0 +1,15 @@
+{
+  "name": "terser",
+  "displayName": "Terser",
+  "version": "1.2.0",
+  "description": "Unified token-efficiency suite for Antigravity 2.0, Claude Code, and Codex: 4-tier read funnel (dedup, delta diffs, outline-first), 6-tool AST code index front door, lossless output compression, FormRepair, micro-skills, tool pruning, and unified loop guard.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "Terser"
+  },
+  "suggestedPrompts": [
+    "Show Terser status, token savings, and session quality grade",
+    "Index this repo and map its key symbols and architecture with minimal tokens",
+    "Audit this project's token waste, micro-skills, and unused tools"
+  ]
+}

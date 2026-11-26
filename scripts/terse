@@ -1,0 +1,14 @@
+#!/bin/sh
+# Terser — POSIX CLI launcher.
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PLUGIN_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+CLI_PY="$PLUGIN_ROOT/runtime/cli.py"
+
+for py in "${TERSER_PYTHON:-}" python3 /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3 python; do
+  [ -n "$py" ] || continue
+  if command -v "$py" >/dev/null 2>&1; then
+    exec "$py" -X utf8 "$CLI_PY" "$@"
+  fi
+done
+echo "Terser: python3 not found on PATH." >&2
+exit 1

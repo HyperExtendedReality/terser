@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "terser",
+  "displayName": "Terser",
+  "version": "1.2.0",
+  "description": "Unified token-efficiency plugin combining jCodeMunch (6-tool AST Counter front door), Token Optimizer (4-tier read funnel, lossless output compression, smart compaction, quality scoring, dashboard), and TokenEconomizer (micro-skills, FormRepair, tool pruning, loop guard).",
+  "author": {
+    "name": "Terser"
+  },
+  "license": "MIT",
+  "commands": "./commands/",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "keywords": [
+    "tokens",
+    "optimization",
+    "ast",
+    "context",
+    "compression",
+    "micro-skills",
+    "tool-pruning",
+    "mcp"
+  ],
+  "mcpServers": {
+    "terser-codemunch": {
+      "command": "uvx",
+      "args": [
+        "jcodemunch-mcp"
+      ],
+      "env": {
+        "JCODEMUNCH_CLIENT_ID": "claude",
+        "JCODEMUNCH_TOOL_SURFACE": "counter",
+        "JCODEMUNCH_SHARE_SAVINGS": "0"
+      }
+    }
+  }
+}

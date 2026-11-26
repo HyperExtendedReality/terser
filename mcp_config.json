@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "terser-codemunch": {
+      "command": "jcodemunch-mcp",
+      "args": [],
+      "env": {
+        "JCODEMUNCH_CLIENT_ID": "antigravity",
+        "JCODEMUNCH_TOOL_SURFACE": "counter",
+        "JCODEMUNCH_SHARE_SAVINGS": "0"
+      }
+    }
+  }
+}

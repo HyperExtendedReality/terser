@@ -1,0 +1,13 @@
+#!/bin/sh
+# Terser — POSIX hook launcher (minimal-PATH safe, fail-open).
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PLUGIN_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+HOOK_PY="$PLUGIN_ROOT/runtime/unified_hook.py"
+
+for py in "${TERSER_PYTHON:-}" python3 /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3 python; do
+  [ -n "$py" ] || continue
+  if command -v "$py" >/dev/null 2>&1; then
+    exec "$py" -E -s -X utf8 "$HOOK_PY" "$@"
+  fi
+done
+exit 0

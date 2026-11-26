@@ -1,0 +1,26 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "terser",
+  "description": "Unified token-efficiency plugin for Antigravity 2.0, Claude Code, and Codex.",
+  "owner": {
+    "name": "Terser"
+  },
+  "plugins": [
+    {
+      "name": "terser",
+      "source": "./",
+      "displayName": "Terser",
+      "version": "1.2.0",
+      "description": "Combines jCodeMunch AST retrieval (Counter front door), Token Optimizer compression/continuity/dashboard, and TokenEconomizer micro-skills/FormRepair/tool pruning/loop guard into one fast plugin.",
+      "category": "productivity",
+      "tags": [
+        "tokens",
+        "ast",
+        "compression",
+        "context",
+        "micro-skills",
+        "tool-pruning"
+      ]
+    }
+  ]
+}

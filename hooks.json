@@ -1,0 +1,49 @@
+{
+  "terser": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./scripts/terse-hook --host antigravity --event SessionStart || scripts\\terse-hook.cmd --host antigravity --event SessionStart",
+        "timeout": 10
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./scripts/terse-hook --host antigravity --event PreInvocation || scripts\\terse-hook.cmd --host antigravity --event PreInvocation",
+        "timeout": 10
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_command|read_file|view_file|call_mcp_tool|mcp_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/terse-hook --host antigravity --event PreToolUse || scripts\\terse-hook.cmd --host antigravity --event PreToolUse",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "run_command|read_file|view_file|edit_file|write_file|call_mcp_tool|mcp_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/terse-hook --host antigravity --event PostToolUse || scripts\\terse-hook.cmd --host antigravity --event PostToolUse",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./scripts/terse-hook --host antigravity --event Stop || scripts\\terse-hook.cmd --host antigravity --event Stop",
+        "timeout": 15
+      }
+    ]
+  }
+}

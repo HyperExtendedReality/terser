@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "terser-codemunch": {
+      "command": "uvx",
+      "args": [
+        "jcodemunch-mcp"
+      ],
+      "env": {
+        "JCODEMUNCH_TOOL_SURFACE": "counter",
+        "JCODEMUNCH_SHARE_SAVINGS": "0"
+      }
+    }
+  }
+}

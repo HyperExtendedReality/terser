@@ -1,0 +1,40 @@
+{
+  "name": "terser",
+  "version": "1.2.0",
+  "description": "Unified token-efficiency plugin for Codex: 4-tier read funnel, 6-tool AST code index front door, lossless output compression, cross-session micro-skills, tool pruning, continuity restore, and unified loop guard.",
+  "author": {
+    "name": "Terser"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "hooks": "./hooks/codex-hooks.json",
+  "keywords": [
+    "tokens",
+    "optimization",
+    "ast",
+    "context",
+    "micro-skills",
+    "tool-pruning",
+    "codex"
+  ],
+  "interface": {
+    "displayName": "Terser",
+    "shortDescription": "Maximum token savings without losing output quality.",
+    "longDescription": "Unifies AST symbol retrieval (6-tool Counter front door), 4-tier read deduplication/delta/outline funnel, lossless command output compression, cross-session repo micro-skills, unused tool pruning, and loop intervention into one zero-conflict engine.",
+    "developerName": "Terser",
+    "category": "Developer Tools",
+    "capabilities": [
+      "AST symbol retrieval",
+      "4-tier read funnel",
+      "Lossless output compression",
+      "Cross-session micro-skills & tool pruning",
+      "Session continuity & quality scoring"
+    ],
+    "defaultPrompt": [
+      "Show Terser status, token savings, and session quality grade.",
+      "Audit this project's token waste, micro-skills, and unused tools.",
+      "Use code-munch to map key symbols and trace blast radius with minimal tokens."
+    ],
+    "brandColor": "#0F766E"
+  }
+}
