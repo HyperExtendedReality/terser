@@ -22,7 +22,7 @@ from typing import Any
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 IGNORE = shutil.ignore_patterns(
-    "__pycache__", "*.pyc", "*.pyo", ".pytest_cache", ".DS_Store", "dist", "tests",
+    ".git", "__pycache__", "*.pyc", "*.pyo", ".pytest_cache", ".DS_Store", "dist", "tests",
 )
 TERSER_MARKER = "terser"
 
@@ -41,14 +41,54 @@ def _codex_home() -> Path:
     return Path(os.path.expanduser(raw)) if raw else (Path.home() / ".codex")
 
 
+_HOT_EVENTS = frozenset({"PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart"})
+
+
+def _native_bin_name() -> str:
+    return "terser-fast.exe" if os.name == "nt" else "terser-fast"
+
+
+def _native_bin_path(plugin_dir: Path) -> Path:
+    return plugin_dir / "bin" / _native_bin_name()
+
+
+def build_native() -> Path | None:
+    """Compile the optional Rust hot-path accelerator (terser-fast) into bin/."""
+    import subprocess
+
+    cargo = shutil.which("cargo")
+    manifest = PLUGIN_ROOT / "native" / "terser-fast" / "Cargo.toml"
+    if not cargo:
+        print("[Native] `cargo` not found on PATH — skipping Rust hot-path build (pure-Python fallback active).")
+        return None
+    if not manifest.is_file():
+        print(f"[Native] Cargo manifest missing at {manifest}")
+        return None
+    print(f"[Native] Building Rust hot-path accelerator ({manifest})...")
+    proc = subprocess.run([cargo, "build", "--release", "--manifest-path", str(manifest)])
+    if proc.returncode != 0:
+        print("[Native] Cargo build failed — falling back to pure Python.")
+        return None
+    built = PLUGIN_ROOT / "native" / "terser-fast" / "target" / "release" / _native_bin_name()
+    if not built.is_file():
+        print(f"[Native] Expected binary not found at {built}")
+        return None
+    dest = _native_bin_path(PLUGIN_ROOT)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(built, dest)
+    print(f"  Installed native binary at {dest} ({dest.stat().st_size:,} B)")
+    return dest
+
+
 def _build_antigravity_hooks(plugin_dir: Path, python_exe: str) -> dict[str, Any]:
     hook_py = str(plugin_dir / "runtime" / "unified_hook.py")
-    if os.name == "nt":
-        def cmd(event: str) -> str:
-            return f'"{python_exe}" -E -s -X utf8 "{hook_py}" --host antigravity --event {event}'
-    else:
-        def cmd(event: str) -> str:
-            return f'"{python_exe}" -E -s -X utf8 "{hook_py}" --host antigravity --event {event}'
+    fast_bin = _native_bin_path(plugin_dir)
+    use_native = fast_bin.is_file()
+
+    def cmd(event: str) -> str:
+        if use_native and event in _HOT_EVENTS:
+            return f'"{fast_bin}" --python "{python_exe}" --script "{hook_py}" --host antigravity --event {event}'
+        return f'"{python_exe}" -E -s -X utf8 "{hook_py}" --host antigravity --event {event}'
 
     return {
         "terser": {
@@ -68,16 +108,16 @@ def _build_antigravity_hooks(plugin_dir: Path, python_exe: str) -> dict[str, Any
 
 
 def _build_mcp_config(client_id: str) -> dict[str, Any]:
-    jcm = shutil.which("jcodemunch-mcp")
-    if jcm:
-        command = jcm
+    idx_bin = shutil.which("jcodemunch-mcp")
+    if idx_bin:
+        command = idx_bin
         args: list[str] = []
     else:
         command = shutil.which("uvx") or "uvx"
         args = ["jcodemunch-mcp"]
     return {
         "mcpServers": {
-            "terser-codemunch": {
+            "terser-index": {
                 "command": command,
                 "args": args,
                 "env": {
@@ -111,8 +151,8 @@ def install_antigravity(*, dest_root: Path | None = None, dry_run: bool = False)
         PLUGIN_ROOT,
         target,
         ignore=shutil.ignore_patterns(
-            "__pycache__", "*.pyc", "*.pyo", ".pytest_cache", ".DS_Store",
-            "dist", "tests", ".claude-plugin", ".codex-plugin", ".mcp.json",
+            ".git", "__pycache__", "*.pyc", "*.pyo", ".pytest_cache", ".DS_Store",
+            "dist", "tests", "native", ".claude-plugin", ".codex-plugin", ".mcp.json",
             "commands", "hooks",
         ),
     )
@@ -123,7 +163,7 @@ def install_antigravity(*, dest_root: Path | None = None, dry_run: bool = False)
         # Write machine-resolved mcp_config.json with Counter front door enforced
         mcp_doc = _build_mcp_config("antigravity")
         (target / "mcp_config.json").write_text(json.dumps(mcp_doc, indent=2) + "\n", encoding="utf-8")
-        # Record Token Optimizer Antigravity consent so vendored rollup works seamlessly
+        # Record Antigravity consent so bundled rollup works seamlessly
         to_cfg = _antigravity_home() / "token-optimizer" / "config.json"
         to_cfg.parent.mkdir(parents=True, exist_ok=True)
         existing: dict[str, Any] = {}
@@ -155,6 +195,9 @@ def uninstall_antigravity(*, dry_run: bool = False) -> None:
 def _codex_hook_command(plugin_dir: Path, event: str) -> str:
     py = _resolve_python()
     hook_py = str(plugin_dir / "runtime" / "unified_hook.py")
+    fast_bin = _native_bin_path(plugin_dir)
+    if fast_bin.is_file() and event in _HOT_EVENTS:
+        return f'"{fast_bin}" --python "{py}" --script "{hook_py}" --host codex --event {event}'
     # Shell-neutral bare exe + quoted args works identically in cmd.exe, pwsh, and POSIX sh
     return f'{py} -E -s -X utf8 "{hook_py}" --host codex --event {event}'
 
@@ -164,12 +207,12 @@ _CODEX_END = "# END terser"
 
 
 def _render_codex_toml_block() -> str:
-    mcp = _build_mcp_config("codex")["mcpServers"]["terser-codemunch"]
+    mcp = _build_mcp_config("codex")["mcpServers"]["terser-index"]
     cmd = str(mcp["command"]).replace("\\", "\\\\")
     args_toml = ", ".join(f'"{a}"' for a in mcp["args"])
     return (
         f"{_CODEX_BEGIN}\n"
-        "[mcp_servers.terser-codemunch]\n"
+        "[mcp_servers.terser-index]\n"
         f'command = "{cmd}"\n'
         f"args = [{args_toml}]\n"
         'env = { JCODEMUNCH_CLIENT_ID = "codex", JCODEMUNCH_TOOL_SURFACE = "counter", JCODEMUNCH_SHARE_SAVINGS = "0" }\n'
@@ -242,7 +285,7 @@ def install_codex(*, dry_run: bool = False) -> Path:
     hooks_path.parent.mkdir(parents=True, exist_ok=True)
     hooks_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
 
-    # Idempotently register terser-codemunch (Counter surface) in ~/.codex/config.toml
+    # Idempotently register terser-index (Counter surface) in ~/.codex/config.toml
     cur_toml = config_toml.read_text(encoding="utf-8", errors="replace") if config_toml.is_file() else ""
     cleaned_toml = _strip_codex_toml_block(cur_toml).rstrip()
     new_toml = (cleaned_toml + "\n\n" if cleaned_toml else "") + _render_codex_toml_block()
@@ -296,7 +339,7 @@ def build_dist(out_dir: Path | None = None) -> Path:
         PLUGIN_ROOT,
         cc_bundle,
         ignore=shutil.ignore_patterns(
-            "__pycache__", "*.pyc", "*.pyo", ".pytest_cache", ".DS_Store",
+            ".git", "__pycache__", "*.pyc", "*.pyo", ".pytest_cache", ".DS_Store",
             "dist", "tests", "plugin.json", "hooks.json", "mcp_config.json",
         ),
     )
@@ -363,17 +406,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--claude", action="store_true", help="Print Claude Code plugin install/update commands")
     ap.add_argument("--all", action="store_true", help="Install/configure for Antigravity 2.0, Codex, and Claude Code")
     ap.add_argument("--build-dist", action="store_true", help="Build standalone dist/ bundles for all 3 platforms")
+    ap.add_argument("--build-native", action="store_true", help="Build optional Rust hot-path accelerator (bin/terser-fast)")
     ap.add_argument("--bump", choices=("patch", "minor"), default=None, help="Bump version across all manifests so Claude/Codex plugin caches refresh cleanly")
     ap.add_argument("--uninstall", action="store_true", help="Uninstall from selected targets")
     ap.add_argument("--dry-run", action="store_true", help="Preview changes without writing")
     args = ap.parse_args(argv)
 
-    if not any((args.antigravity, args.codex, args.claude, args.all, args.build_dist, args.bump)):
+    if not any((args.antigravity, args.codex, args.claude, args.all, args.build_dist, args.build_native, args.bump)):
         ap.print_help()
         return 0
 
     if args.bump:
         bump_version(args.bump)
+    if args.build_native:
+        build_native()
     if args.build_dist:
         build_dist()
     if args.antigravity or args.all:

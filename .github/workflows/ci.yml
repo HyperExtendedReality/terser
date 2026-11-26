@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test Rust hot-path (terser-fast)
+        run: cargo test --manifest-path native/terser-fast/Cargo.toml
+
+      - name: Build Rust release binary
+        run: python scripts/install.py --build-native
+
+      - name: Run Python & native integration test suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Run doctor & benchmark smoke check
+        run: |
+          python runtime/cli.py doctor
+          python scripts/benchmark.py

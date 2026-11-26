@@ -99,12 +99,12 @@ class OutputCompressorTests(unittest.TestCase):
             assert archived is not None
             self.assertIn("FAILED tests/test_auth.py::test_login", archived)
 
-    def test_rtk_filters_cargo_and_go_preserve_errors(self) -> None:
+    def test_stream_filters_cargo_and_go_preserve_errors(self) -> None:
         cargo_raw = (
             "".join(f"   Compiling crate_{i} v0.1.0\n" for i in range(15))
             + "error[E0308]: mismatched types\n  --> src/main.rs:42:5\n"
         )
-        out = output_compressor.apply_rtk_filters(cargo_raw, "cargo build")
+        out = output_compressor.apply_stream_filters(cargo_raw, "cargo build")
         self.assertIn("compile/download status lines omitted", out)
         self.assertIn("error[E0308]: mismatched types", out)
 
@@ -112,7 +112,7 @@ class OutputCompressorTests(unittest.TestCase):
             "".join(f"=== RUN   TestCase{i}\n--- PASS: TestCase{i} (0.00s)\n" for i in range(12))
             + "--- FAIL: TestAuth (0.02s)\nFAIL\tpkg/auth\t0.15s\n"
         )
-        go_out = output_compressor.apply_rtk_filters(go_raw, "go test ./...")
+        go_out = output_compressor.apply_stream_filters(go_raw, "go test ./...")
         self.assertIn("passing RUN/PASS lines omitted", go_out)
         self.assertIn("--- FAIL: TestAuth", go_out)
 
@@ -236,13 +236,13 @@ class ReadFunnelTests(unittest.TestCase):
 
     def test_mcp_refetch_guard(self) -> None:
         args = {"repo": "app", "query": "auth"}
-        self.assertIsNone(read_funnel.check_mcp_refetch("sess-5", "codemunch:search_symbols", args, cfg=self.cfg, env=self.env))
+        self.assertIsNone(read_funnel.check_mcp_refetch("sess-5", "terser-index:search_symbols", args, cfg=self.cfg, env=self.env))
         # Duplicate within window soft-denies once
-        res = read_funnel.check_mcp_refetch("sess-5", "codemunch:search_symbols", args, cfg=self.cfg, env=self.env)
+        res = read_funnel.check_mcp_refetch("sess-5", "terser-index:search_symbols", args, cfg=self.cfg, env=self.env)
         self.assertIsNotNone(res)
         # Mutating tools are never blocked
-        self.assertIsNone(read_funnel.check_mcp_refetch("sess-5", "codemunch:index_folder", args, cfg=self.cfg, env=self.env))
-        self.assertIsNone(read_funnel.check_mcp_refetch("sess-5", "codemunch:index_folder", args, cfg=self.cfg, env=self.env))
+        self.assertIsNone(read_funnel.check_mcp_refetch("sess-5", "terser-index:index_folder", args, cfg=self.cfg, env=self.env))
+        self.assertIsNone(read_funnel.check_mcp_refetch("sess-5", "terser-index:index_folder", args, cfg=self.cfg, env=self.env))
 
 
 class LoopGuardAndHostDispatchTests(unittest.TestCase):
@@ -366,14 +366,14 @@ class LoopGuardAndHostDispatchTests(unittest.TestCase):
         # Verify Counter front door enforced across all MCP configs
         for rel in ("mcp_config.json", ".mcp.json", ".claude-plugin/plugin.json"):
             doc = json.loads((ROOT / rel).read_text(encoding="utf-8"))
-            env_map = doc["mcpServers"]["terser-codemunch"]["env"]
+            env_map = doc["mcpServers"]["terser-index"]["env"]
             self.assertEqual(env_map["JCODEMUNCH_TOOL_SURFACE"], "counter")
             self.assertEqual(env_map["JCODEMUNCH_SHARE_SAVINGS"], "0")
 
-        # Verify AGENTS.md stays lean and includes Ponytail quality-preserving guardrails
+        # Verify AGENTS.md stays lean and includes quality-preserving guardrails
         agents_md = (ROOT / "rules" / "AGENTS.md").read_text(encoding="utf-8")
         self.assertLessEqual(config.estimate_tokens(agents_md), 220)
-        self.assertIn("Ponytail", agents_md)
+        self.assertIn("Pragmatic minimalism", agents_md)
         self.assertIn("Never cut validation, error handling, security, or accessibility", agents_md)
 
     def test_cli_doctor_and_status_exit_zero(self) -> None:
@@ -548,6 +548,149 @@ class ResearchUpgradesTests(unittest.TestCase):
         # core.py is imported by all 5 modules, so it must rank first
         first_entry = rmap1.splitlines()[1]
         self.assertIn("core.py", first_entry)
+
+
+class NativeFastPathTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="terser-native-test-"))
+        self.env = {**os.environ, "TERSER_HOME": str(self.tmp / "state")}
+        self.fast_bin = ROOT / "bin" / ("terser-fast.exe" if os.name == "nt" else "terser-fast")
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run_fast(self, event: str, payload: dict, *, host: str = "antigravity", with_py: bool = True) -> subprocess.CompletedProcess:
+        cmd = [str(self.fast_bin), "--host", host, "--event", event]
+        if with_py:
+            cmd.extend(["--python", sys.executable, "--script", str(ROOT / "runtime" / "unified_hook.py")])
+        return subprocess.run(
+            cmd,
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=self.env,
+            timeout=15,
+        )
+
+    def test_native_fast_path_read_funnel_mcp_loop_guard_and_delegation(self) -> None:
+        if not self.fast_bin.is_file():
+            self.skipTest("Optional Rust binary bin/terser-fast not built")
+
+        ver = subprocess.run([str(self.fast_bin), "--version"], capture_output=True, text=True, timeout=5)
+        self.assertEqual(ver.returncode, 0)
+        self.assertIn("terser-fast", ver.stdout)
+
+        # 1. Tier 3 first read -> silent passthrough; Tier 0 repeat -> deny; retry -> passthrough
+        sample = self.tmp / "small.py"
+        sample.write_text("x = 1\ny = 2\n", encoding="utf-8")
+        read_payload = {
+            "conversationId": "conv-native-1",
+            "toolCall": {"name": "read_file", "args": {"Path": str(sample)}},
+        }
+        p1 = self._run_fast("PreToolUse", read_payload, with_py=False)
+        self.assertEqual(p1.returncode, 0)
+        self.assertEqual(p1.stdout.strip(), "")
+
+        p2 = self._run_fast("PreToolUse", read_payload, with_py=False)
+        self.assertEqual(p2.returncode, 0)
+        d2 = json.loads(p2.stdout)
+        self.assertEqual(d2["decision"], "deny")
+        self.assertIn("unchanged", d2["reason"])
+
+        p3 = self._run_fast("PreToolUse", read_payload, with_py=False)
+        self.assertEqual(p3.returncode, 0)
+        self.assertEqual(p3.stdout.strip(), "")
+
+        # 2. MCP read-only refetch guard handled natively
+        mcp_payload = {
+            "conversationId": "conv-native-1",
+            "toolCall": {
+                "name": "call_mcp_tool",
+                "args": {"ServerName": "terser-index", "ToolName": "search_symbols", "Arguments": {"q": "foo"}},
+            },
+        }
+        m1 = self._run_fast("PreToolUse", mcp_payload, with_py=False)
+        self.assertEqual(m1.returncode, 0)
+        self.assertEqual(m1.stdout.strip(), "")
+        m2 = self._run_fast("PreToolUse", mcp_payload, with_py=False)
+        self.assertEqual(m2.returncode, 0)
+        self.assertEqual(json.loads(m2.stdout)["decision"], "deny")
+
+        # 3. SubagentStart handled natively
+        sub = self._run_fast("SubagentStart", {"session_id": "s-sub"}, host="claude", with_py=False)
+        self.assertEqual(sub.returncode, 0)
+        self.assertIn("Terser Subagent", sub.stdout)
+
+        # 4. Loop guard on PostToolUse (3 identical failures -> nudge)
+        fail_payload = {
+            "session_id": "s-loop-native",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(sample)},
+            "error": "boom",
+        }
+        self._run_fast("PostToolUse", fail_payload, host="claude", with_py=False)
+        self._run_fast("PostToolUse", fail_payload, host="claude", with_py=False)
+        l3 = self._run_fast("PostToolUse", fail_payload, host="claude", with_py=False)
+        self.assertEqual(l3.returncode, 0)
+        self.assertIn("failed 3x in a row", l3.stdout)
+
+        # 5. Delegation to Python when needed (e.g. cold-path SessionStart)
+        cold = self._run_fast("SessionStart", {"conversationId": "conv-cold"}, host="antigravity", with_py=True)
+        self.assertEqual(cold.returncode, 0)
+
+        # 6. Native `compress` subcommand (Cargo stream filter + ANSI strip + error preservation)
+        noisy = "\x1b[32m   Compiling a v0.1\x1b[0m\n   Compiling b v0.1\n   Compiling c v0.1\nerror[E0425]: cannot find value\n"
+        comp = subprocess.run(
+            [str(self.fast_bin), "compress", "--cmd", "cargo build"],
+            input=noisy,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=5,
+        )
+        self.assertEqual(comp.returncode, 0)
+        self.assertIn("error[E0425]", comp.stdout)
+        self.assertNotIn("Compiling a", comp.stdout)
+
+        # 7. Native `exec` subcommand (preserves exit code & tee-on-failure)
+        ok_exec = subprocess.run(
+            [str(self.fast_bin), "exec", "--", sys.executable, "-c", "print('hello native exec')"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=self.env,
+            timeout=10,
+        )
+        self.assertEqual(ok_exec.returncode, 0)
+        self.assertIn("hello native exec", ok_exec.stdout)
+
+        fail_exec = subprocess.run(
+            [str(self.fast_bin), "exec", "--", sys.executable, "-c", "import sys; print('RAW_FAIL'); sys.exit(7)"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            env=self.env,
+            timeout=10,
+        )
+        self.assertEqual(fail_exec.returncode, 7)
+        self.assertIn("RAW_FAIL", fail_exec.stdout)
+
+    def test_sandbox_last_shortcut_and_size_pruning(self) -> None:
+        aid1 = context_sandbox.store_output("alpha line\n" * 40, command="cmd1", env=self.env)
+        aid2 = context_sandbox.store_output("beta unique_needle\n" * 40, command="cmd2", env=self.env)
+        self.assertIsNotNone(aid1)
+        self.assertIsNotNone(aid2)
+        self.assertEqual(context_sandbox.get_latest_archive_id(env=self.env), aid2)
+        res = context_sandbox.query_output("--last", "unique_needle", env=self.env)
+        self.assertIsNotNone(res)
+        assert res is not None
+        self.assertIn("unique_needle", res)
+        exp = context_sandbox.expand_output("--last", start_line=1, end_line=2, env=self.env)
+        self.assertIsNotNone(exp)
+        assert exp is not None
+        self.assertIn("L1: beta unique_needle", exp)
 
 
 if __name__ == "__main__":

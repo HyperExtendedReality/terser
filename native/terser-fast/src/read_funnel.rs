@@ -1,0 +1,393 @@
+use crate::config::{
+    atomic_write_json, canonical_json, now_secs, record_savings, safe_sid_filename, state_home,
+    valid_sid, Config,
+};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_SNAPSHOT_BYTES: usize = 128 * 1024;
+const MAX_STORE_ENTRIES: usize = 160;
+const SOFT_DENY_CAP: i64 = 1;
+
+const MUTATING_OR_LIVE_MCP_TOKENS: &[&str] = &[
+    "write", "edit", "create", "delete", "remove", "drop", "update", "patch", "put", "post",
+    "send", "submit", "publish", "deploy", "run", "exec", "execute", "invoke", "trigger", "start",
+    "stop", "kill", "cancel", "status", "poll", "wait", "watch", "tail", "logs", "time", "now",
+    "clock", "health", "ping", "refresh", "invalidate", "register", "index",
+];
+
+pub enum FunnelOutcome {
+    Allow,
+    Deny(String),
+    Delegate,
+}
+
+fn cache_path(sid: &str) -> PathBuf {
+    state_home()
+        .join("read-cache")
+        .join(format!("{}.json", safe_sid_filename(sid)))
+}
+
+fn norm_path(file_path: &str) -> String {
+    let p = Path::new(file_path);
+    let abs = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut s = abs.to_string_lossy().to_string();
+    // Strip Windows verbatim prefix \\?\ so keys match Python os.path.abspath()
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        s = stripped.to_string();
+    }
+    if cfg!(windows) {
+        s.to_ascii_lowercase()
+    } else {
+        s
+    }
+}
+
+fn load_store(sid: &str) -> Map<String, Value> {
+    let p = cache_path(sid);
+    let mut root = Map::new();
+    if let Ok(text) = fs::read_to_string(&p) {
+        if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&text) {
+            root = m;
+        }
+    }
+    if !matches!(root.get("reads"), Some(Value::Object(_))) {
+        root.insert("reads".into(), Value::Object(Map::new()));
+    }
+    if !matches!(root.get("mcp"), Some(Value::Object(_))) {
+        root.insert("mcp".into(), Value::Object(Map::new()));
+    }
+    if !matches!(root.get("meta"), Some(Value::Object(_))) {
+        root.insert("meta".into(), Value::Object(Map::new()));
+    }
+    root
+}
+
+fn save_store(sid: &str, store: &mut Map<String, Value>) {
+    for bucket_key in ["reads", "mcp"] {
+        if let Some(Value::Object(bucket)) = store.get_mut(bucket_key) {
+            if bucket.len() > MAX_STORE_ENTRIES {
+                let mut items: Vec<(String, f64)> = bucket
+                    .iter()
+                    .map(|(k, v)| {
+                        let ts = v.get("ts").and_then(|t| t.as_f64()).unwrap_or(0.0);
+                        (k.clone(), ts)
+                    })
+                    .collect();
+                items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let keep: std::collections::HashSet<String> = items
+                    .into_iter()
+                    .take(MAX_STORE_ENTRIES)
+                    .map(|(k, _)| k)
+                    .collect();
+                bucket.retain(|k, _| keep.contains(k));
+            }
+        }
+    }
+    atomic_write_json(&cache_path(sid), &Value::Object(store.clone()));
+}
+
+fn range_covered(
+    prev_start: Option<i64>,
+    prev_end: Option<i64>,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> bool {
+    if prev_start.is_none() && prev_end.is_none() {
+        return true;
+    }
+    if start.is_none() && end.is_none() {
+        return false;
+    }
+    let ps = prev_start.unwrap_or(1);
+    let s = start.unwrap_or(1);
+    if s < ps {
+        return false;
+    }
+    if let Some(pe) = prev_end {
+        if end.is_none() || end.unwrap() > pe {
+            return false;
+        }
+    }
+    true
+}
+
+fn format_range(start: Option<i64>, end: Option<i64>) -> String {
+    match (start, end) {
+        (None, None) => "full file".to_string(),
+        (Some(s), Some(e)) => format!("L{s}-L{e}"),
+        (Some(s), None) => format!("from L{s}"),
+        (None, Some(e)) => format!("L1-L{e}"),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn opt_i64(val: Option<&Value>) -> Option<i64> {
+    match val? {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+pub fn check_read(
+    sid: &str,
+    file_path: &str,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+    byte_offset: Option<i64>,
+    cfg: &Config,
+    host: &str,
+) -> FunnelOutcome {
+    if !cfg.read_cache || sid.is_empty() || !valid_sid(sid) || file_path.is_empty() {
+        return FunnelOutcome::Allow;
+    }
+    if byte_offset.unwrap_or(0) > 0 {
+        return FunnelOutcome::Allow;
+    }
+
+    let target = Path::new(file_path);
+    let meta = match fs::metadata(target) {
+        Ok(m) if m.is_file() && m.len() <= MAX_FILE_BYTES => m,
+        _ => return FunnelOutcome::Allow,
+    };
+
+    let raw_bytes = match fs::read(target) {
+        Ok(b) => b,
+        Err(_) => return FunnelOutcome::Allow,
+    };
+    let probe_len = raw_bytes.len().min(4096);
+    if raw_bytes[..probe_len].contains(&0u8) {
+        return FunnelOutcome::Allow;
+    }
+
+    let now = now_secs();
+    let sha = sha256_hex(&raw_bytes);
+    let key = norm_path(file_path);
+    let basename = target
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.to_string());
+
+    let mut store = load_store(sid);
+    let text_snapshot: Option<String> = if raw_bytes.len() <= MAX_SNAPSHOT_BYTES {
+        Some(String::from_utf8_lossy(&raw_bytes).into_owned())
+    } else {
+        None
+    };
+
+    let prev_opt = store
+        .get("reads")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get(&key))
+        .and_then(|v| v.as_object())
+        .cloned();
+
+    if let Some(mut prev) = prev_opt {
+        let prev_sha = prev.get("sha").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_start = opt_i64(prev.get("start"));
+        let prev_end = opt_i64(prev.get("end"));
+        let soft_denies = opt_i64(prev.get("soft_denies")).unwrap_or(0);
+        let outline_only = prev
+            .get("outline_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // Retry after outline-only -> allow full file & record override
+        if outline_only {
+            prev.insert("outline_only".into(), Value::Bool(false));
+            prev.insert("sha".into(), Value::String(sha));
+            prev.insert("start".into(), start_line.map(Into::into).unwrap_or(Value::Null));
+            prev.insert("end".into(), end_line.map(Into::into).unwrap_or(Value::Null));
+            prev.insert("soft_denies".into(), json!(0));
+            prev.insert("ts".into(), json!(now));
+            if let Some(snap) = text_snapshot {
+                prev.insert("snapshot".into(), Value::String(snap));
+            }
+            if let Some(Value::Object(reads)) = store.get_mut("reads") {
+                reads.insert(key, Value::Object(prev));
+            }
+            if start_line.is_none() && end_line.is_none() {
+                if let Some(Value::Object(meta_obj)) = store.get_mut("meta") {
+                    let cur = opt_i64(meta_obj.get("outline_overrides")).unwrap_or(0);
+                    meta_obj.insert("outline_overrides".into(), json!(cur + 1));
+                }
+            }
+            save_store(sid, &mut store);
+            return FunnelOutcome::Allow;
+        }
+
+        // Tier 0: Unchanged re-read
+        if prev_sha == sha && range_covered(prev_start, prev_end, start_line, end_line) {
+            if soft_denies < SOFT_DENY_CAP && !cfg.shadow {
+                prev.insert("soft_denies".into(), json!(soft_denies + 1));
+                prev.insert("ts".into(), json!(now));
+                if let Some(Value::Object(reads)) = store.get_mut("reads") {
+                    reads.insert(key, Value::Object(prev));
+                }
+                save_store(sid, &mut store);
+                let rng = format_range(start_line, end_line);
+                let reason = format!(
+                    "[Terser] `{basename}` ({rng}) is unchanged since your earlier read. \
+                     Reuse the content already in context, or retry to refresh (e.g. after /compact)."
+                );
+                record_savings("read_dedup", raw_bytes.len(), reason.len(), host, &basename);
+                return FunnelOutcome::Deny(reason);
+            }
+            prev.insert("soft_denies".into(), json!(0));
+            prev.insert("ts".into(), json!(now));
+            if let Some(Value::Object(reads)) = store.get_mut("reads") {
+                reads.insert(key, Value::Object(prev));
+            }
+            save_store(sid, &mut store);
+            return FunnelOutcome::Allow;
+        }
+
+        // Tier 1: File changed slightly & snapshot exists -> delegate to Python unified diff
+        if cfg.delta_diff
+            && prev_sha != sha
+            && soft_denies < SOFT_DENY_CAP
+            && !cfg.shadow
+            && prev.get("snapshot").and_then(|v| v.as_str()).is_some()
+            && text_snapshot.is_some()
+            && range_covered(prev_start, prev_end, start_line, end_line)
+        {
+            return FunnelOutcome::Delegate;
+        }
+    } else {
+        // Tier 2: Large unranged first read -> delegate to Python for full AST/Markdown outline
+        let outline_overrides = store
+            .get("meta")
+            .and_then(|v| v.as_object())
+            .and_then(|m| opt_i64(m.get("outline_overrides")))
+            .unwrap_or(0);
+        if start_line.is_none()
+            && end_line.is_none()
+            && cfg.outline_first
+            && (cfg.outline_backoff_limit <= 0 || outline_overrides < cfg.outline_backoff_limit)
+            && !cfg.shadow
+            && meta.len() >= cfg.outline_min_bytes
+        {
+            let line_count = raw_bytes.iter().filter(|&&b| b == b'\n').count() + 1;
+            if line_count >= cfg.outline_min_lines {
+                return FunnelOutcome::Delegate;
+            }
+        }
+    }
+
+    // Tier 3: First read / ranged read / wider range / large change -> record & allow
+    let mut merged_start = start_line;
+    let mut merged_end = end_line;
+    if let Some(Value::Object(reads)) = store.get("reads") {
+        if let Some(Value::Object(prev)) = reads.get(&key) {
+            if prev.get("sha").and_then(|v| v.as_str()) == Some(sha.as_str()) {
+                let ps = opt_i64(prev.get("start"));
+                let pe = opt_i64(prev.get("end"));
+                merged_start = match (ps, start_line) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    _ => None,
+                };
+                merged_end = match (pe, end_line) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+            }
+        }
+    }
+
+    let mut entry = Map::new();
+    entry.insert("sha".into(), Value::String(sha));
+    entry.insert("start".into(), merged_start.map(Into::into).unwrap_or(Value::Null));
+    entry.insert("end".into(), merged_end.map(Into::into).unwrap_or(Value::Null));
+    entry.insert("soft_denies".into(), json!(0));
+    entry.insert("outline_only".into(), Value::Bool(false));
+    entry.insert("ts".into(), json!(now));
+    if let Some(snap) = text_snapshot {
+        entry.insert("snapshot".into(), Value::String(snap));
+    }
+    if let Some(Value::Object(reads)) = store.get_mut("reads") {
+        reads.insert(key, Value::Object(entry));
+    }
+    save_store(sid, &mut store);
+    FunnelOutcome::Allow
+}
+
+fn is_mutating_or_live_mcp(name: &str) -> bool {
+    let tool_part = name.rsplit(':').next().unwrap_or(name);
+    let tool_part = if tool_part.contains("__") {
+        tool_part.rsplit("__").next().unwrap_or(tool_part)
+    } else {
+        tool_part
+    };
+    let lower = tool_part.to_ascii_lowercase();
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .any(|t| MUTATING_OR_LIVE_MCP_TOKENS.contains(&t))
+}
+
+pub fn check_mcp_refetch(
+    sid: &str,
+    display_name: &str,
+    inner_args: &Value,
+    cfg: &Config,
+    host: &str,
+) -> FunnelOutcome {
+    if !cfg.mcp_refetch_guard || cfg.shadow || sid.is_empty() || !valid_sid(sid) {
+        return FunnelOutcome::Allow;
+    }
+    if display_name.is_empty() || is_mutating_or_live_mcp(display_name) {
+        return FunnelOutcome::Allow;
+    }
+
+    let now = now_secs();
+    let payload = json!({"tool": display_name, "args": inner_args});
+    let canon = canonical_json(&payload);
+    let fp = sha256_hex(canon.as_bytes())[..24].to_string();
+
+    let mut store = load_store(sid);
+    let prev_opt = store
+        .get("mcp")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get(&fp))
+        .and_then(|v| v.as_object())
+        .cloned();
+
+    if let Some(mut prev) = prev_opt {
+        let elapsed = now - prev.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let soft_denies = opt_i64(prev.get("soft_denies")).unwrap_or(0);
+        if elapsed >= 0.0 && elapsed <= cfg.mcp_dedup_window_s && soft_denies < SOFT_DENY_CAP {
+            prev.insert("soft_denies".into(), json!(soft_denies + 1));
+            if let Some(Value::Object(mcp)) = store.get_mut("mcp") {
+                mcp.insert(fp, Value::Object(prev));
+            }
+            save_store(sid, &mut store);
+            let secs = (elapsed as i64).max(1);
+            let reason = format!(
+                "[Terser] Identical read-only MCP call `{display_name}` ran {secs}s ago. \
+                 Reuse the earlier result, or retry if live state changed."
+            );
+            record_savings("mcp_dedup", 2000, reason.len(), host, display_name);
+            return FunnelOutcome::Deny(reason);
+        }
+    }
+
+    if let Some(Value::Object(mcp)) = store.get_mut("mcp") {
+        mcp.insert(fp, json!({"ts": now, "soft_denies": 0}));
+    }
+    save_store(sid, &mut store);
+    FunnelOutcome::Allow
+}

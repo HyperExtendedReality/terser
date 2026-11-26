@@ -3,7 +3,7 @@
   "name": "terser",
   "displayName": "Terser",
   "version": "1.2.0",
-  "description": "Unified token-efficiency plugin combining jCodeMunch (6-tool AST Counter front door), Token Optimizer (4-tier read funnel, lossless output compression, smart compaction, quality scoring, dashboard), and TokenEconomizer (micro-skills, FormRepair, tool pruning, loop guard).",
+  "description": "Unified token-efficiency plugin combining a 6-tool AST Counter front door, 4-tier read funnel, lossless output compression, smart compaction, quality scoring, local dashboard, micro-skills, FormRepair, tool pruning, and loop guard.",
   "author": {
     "name": "Terser"
   },
@@ -22,7 +22,7 @@
     "mcp"
   ],
   "mcpServers": {
-    "terser-codemunch": {
+    "terser-index": {
       "command": "uvx",
       "args": [
         "jcodemunch-mcp"

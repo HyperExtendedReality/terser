@@ -42,7 +42,7 @@ Run the reproducible, zero-network local benchmark anytime via `scripts/terse be
 | **Read Funnel T1** (Small-Edit Unified Delta) | 3,603 | 93 | **97.4%** |
 | **Read Funnel T2** (Outline-First Code) | 3,603 | 689 | **80.9%** |
 | **Read Funnel T2b** (Outline-First Markdown) | 5,753 | 329 | **94.3%** |
-| **RTK Output Filter** (Cargo Build) | 447 | 34 | **92.4%** |
+| **Stream Output Filter** (Cargo Build) | 447 | 34 | **92.4%** |
 | **Lossless Columnar JSON Folding** | 1,751 | 244 | **86.1%** |
 | **Command Delta-Diff** (Repeat `pytest`) | 505 | 94 | **81.4%** |
 | **SQLite FTS5 Sandbox Query** | 5,678 | 462 | **91.9%** |
@@ -68,21 +68,21 @@ flowchart LR
 
 | Layer | Mechanism | Quality & Cache Safety Guarantee |
 | :--- | :--- | :--- |
-| **6-Tool AST Front Door** | Enforces `JCODEMUNCH_TOOL_SURFACE=counter` (**~1,050** schema tokens vs **~25,800** full — **96% cut**) across 81+ tree-sitter languages (`get_symbol_source`, `get_blast_radius`, `get_call_hierarchy`, `check_edit_safe`). | All 90+ AST/graph actions remain 1 call away via `menu`/`order`/`route`. |
+| **6-Tool AST Front Door** | Enforces the 6-tool Counter front door (**~1,050** schema tokens vs **~25,800** full — **96% cut**) across 81+ tree-sitter languages (`get_symbol_source`, `get_blast_radius`, `get_call_hierarchy`, `check_edit_safe`). | All 90+ AST/graph actions remain 1 call away via `menu`/`order`/`route`. |
 | **4-Tier Read Funnel** | **T0** unchanged re-read dedup · **T1** exact unified delta-diff · **T2/T2b** outline-first for large code/Markdown (`>=10 KB`, `>=250L`) · **T3** instant passthrough for small/ranged reads + 120s read-only MCP dedup. | `soft_denies=1` retry escape + **auto-backoff** (`outline_backoff_limit=2`) prevents extra round-trips on whole-file tasks. |
-| **FormRepair → 5-Stage Compression → Cmd Delta** | Applies **FormRepair** *first*, then ANSI/OSC-8 strip → **RTK filters** (Cargo, Go, pip/uv/pnpm/npm, Vite/tsc) + 25 output handlers → duplicate-line collapse → **lossless columnar JSON** → **cross-run Command Delta-Diff** on repeated test/lint/git runs. | Tee-on-failure & CoACT NAP guardrails preserve 100% of errors, tracebacks, diffs, and exit codes. |
+| **FormRepair → 5-Stage Compression → Cmd Delta** | Applies **FormRepair** *first*, then ANSI/OSC-8 strip → **stream noise filters** (Cargo, Go, pip/uv/pnpm/npm, Vite/tsc) + 25 output handlers → duplicate-line collapse → **lossless columnar JSON** → **cross-run Command Delta-Diff** on repeated test/lint/git runs. | Tee-on-failure & next-action preservation guardrails keep 100% of errors, tracebacks, diffs, and exit codes. |
 | **SmartCrusher JSON Pruner** | Statistically summarizes repetitive JSON arrays/API responses while indexing the full raw payload. | Reversible via `terse query <id> "<keywords>"`. |
 | **SQLite FTS5 Context Sandbox** | Oversized command, MCP, `Glob`, and `Grep` outputs are chunk-indexed into `~/.terser/sandbox.db` (stdlib `sqlite3` FTS5). | Query exact chunks (`terse query <id> "<terms>"`) or line spans (`terse expand <id> [start end]`) instead of dumping 100 KB logs. |
-| **Byte-Stable PageRank RepoMap** | Automatic `<150ms` AST import-graph PageRank fallback (~300 tokens) *only* when a workspace is not yet indexed by jCodeMunch. | Deterministic sort + mtime fingerprint keeps KV prompt cache 100% warm. |
-| **Pragmatic Minimalism (Ponytail)** | Embedded 7-rung minimalism ladder in `<220`-token `rules/AGENTS.md` + 3 consolidated skills + `SubagentStart` economy brief. | Explicitly forbids cutting validation, error handling, security, or accessibility; keeps prose clear and direct. |
-| **Unified Loop Guard & Smart Auto-Reindex** | Single per-session cooldown (45s), content-hashed edit signatures (no false positives on multi-region edits), and index-gated `jcodemunch-mcp index-file` on edits. | Always exits `0`; fails open on any error. |
+| **Byte-Stable PageRank RepoMap** | Automatic `<150ms` AST import-graph PageRank fallback (~300 tokens) *only* when a workspace is not yet indexed by Terser. | Deterministic sort + mtime fingerprint keeps KV prompt cache 100% warm. |
+| **Pragmatic Minimalism** | Embedded 7-rung minimalism ladder in `<220`-token `rules/AGENTS.md` + 3 consolidated skills + `SubagentStart` economy brief. | Explicitly forbids cutting validation, error handling, security, or accessibility; keeps prose clear and direct. |
+| **Unified Loop Guard & Smart Auto-Reindex** | Single per-session cooldown (45s), content-hashed edit signatures (no false positives on multi-region edits), and index-gated incremental AST re-indexing on edits. | Always exits `0`; fails open on any error. |
 
 ---
 
 ## Requirements
 
 - **Python 3.10+** (pure stdlib — no `pip install` required for the core runtime)
-- Optional (for the 6-tool AST index front door): [`jcodemunch-mcp`](https://github.com/jgravelle/jcodemunch-mcp) available on `PATH` or via `uvx`
+- Optional (for the 6-tool AST index front door): `uvx` (or the AST code-index MCP binary) available on `PATH`
 
 ---
 
@@ -103,7 +103,7 @@ python scripts/install.py --antigravity
 
 Installs into `~/.gemini/config/plugins/terser/` with OS-native hooks and the Counter MCP config (safe to re-run in place on Windows even while Antigravity is running).
 
-> **Tip:** If you previously installed `jcodemunch`, `token-optimizer`, or `tokeneconomizer` individually, disable them in Antigravity Customizations to avoid duplicate hooks and schemas.
+> **Tip:** If you previously installed standalone token-optimization or code-indexing plugins, disable them in Antigravity Customizations to avoid duplicate hooks and schemas.
 
 ### Claude Code
 
@@ -147,10 +147,10 @@ python scripts/install.py --all --uninstall
 Run via `scripts/terse` (macOS/Linux), `scripts/terse.cmd` (Windows), or `python runtime/cli.py`:
 
 ```bash
-terse status                        # Status, active layers & cumulative savings
+terse status                        # Status, per-layer % savings & outline override stats
 terse benchmark                     # Reproducible 8-layer local token-savings benchmark
-terse query <id> "<keywords>"       # SQLite FTS5 search over an archived output
-terse expand <id> [start end]       # Expand a line range (or full text) of an archive
+terse query <id|--last> "<terms>"   # SQLite FTS5 search over an archived output
+terse expand <id|--last> [start end]# Expand a line range (or full text) of an archive
 terse repomap [--budget 400]        # Generate a byte-stable PageRank structural repo map
 terse route "<task description>"    # Zero-cost task complexity router (tier + score)
 terse audit                         # Full session token & cost audit
@@ -161,7 +161,7 @@ terse microskills [forget|unforget] # Manage learned repo EnvFacts micro-skills
 terse toolprune [status|apply|restore] # Review/apply/restore unused tool pruning
 terse coach                         # Project token-efficiency coaching
 terse dashboard                     # Refresh & open local analytics dashboard
-terse doctor                        # Verify Python, vendored engines, manifests & MCP health
+terse doctor                        # Verify Python, Rust fast-path, engines, manifests & MCP
 ```
 
 ---
@@ -188,7 +188,7 @@ Persistent toggles can be set via `terse config set <key>=<value>` and reset any
 
 - **100% Local:** Zero outbound network requests, zero telemetry, zero external API calls.
 - **Fail-Open Architecture:** Every lifecycle hook is wrapped in defensive error handling and exits `0` so an unexpected edge case never blocks your agent.
-- **Reversible by Design:** Oversized outputs are archived in `~/.terser/sandbox.db` and retrievable on demand; shadow mode (`terse config set shadow=true`) lets you audit behavior with zero mutation.
+- **Reversible by Design:** Oversized outputs are archived in `~/.terser/sandbox.db` (auto-pruned at 7 days / 50 MB) and retrievable via `terse query --last` or `terse expand --last`; shadow mode (`terse config set shadow=true`) lets you audit behavior with zero mutation.
 
 ---
 
@@ -203,13 +203,22 @@ python scripts/benchmark.py
 
 # Bump semantic version across all manifests & rebuild standalone dist/ bundles
 python scripts/install.py --bump patch --build-dist
+
+# Optional: build the native Rust hot-path accelerator (~10ms hook latency, 14x faster)
+python scripts/install.py --build-native --antigravity
+
+# Run Rust unit tests
+cargo test --manifest-path native/terser-fast/Cargo.toml
 ```
 
+### Optional Native Rust Hot-Path (`terser-fast`)
+
+Terser works out-of-the-box with pure Python stdlib. If you have Rust (`cargo`) installed—or download a prebuilt binary from [GitHub Releases](https://github.com/HyperExtendedReality/terser/releases)—the ~390 KB native binary (`native/terser-fast/` → `bin/terser-fast`) cuts `PreToolUse` hook latency from **~147 ms → ~10 ms (14.1× faster)**:
+
+- **Native fast paths:** Read Funnel T0/T3, MCP refetch dedup, Loop Guard, `SubagentStart` brief, `terser-fast compress` (ANSI/OSC-8 strip, lockfile diff elision, Cargo/Go/pytest/npm/pnpm/pip/uv stream filters, duplicate-line collapse), and `terser-fast exec` (zero-overhead Antigravity `run_command` wrapper with tee-on-failure).
+- **Transparent Python fallback:** Cold-path and rich operations (AST outlines, unified diffs, FormRepair, command delta-diff, SQLite FTS5 archival, audit/dashboard) delegate seamlessly to Python while sharing the exact same `~/.terser/` state files.
+
 ---
-
-## Credits & Research Foundations
-
-Terser unifies and extends the strongest engines from **jCodeMunch MCP**, **Token Optimizer**, and **TokenEconomizer**, incorporating ideas from 2025–2026 context-engineering research including **CoACT NAP**, **Weinberger/Yang KV-cache stability**, **Ponytail pragmatic minimalism**, **RTK stream filters**, **SQLite FTS5 context sandboxing**, and **PageRank RepoMap**.
 
 ## License
 

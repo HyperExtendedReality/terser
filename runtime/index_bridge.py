@@ -1,10 +1,10 @@
-"""Terser — Fast jCodeMunch Bridge.
+"""Terser — Fast AST Index Bridge.
 
-Provides lightweight, zero-heavy-import hooks for jCodeMunch:
+Provides lightweight, zero-heavy-import hooks for Terser's AST code index:
   1. Fire-and-forget incremental file re-indexing after Edit/Write/MultiEdit.
   2. Ultra-fast (<5ms) workspace index status lookup directly from ~/.code-index metadata
      (no MCP server spawn required!).
-  3. Index-backed large Grep answering on Claude Code / Codex when jCodeMunch is installed.
+  3. Index-backed large Grep answering on Claude Code / Codex when the AST index package is installed.
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def code_index_dir(env: dict[str, str] | None = None) -> Path:
     return Path(os.path.expanduser(raw)) if raw else (Path.home() / ".code-index")
 
 
-def find_jcodemunch_cmd() -> list[str] | None:
+def find_index_cmd() -> list[str] | None:
     exe = shutil.which("jcodemunch-mcp")
     if exe:
         return [exe]
@@ -42,7 +42,7 @@ def find_jcodemunch_cmd() -> list[str] | None:
 
 
 def spawn_reindex_file(file_path: str, *, env: dict[str, str] | None = None) -> bool:
-    """Fire-and-forget ``jcodemunch-mcp index-file <path>`` on code edits inside indexed repos."""
+    """Fire-and-forget incremental AST re-indexing on code edits inside indexed repos."""
     if not file_path or "\x00" in file_path:
         return False
     p = Path(file_path)
@@ -119,7 +119,7 @@ def workspace_index_summary(workspace: str, env: dict[str, str] | None = None) -
 
 
 def try_answer_large_grep(tool_input: dict, cwd: str, session_id: str) -> str | None:
-    """If jcodemunch_mcp is importable and the repo is indexed, answer huge Greps from the index once."""
+    """If the AST index package is importable and the repo is indexed, answer huge Greps from the index once."""
     try:
         os.environ.setdefault("JCODEMUNCH_HOOK_GREP_ANSWER", "1")
         from jcodemunch_mcp.cli.hooks.grep_answer import answer_grep  # type: ignore

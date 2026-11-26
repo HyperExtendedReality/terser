@@ -28,7 +28,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cmd_delta": True,             # Cross-run delta-diff on repeated test/lint/build/git runs
     "fts_sandbox": True,           # Index oversized outputs in SQLite FTS5 (`terse query <id>`)
     "auto_approve_readonly": False,
-    "enhanced_compression": True,  # ANSI/spinner strip + RTK filters + duplicate collapse + JSON fold
+    "enhanced_compression": True,  # ANSI/spinner strip + stream filters + duplicate collapse + JSON fold
     # PreToolUse Read Funnel (4-tier quality-preserving)
     "read_cache": True,
     "delta_diff": True,
@@ -38,10 +38,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "outline_backoff_limit": 2,    # Auto-backoff outline_first if agent overrides 2x in a session
     "mcp_refetch_guard": True,
     "mcp_dedup_window_s": 120,
-    # jCodeMunch integration
-    "codemunch_auto_reindex": True,
-    "codemunch_grep_answer": True,  # Answer huge Greps (>=66 lines) directly from fresh index once
-    "codemunch_surface": "counter", # "counter" (~1k tok) | "core" (~4k tok) | "full" (~26k tok)
+    # AST code-index integration
+    "index_auto_reindex": True,
+    "index_grep_answer": True,     # Answer huge Greps (>=66 lines) directly from fresh index once
+    "index_surface": "counter",    # "counter" (~1k tok) | "core" (~4k tok) | "full" (~26k tok)
     # Unified Loop & Thrash Guard (deduped single-nudge cooldown)
     "loop_guard": True,
     "thrash_streak": 3,
@@ -50,9 +50,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Unified SessionStart Brief (prompt-cache-safe, strictly budget-capped)
     "session_brief": True,
     "session_brief_max_chars": 1600,  # ~400 tokens hard cap (strictly byte-stable)
-    "repo_map": True,                 # Byte-stable PageRank fallback when jCodeMunch index is absent
+    "repo_map": True,                 # Byte-stable PageRank fallback when AST index is absent
     "repo_map_max_tokens": 300,
-    "code_discipline": "ponytail",    # "ponytail" (7-rung minimalism, never cuts safety) | "off"
+    "code_discipline": "minimal",     # "minimal" (7-rung minimalism, never cuts safety) | "off"
     "microskills": "envfacts",        # "envfacts" (LLM-free, fast) | "on" | "off"
     "continuity_restore": True,
     "context_fill_nudges": True,
@@ -94,6 +94,13 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
             raw = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 cfg.update(raw)
+                for old_k, new_k in (
+                    ("codemunch_auto_reindex", "index_auto_reindex"),
+                    ("codemunch_grep_answer", "index_grep_answer"),
+                    ("codemunch_surface", "index_surface"),
+                ):
+                    if old_k in raw and new_k not in raw:
+                        cfg[new_k] = raw[old_k]
     except (OSError, json.JSONDecodeError, ValueError):
         pass
 
@@ -110,8 +117,8 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
         ("TERSER_MCP_REFETCH_GUARD", "mcp_refetch_guard"),
         ("TERSER_LOOP_GUARD", "loop_guard"),
         ("TERSER_AUTO_APPROVE_READONLY", "auto_approve_readonly"),
-        ("TERSER_AUTO_REINDEX", "codemunch_auto_reindex"),
-        ("TERSER_GREP_ANSWER", "codemunch_grep_answer"),
+        ("TERSER_AUTO_REINDEX", "index_auto_reindex"),
+        ("TERSER_GREP_ANSWER", "index_grep_answer"),
         ("TERSER_SESSION_BRIEF", "session_brief"),
     ):
         v = env.get(env_key)

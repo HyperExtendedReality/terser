@@ -1,7 +1,7 @@
 """Terser — Unified Prompt-Cache-Safe SessionStart Brief.
 
-Replaces 3 separate SessionStart injections (Token Optimizer continuity restore +
-TokenEconomizer micro-skills + jCodeMunch status) with ONE strictly budget-capped
+Replaces separate SessionStart injections (continuity restore + repo
+micro-skills + AST code-index status) with ONE strictly budget-capped
 (<= 1,400 chars ≈ 350 tokens), deduplicated, cache-prefix-friendly block emitted
 ONCE at session start.
 """
@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from runtime.codemunch_bridge import workspace_index_summary
+from runtime.index_bridge import workspace_index_summary
 from runtime.config import ensure_vendor_paths, normalize_workspace, workspace_hash
 
 _LINE_MAX_CHARS = 180
@@ -24,7 +24,7 @@ def _clean_line(text: str) -> str:
 
 
 def _load_microskills(cwd: str, env: dict[str, str] | None = None) -> list[str]:
-    """Read confirmed, cached TokenEconomizer micro-skills for this repo (zero LLM calls)."""
+    """Read confirmed, cached Terser micro-skills for this repo (zero LLM calls)."""
     if not cwd:
         return []
     try:
@@ -53,7 +53,7 @@ def _load_microskills(cwd: str, env: dict[str, str] | None = None) -> list[str]:
 
 
 def _load_continuity(workspace: str, host: str, env: dict[str, str] | None = None) -> list[str]:
-    """Load workspace-scoped Token Optimizer continuity context (strictly workspace-matched)."""
+    """Load workspace-scoped Terser continuity context (strictly workspace-matched)."""
     if not workspace:
         return []
     env = env if env is not None else os.environ
@@ -136,10 +136,10 @@ def build_session_brief(
             sections.append("Prior session:\n" + "\n".join(cont))
             notice_parts.append("continuity restored")
 
-    # 3. Compact 1-line jCodeMunch index status — OR byte-stable PageRank Repo Map if unindexed
+    # 3. Compact 1-line AST index status — OR byte-stable PageRank Repo Map if unindexed
     idx = workspace_index_summary(workspace, env)
     if idx:
-        surface = cfg.get("codemunch_surface", "counter")
+        surface = cfg.get("index_surface", "counter")
         hint = "use `order`/`route`" if surface == "counter" else "use `search_symbols`/`get_symbol_source`"
         # Prompt-cache stable: avoid volatile symbol counts in model context
         sections.append(f"Code index: `{idx['repo']}` ready — {hint}.")

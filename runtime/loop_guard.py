@@ -1,8 +1,8 @@
 """Terser — Unified Tiered Loop Guard & FormRepair.
 
-Combines Token Optimizer's fast deterministic thrash detector with TokenEconomizer's
-cross-session EnvFacts FormRepair and loop guard, coordinated by a single per-session
-cooldown so two nudges NEVER fire back-to-back on the same loop.
+Combines fast deterministic thrash detection with cross-session EnvFacts
+FormRepair and loop guard, coordinated by a single per-session cooldown so two
+nudges NEVER fire back-to-back on the same loop.
 """
 from __future__ import annotations
 
@@ -203,7 +203,7 @@ def apply_form_repair(
     host: str = "antigravity",
     env: dict[str, str] | None = None,
 ) -> tuple[str, bool]:
-    """Rewrite a leading broken shell command using confirmed TokenEconomizer EnvFacts.
+    """Rewrite a leading broken shell command using confirmed Terser EnvFacts.
 
     Returns ``(command_out, was_repaired)``. Only rewrites exact leading token/prefix
     matches followed by whitespace or end-of-string, and never rewrites ``cd ... &&``

@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "terser-codemunch": {
+    "terser-index": {
       "command": "uvx",
       "args": [
         "jcodemunch-mcp"

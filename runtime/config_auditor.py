@@ -1,13 +1,11 @@
 """Terser — Static Context Bloat & Secret-Leak Auditor (`terse audit-config`).
 
-Inspired by `CodeBurn` and 2026 static-context security findings:
 Every token in always-on context files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`,
 `MEMORY.md`, MCP configs) is re-sent on EVERY turn. Removing 1,000 static tokens
 saves 20,000–50,000 tokens over a 30-turn session.
 
 Also checks for:
-  - Duplicate legacy plugins (`jcodemunch`, `token-optimizer`, `tokeneconomizer`)
-    running alongside `terser`.
+  - Overlapping legacy standalone token/index plugins running alongside `terser`.
   - `.claude/settings.local.json` secret exposure / missing `.gitignore` entry.
 """
 from __future__ import annotations
@@ -63,7 +61,7 @@ def audit_workspace(cwd: str, *, home: Path | None = None) -> dict[str, Any]:
                 "Trim verbose examples or move reference detail into on-demand skills."
             )
 
-    # Check .claude/settings.local.json hygiene (Apiiro 2026 secret-leak check)
+    # Check .claude/settings.local.json hygiene (secret-leak check)
     local_settings = root / ".claude" / "settings.local.json"
     if local_settings.is_file():
         try:

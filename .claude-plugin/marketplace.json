@@ -11,7 +11,7 @@
       "source": "./",
       "displayName": "Terser",
       "version": "1.2.0",
-      "description": "Combines jCodeMunch AST retrieval (Counter front door), Token Optimizer compression/continuity/dashboard, and TokenEconomizer micro-skills/FormRepair/tool pruning/loop guard into one fast plugin.",
+      "description": "Unified token-efficiency plugin combining 6-tool AST retrieval (Counter front door), 4-tier read funnel, lossless output compression, smart compaction, micro-skills, FormRepair, tool pruning, and loop guard.",
       "category": "productivity",
       "tags": [
         "tokens",

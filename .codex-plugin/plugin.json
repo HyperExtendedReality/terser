@@ -33,7 +33,7 @@
     "defaultPrompt": [
       "Show Terser status, token savings, and session quality grade.",
       "Audit this project's token waste, micro-skills, and unused tools.",
-      "Use code-munch to map key symbols and trace blast radius with minimal tokens."
+      "Use terser-index to map key symbols and trace blast radius with minimal tokens."
     ],
     "brandColor": "#0F766E"
   }

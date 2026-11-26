@@ -1,7 +1,7 @@
 """Terser — 4-Tier Quality-Preserving Read Funnel & MCP Refetch Guard.
 
-Unifies Token Optimizer's Read Cache + Delta Diff + Structure Map with jCodeMunch's
-symbol-first workflow into one conflict-free PreToolUse funnel:
+Unifies Terser's Read Cache + Delta Diff + Structure Map with symbol-first
+AST navigation into one conflict-free PreToolUse funnel:
 
   Tier 0 (Unchanged re-read):
       Soft-deny ONCE with a concise pointer to the already-loaded context.
@@ -11,7 +11,7 @@ symbol-first workflow into one conflict-free PreToolUse funnel:
       re-reading the entire file. Immediate retry returns the full file.
   Tier 2 (First unranged read of a LARGE code file >= 10 KB & >= 250 lines):
       Return an inline, line-numbered AST/structure outline (imports + class/fn
-      signatures + exact line spans) ONCE, pointing to ranged reads or jCodeMunch
+      signatures + exact line spans) ONCE, pointing to ranged reads or `terser-index`
       `order {action: "get_symbol_source"}`. Immediate retry returns the full file!
   Tier 3 (Small/medium file, ranged read, non-code file, ByteOffset read, or retry):
       Pass straight through untouched with zero friction.
@@ -223,7 +223,7 @@ _MD_HEADING_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*#*$")
 def build_code_outline(file_path: str, text: str) -> str | None:
     """Build a compact line-numbered symbol or doc-heading outline for a large file.
 
-    Prefers Token Optimizer's vendor ``structure_map`` when available, falling back to
+    Prefers Terser's bundled ``structure_map`` when available, falling back to
     Python's ``ast`` module (for .py), Markdown heading TOC (for .md), or a fast regex extractor.
     """
     ext = Path(file_path).suffix.lower()
@@ -250,7 +250,7 @@ def build_code_outline(file_path: str, text: str) -> str | None:
     if ext not in _CODE_EXTS:
         return None
 
-    # 1. Try Token Optimizer's multi-language structure_map
+    # 1. Try Terser's bundled multi-language structure_map
     try:
         ensure_vendor_paths()
         import structure_map as _sm  # type: ignore
@@ -367,7 +367,7 @@ def check_read(
         # If previous call only returned an outline, the immediate retry loads the full file!
         # Also track full-file overrides: if the agent overrides outlines repeatedly in a
         # session (task genuinely requires whole-file reads), auto-backoff outline_first
-        # to avoid extra round-trip turns (Weinberger/Yang 2026 cost guardrail).
+        # to avoid extra round-trip turns (round-trip cost guardrail).
         if outline_only:
             prev["outline_only"] = False
             prev["sha"] = sha
@@ -456,7 +456,7 @@ def check_read(
                 reason = (
                     f"[Terser] `{basename}` is {total_lines} lines ({st.st_size:,} B). "
                     f"Outline (exact line spans):\n{outline}\n\n"
-                    f"Read only the needed span with {range_hint} (or jCodeMunch `get_symbol_source`), "
+                    f"Read only the needed span with {range_hint} (or `terser-index` `get_symbol_source`), "
                     "or retry this read immediately to load the full file."
                 )
                 record_savings("read_outline", len(raw_bytes), len(reason), host=host, detail=basename, env=env)
@@ -503,7 +503,12 @@ def invalidate_on_edit(
 
 
 def _is_mutating_or_live_mcp(name: str) -> bool:
-    tokens = [t for t in re.split(r"[^a-z0-9]+", name.lower()) if t]
+    # Strip MCP server prefix (`server:tool` or `mcp__server__tool`) so server names
+    # like `terser-index` don't misclassify read-only tools such as `search_symbols`.
+    tool_part = name.rsplit(":", 1)[-1]
+    if "__" in tool_part:
+        tool_part = tool_part.rsplit("__", 1)[-1]
+    tokens = [t for t in re.split(r"[^a-z0-9]+", tool_part.lower()) if t]
     return any(t in _MUTATING_OR_LIVE_MCP_TOKENS for t in tokens)
 
 

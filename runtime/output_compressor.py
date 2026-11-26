@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Terser — Enhanced Quality-Preserving Output Compressor.
 
-Improves on Token Optimizer's bash_compress by chaining five lossless/error-preserving stages:
+Chains five lossless/error-preserving compression stages:
   1. ANSI escape & carriage-return progress/spinner stripping (zero semantic loss).
-  2. Token Optimizer's 25 specialized command handlers (git, pytest, npm, cargo, tsc, etc.).
+  2. Bundled specialized command handlers (git, pytest, npm, cargo, tsc, etc.).
   3. Consecutive & near-duplicate log-line collapsing (preserves all errors/stack frames/diffs).
   4. Uniform JSON array columnar folding (100% value-preserving, ~40-65% fewer tokens).
   5. Error-pinned bounded window with local full-output archive (`terse expand <id>`).
@@ -210,7 +210,7 @@ def read_archived_output(
         return None
 
 
-# RTK-inspired specialized noise filters (strip zero-signal build/install chatter, keep 100% of errors/summaries)
+# Specialized stream noise filters (strip zero-signal build/install chatter, keep 100% of errors/summaries)
 _CARGO_NOISE_RE = re.compile(r"^\s*(?:Compiling|Downloading|Downloaded|Fresh|Updating|Locking|Adding|Checking)\s+")
 _GO_TEST_PASS_RE = re.compile(r"^\s*(?:=== RUN|=== PAUSE|=== CONT|--- PASS:)\s+")
 _PKG_NOISE_RE = re.compile(
@@ -301,8 +301,8 @@ def fold_framework_stack_frames(text: str, min_run: int = 3) -> str:
     return "\n".join(out)
 
 
-def apply_rtk_filters(text: str, command: str) -> str:
-    """Apply RTK-inspired high-signal filters for Cargo, Go test, bundlers, and package managers."""
+def apply_stream_filters(text: str, command: str) -> str:
+    """Apply high-signal stream filters for Cargo, Go test, bundlers, and package managers."""
     if not text or not command:
         return text
     low = command.lower()
@@ -379,7 +379,7 @@ def _error_pinned_window(text: str, max_chars: int, archive_id: str | None) -> s
 
 
 def _vendor_compress(text: str, command: str, returncode: int = 0, stderr: str = "") -> str:
-    """Delegate to Token Optimizer's 25 specialized command handlers (git, pytest, npm, etc.)."""
+    """Delegate to Terser's bundled specialized command handlers (git, pytest, npm, etc.)."""
     if not command or not text:
         return text
     try:
@@ -417,15 +417,15 @@ def compress_output(
     raw_len = len(text)
     cur = strip_ansi_and_progress(text) if enhanced else text
 
-    # Stage 2: lockfile diff elision + RTK filters + Token Optimizer's 25 specialized command handlers
+    # Stage 2: lockfile diff elision + stream filters + specialized command handlers
     if enhanced:
         cur = elide_lockfile_diffs(cur)
         cur = fold_framework_stack_frames(cur)
     if command:
-        cur = apply_rtk_filters(cur, command) if enhanced else cur
+        cur = apply_stream_filters(cur, command) if enhanced else cur
         cur = _vendor_compress(cur, command, returncode=returncode, stderr=stderr)
 
-    # Stage 3: SmartCrusher statistical/columnar JSON pruning (CCR-reversible via sandbox.db)
+    # Stage 3: SmartCrusher statistical/columnar JSON pruning (reversible via sandbox.db)
     if enhanced:
         crushed: str | None = None
         try:

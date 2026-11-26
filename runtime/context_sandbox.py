@@ -1,6 +1,5 @@
 """Terser — Local SQLite FTS5 Context Sandbox.
 
-Inspired by `mksglu/context-mode` and `headroomlabs-ai/headroom`:
 Instead of forcing an agent to dump an entire 100 KB archived output back into
 context via `terse expand <id>`, every oversized command or MCP output is chunked
 and indexed into a local SQLite FTS5 database (`~/.terser/sandbox.db`).
@@ -24,6 +23,7 @@ from typing import Any
 from runtime.config import state_home
 
 _TTL_SECONDS = 7 * 86400
+_MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MB total archive cap
 _CHUNK_LINES = 30
 _ID_RE = re.compile(r"^[0-9a-f]{6,32}$")
 
@@ -82,18 +82,53 @@ def _has_fts5(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def _prune_old(conn: sqlite3.Connection, now: float) -> None:
-    cutoff = now - _TTL_SECONDS
-    old_ids = [r[0] for r in conn.execute("SELECT id FROM blobs WHERE created_at < ?", (cutoff,)).fetchall()]
-    if not old_ids:
+def _delete_ids(conn: sqlite3.Connection, ids: list[str]) -> None:
+    if not ids:
         return
     use_fts = _has_fts5(conn)
-    for oid in old_ids:
+    for oid in ids:
         conn.execute("DELETE FROM blobs WHERE id = ?", (oid,))
         if use_fts:
             conn.execute("DELETE FROM chunks_fts WHERE blob_id = ?", (oid,))
         else:
             conn.execute("DELETE FROM chunks_plain WHERE blob_id = ?", (oid,))
+
+
+def _prune_old(conn: sqlite3.Connection, now: float, max_bytes: int = _MAX_TOTAL_BYTES) -> None:
+    cutoff = now - _TTL_SECONDS
+    old_ids = [r[0] for r in conn.execute("SELECT id FROM blobs WHERE created_at < ?", (cutoff,)).fetchall()]
+    _delete_ids(conn, old_ids)
+
+    # Size-cap pruning: evict oldest blobs while total stored bytes exceed max_bytes
+    row = conn.execute("SELECT COALESCE(SUM(total_bytes), 0) FROM blobs").fetchone()
+    total = int(row[0] or 0) if row else 0
+    if total > max_bytes:
+        evict: list[str] = []
+        for bid, bsz in conn.execute("SELECT id, total_bytes FROM blobs ORDER BY created_at ASC").fetchall():
+            if total <= max_bytes:
+                break
+            evict.append(str(bid))
+            total -= int(bsz or 0)
+        _delete_ids(conn, evict)
+
+
+def get_latest_archive_id(env: dict[str, str] | None = None) -> str | None:
+    """Return the most recently indexed archive ID in sandbox.db, if any."""
+    try:
+        if not _db_path(env).is_file():
+            return None
+        with closing(_connect(env)) as conn:
+            row = conn.execute("SELECT id FROM blobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            return str(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _resolve_id(archive_id: str, env: dict[str, str] | None = None) -> str | None:
+    raw = str(archive_id or "").strip()
+    if raw in ("--last", "last", "latest"):
+        return get_latest_archive_id(env)
+    return raw if _ID_RE.match(raw) else None
 
 
 def store_output(
@@ -142,8 +177,10 @@ def query_output(
     env: dict[str, str] | None = None,
 ) -> str | None:
     """Search an archived blob with FTS5 (or case-insensitive substring fallback)."""
-    if not _ID_RE.match(str(archive_id or "")) or not (query or "").strip():
+    resolved = _resolve_id(archive_id, env)
+    if not resolved or not (query or "").strip():
         return None
+    archive_id = resolved
     try:
         with closing(_connect(env)) as conn:
             meta = conn.execute(
@@ -199,8 +236,10 @@ def expand_output(
     env: dict[str, str] | None = None,
 ) -> str | None:
     """Return a targeted line range (or full text) from sandbox.db."""
-    if not _ID_RE.match(str(archive_id or "")):
+    resolved = _resolve_id(archive_id, env)
+    if not resolved:
         return None
+    archive_id = resolved
     try:
         with closing(_connect(env)) as conn:
             row = conn.execute("SELECT content FROM blobs WHERE id = ?", (archive_id,)).fetchone()

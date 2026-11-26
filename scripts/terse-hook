@@ -1,13 +1,28 @@
 #!/bin/sh
-# Terser — POSIX hook launcher (minimal-PATH safe, fail-open).
+# Terser — POSIX hook launcher (native Rust fast-path with minimal-PATH safe Python fallback).
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PLUGIN_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 HOOK_PY="$PLUGIN_ROOT/runtime/unified_hook.py"
+FAST_BIN="$PLUGIN_ROOT/bin/terser-fast"
 
+PY_BIN=""
 for py in "${TERSER_PYTHON:-}" python3 /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3 python; do
   [ -n "$py" ] || continue
   if command -v "$py" >/dev/null 2>&1; then
-    exec "$py" -E -s -X utf8 "$HOOK_PY" "$@"
+    PY_BIN="$py"
+    break
   fi
 done
+
+if [ -x "$FAST_BIN" ]; then
+  if [ -n "$PY_BIN" ]; then
+    exec "$FAST_BIN" --python "$PY_BIN" --script "$HOOK_PY" "$@"
+  else
+    exec "$FAST_BIN" "$@"
+  fi
+fi
+
+if [ -n "$PY_BIN" ]; then
+  exec "$PY_BIN" -E -s -X utf8 "$HOOK_PY" "$@"
+fi
 exit 0

@@ -1,7 +1,4 @@
-"""Terser — Cross-Run Command Output Delta-Diff (CoACT NAP-Safe).
-
-Inspired by `ppgranger/token-saver` Delta mode and CoACT (Zhu et al., 2026)
-Next-Action Preservation (NAP):
+"""Terser — Cross-Run Command Output Delta-Diff (Next-Action Preserving).
 
 During iterative fix/test loops, agents run the same test, lint, typecheck, or
 git command 5-15 times in a row. Instead of re-billing the entire output every
@@ -9,7 +6,7 @@ time:
   - Identical output + identical exit code -> 1-line receipt (~99% saved).
   - Small change (<= 45 diff lines and < 45% of output) -> exact unified diff
     plus the final summary line (~75-92% saved).
-  - Large change or first run -> full compressed output (NAP guardrail: never
+  - Large change or first run -> full compressed output (guardrail: never
     withholds signal that could cause an extra re-run turn).
 
 Pure Python stdlib, per-session state under ~/.terser/cmd-delta/.

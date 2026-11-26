@@ -34,7 +34,7 @@ def run_benchmark() -> list[tuple[str, int, int, float]]:
         env = {"TERSER_HOME": str(tmp / "state")}
         cfg = config.load_config(env)
 
-        # 1. MCP Schema Surface: jCodeMunch full (91 tools) vs Counter front door (6 tools)
+        # 1. MCP Schema Surface: Full AST surface (91 tools) vs Counter front door (6 tools)
         rows.append(("MCP Schema (Counter vs Full)", 25800, 1050, (1 - 1050 / 25800) * 100))
 
         # 2. Tier 0: Unchanged re-read dedup (500-line Python service)
@@ -88,14 +88,14 @@ def run_benchmark() -> list[tuple[str, int, int, float]]:
         md_raw, md_srv = _tok(md_text), _tok(md_res["reason"])
         rows.append(("Read Funnel T2b (Outline-First Docs)", md_raw, md_srv, (1 - md_srv / md_raw) * 100))
 
-        # 4. RTK + Output Compression (Cargo build with 40 compiling lines + 1 real error)
+        # 4. Stream Noise Filter + Output Compression (Cargo build with 40 compiling lines + 1 real error)
         cargo_raw = (
             "".join(f"\x1b[32m   Compiling\x1b[0m crate_dep_{i} v1.{i}.0\n" for i in range(40))
             + "error[E0308]: mismatched types\n  --> src/engine.rs:88:12\n   | expected u32, found i64\n"
         )
         cargo_comp, _ = output_compressor.compress_output(cargo_raw, command="cargo build", returncode=1, env=env)
         c_raw, c_srv = _tok(cargo_raw), _tok(cargo_comp)
-        rows.append(("RTK Output Filter (Cargo Build)", c_raw, c_srv, (1 - c_srv / c_raw) * 100))
+        rows.append(("Stream Output Filter (Cargo Build)", c_raw, c_srv, (1 - c_srv / c_raw) * 100))
 
         # 5. Lossless Columnar JSON Folding (60 uniform API objects)
         json_raw = json.dumps(

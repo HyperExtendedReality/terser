@@ -1,12 +1,12 @@
-"""Terser — SmartCrusher Statistical JSON & API Array Pruner (CCR-Reversible).
+"""Terser — SmartCrusher Statistical JSON & API Array Pruner (Reversible).
 
-Inspired by `headroomlabs-ai/headroom` SmartCrusher:
+Features:
   1. Unwraps both top-level JSON arrays and common API envelopes (`items`, `results`,
      `data`, `entries`, `records`, `files`, `issues`, `nodes`, `events`).
   2. Factors out constant keys shared identically across all items into `_const`.
   3. Strips redundant null/empty values where safe.
   4. For 5..40 items: lossless columnar encoding (`_format: "columnar"`, `_const`, `cols`, `rows`).
-  5. For >40 items: statistical SmartCrusher sampling + SQLite FTS5 CCR archive:
+  5. For >40 items: statistical SmartCrusher sampling + SQLite FTS5 archive:
        - First 3 items (schema/order)
        - Last 3 items (recency)
        - 100% of error / failed / warning / critical items (unconditional!)

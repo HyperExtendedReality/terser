@@ -1,0 +1,54 @@
+name: Release Native Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: terser-fast-linux-x86_64
+            bin: terser-fast
+          - os: macos-latest
+            artifact: terser-fast-macos-aarch64
+            bin: terser-fast
+          - os: windows-latest
+            artifact: terser-fast-windows-x86_64.exe
+            bin: terser-fast.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release --manifest-path native/terser-fast/Cargo.toml
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp "native/terser-fast/target/release/${{ matrix.bin }}" "release-assets/${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release-assets/${{ matrix.artifact }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

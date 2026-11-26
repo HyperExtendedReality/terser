@@ -2,19 +2,19 @@
 """Terser — Single-Process Multi-Host Lifecycle Hook Dispatcher.
 
 Handles Antigravity 2.0, Claude Code, and Codex through ONE fast, fail-open Python
-process per lifecycle event — eliminating 3x process-spawn latency and resolving
-all hook conflicts between jCodeMunch, Token Optimizer, and TokenEconomizer:
+process per lifecycle event — eliminating multi-hook spawn latency and resolving
+all lifecycle hook conflicts in Terser:
 
   PreToolUse (Shell):   FormRepair FIRST -> Bash Output Compression SECOND (single rewrite)
   PreToolUse (Read):    4-Tier Read Funnel (Dedup -> Delta Diff -> Outline-First -> Passthrough)
   PreToolUse (Grep):    Index-backed large Grep answering (Claude/Codex)
   PreToolUse (MCP):     120s Read-Only MCP Refetch Guard
-  PostToolUse:          Edit cache invalidation + jCodeMunch auto-reindex + Output compression
+  PostToolUse:          Edit cache invalidation + AST auto-reindex + Output compression
                         + Unified deduped Loop/Thrash Guard
   SessionStart:         ONE budget-capped (<=350 tok) Prompt-Cache-Safe Brief
   PreInvocation/Prompt: Pending loop-guard redirect + live context-fill nudges
   PreCompact/PostCmp:   Smart checkpoint capture & read-cache reset
-  Stop/SessionEnd:      Lease-debounced detached rollup + TokenEconomizer session fold
+  Stop/SessionEnd:      Lease-debounced detached rollup + session micro-skills fold
 
 Fail-open contract: always exits 0, never corrupts stdout, never blocks the agent on error.
 """
@@ -35,7 +35,7 @@ _PLUGIN_ROOT = _THIS_DIR.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from runtime import cmd_delta, codemunch_bridge, loop_guard, output_compressor, read_funnel, session_brief
+from runtime import cmd_delta, index_bridge, loop_guard, output_compressor, read_funnel, session_brief
 from runtime.config import (
     atomic_write_json,
     ensure_vendor_paths,
@@ -183,7 +183,16 @@ def _wrap_command_for_compression(
     if not compressor.is_file():
         return None, False
 
+    fast_bin = _PLUGIN_ROOT / "bin" / ("terser-fast.exe" if os.name == "nt" else "terser-fast")
     safe_sid = "".join(c for c in (session_id or "") if c.isalnum() or c in "-_")[:64] if cfg.get("cmd_delta", True) else ""
+
+    def _prefer_native_exec(toks: list[str]) -> bool:
+        if not fast_bin.is_file() or not toks:
+            return False
+        head = Path(toks[0]).stem.lower()
+        sub = toks[1].lower() if len(toks) > 1 else ""
+        # Use ~3ms native Rust exec for build/pkg/diff commands (no Python startup overhead)
+        return head in ("cargo", "go", "npm", "pnpm", "yarn", "pip", "uv", "tsc") or (head == "git" and sub == "diff")
 
     if os.name == "nt":
         tokens = _split_powershell_command(command)
@@ -194,16 +203,24 @@ def _wrap_command_for_compression(
         check_str = shlex.join(tokens)
         if _bh._has_dangerous_chars(check_str) or not _bh._is_whitelisted(check_str):
             return None, False
-        sid_prefix = f"--sid {_ps_quote(safe_sid)} -- " if safe_sid else ""
-        rewritten = (
-            "& "
-            + _ps_quote(sys.executable)
-            + " -E -s "
-            + _ps_quote(str(compressor))
-            + " "
-            + sid_prefix
-            + " ".join(_ps_quote(t) for t in tokens)
-        )
+        if _prefer_native_exec(tokens):
+            rewritten = (
+                "& "
+                + _ps_quote(str(fast_bin))
+                + " exec --host antigravity -- "
+                + " ".join(_ps_quote(t) for t in tokens)
+            )
+        else:
+            sid_prefix = f"--sid {_ps_quote(safe_sid)} -- " if safe_sid else ""
+            rewritten = (
+                "& "
+                + _ps_quote(sys.executable)
+                + " -E -s "
+                + _ps_quote(str(compressor))
+                + " "
+                + sid_prefix
+                + " ".join(_ps_quote(t) for t in tokens)
+            )
     else:
         if not _bh._is_whitelisted(command):
             return None, False
@@ -214,15 +231,22 @@ def _wrap_command_for_compression(
         except ValueError:
             return None, False
         check_str = command
-        sid_prefix = f"--sid {shlex.quote(safe_sid)} -- " if safe_sid else ""
-        rewritten = (
-            shlex.quote(sys.executable)
-            + " -E -s "
-            + shlex.quote(str(compressor))
-            + " "
-            + sid_prefix
-            + " ".join(shlex.quote(t) for t in tokens)
-        )
+        if _prefer_native_exec(tokens):
+            rewritten = (
+                shlex.quote(str(fast_bin))
+                + " exec --host antigravity -- "
+                + " ".join(shlex.quote(t) for t in tokens)
+            )
+        else:
+            sid_prefix = f"--sid {shlex.quote(safe_sid)} -- " if safe_sid else ""
+            rewritten = (
+                shlex.quote(sys.executable)
+                + " -E -s "
+                + shlex.quote(str(compressor))
+                + " "
+                + sid_prefix
+                + " ".join(shlex.quote(t) for t in tokens)
+            )
 
     readonly_ok = False
     if cfg.get("auto_approve_readonly", False):
@@ -375,7 +399,7 @@ def _run_background_fold(host: str, job_path: str, env: dict[str, str]) -> None:
 
     ensure_vendor_paths()
 
-    # 1. TokenEconomizer fold (updates EnvFacts/microskills + toolprune ledger)
+    # 1. Session micro-skills fold (updates EnvFacts/microskills + toolprune ledger)
     try:
         from tokeneconomizer.plugin import hook as te_hook  # type: ignore
 
@@ -385,7 +409,7 @@ def _run_background_fold(host: str, job_path: str, env: dict[str, str]) -> None:
     except Exception:
         pass
 
-    # 2. Token Optimizer rollup / checkpoint / dashboard refresh
+    # 2. Analytics rollup / checkpoint / dashboard refresh
     measure_py = _PLUGIN_ROOT / "vendor" / "token_optimizer" / "measure.py"
     if measure_py.is_file():
         child_env = dict(env)
@@ -591,9 +615,9 @@ def handle_pre_tool_use(host: str, payload: dict[str, Any], cfg: dict[str, Any],
             }
         return None
 
-    # 2. Large Grep -> answer directly from fresh jCodeMunch index once
-    if tool_name == "Grep" and cfg.get("codemunch_grep_answer", True) and not cfg.get("shadow"):
-        answer = codemunch_bridge.try_answer_large_grep(tool_input, ws, sid)
+    # 2. Large Grep -> answer directly from fresh AST index once
+    if tool_name == "Grep" and cfg.get("index_grep_answer", True) and not cfg.get("shadow"):
+        answer = index_bridge.try_answer_large_grep(tool_input, ws, sid)
         if answer:
             return {
                 "hookSpecificOutput": {
@@ -652,13 +676,13 @@ def handle_post_tool_use(
         args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
         is_err = bool(str(payload.get("error") or "").strip())
 
-        # Edit/Write -> reset read-cache soft_denies + fire-and-forget jCodeMunch reindex
+        # Edit/Write -> reset read-cache soft_denies + fire-and-forget AST reindex
         if tool_name in ("edit_file", "write_file"):
             fp = str(args.get("Path") or args.get("AbsolutePath") or args.get("path") or "")
             if fp:
                 read_funnel.invalidate_on_edit(sid, fp, env=env)
-                if cfg.get("codemunch_auto_reindex", True):
-                    codemunch_bridge.spawn_reindex_file(fp, env=env)
+                if cfg.get("index_auto_reindex", True):
+                    index_bridge.spawn_reindex_file(fp, env=env)
 
         loop_guard.record_tool_event(sid, tool_name, args, is_error=is_err, cfg=cfg, env=env)
         return {}
@@ -669,7 +693,7 @@ def handle_post_tool_use(
     tool_resp = payload.get("tool_response")
     is_err = is_failure_event or bool(payload.get("error"))
 
-    # 1. Edit/Write/apply_patch -> read-cache soft-deny reset + jCodeMunch incremental auto-reindex
+    # 1. Edit/Write/apply_patch -> read-cache soft-deny reset + incremental AST auto-reindex
     if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit", "apply_patch"):
         edited_paths: list[str] = []
         direct = str(tool_input.get("file_path") or tool_input.get("path") or "").strip()
@@ -688,8 +712,8 @@ def handle_post_tool_use(
                     edited_paths.append(p)
         for fp in edited_paths:
             read_funnel.invalidate_on_edit(sid, fp, env=env)
-            if cfg.get("codemunch_auto_reindex", True):
-                codemunch_bridge.spawn_reindex_file(fp)
+            if cfg.get("index_auto_reindex", True):
+                index_bridge.spawn_reindex_file(fp)
 
     hso: dict[str, Any] = {}
 
@@ -808,7 +832,7 @@ def handle_subagent_start(host: str, payload: dict[str, Any], cfg: dict[str, Any
     if cfg.get("shadow"):
         return {}
     brief = (
-        "[Terser Subagent] Prefer jCodeMunch `order`/`route` or ranged reads (`offset`/`limit`); "
+        "[Terser Subagent] Prefer `terser-index` (`order`/`route`) or ranged reads (`offset`/`limit`); "
         "scope CLI output; return a concise summary with exact file paths and line spans—never dump raw files."
     )
     return {

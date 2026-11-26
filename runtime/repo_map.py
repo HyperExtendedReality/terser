@@ -1,11 +1,10 @@
 """Terser — Zero-Dependency Import-Graph PageRank Repo Map.
 
-Inspired by Aider's PageRank RepoMap and Graphify:
-When a repository is NOT yet indexed by jCodeMunch (or when invoked explicitly
-via `terse repomap`), builds a compact, strictly token-budgeted structural map of
-the most central files and their key symbol signatures using import-graph
-PageRank—cached by git HEAD + file-mtime digest so the output is 100%
-byte-stable across turns (prompt-cache safe!).
+When a repository is NOT yet indexed by Terser's AST index (or when invoked
+explicitly via `terse repomap`), builds a compact, strictly token-budgeted
+structural map of the most central files and their key symbol signatures using
+import-graph PageRank—cached by git HEAD + file-mtime digest so the output is
+100% byte-stable across turns (prompt-cache safe!).
 
 Pure Python stdlib, <150ms on typical repos, fail-open.
 """

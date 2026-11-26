@@ -4,14 +4,14 @@
 Commands:
   status        Unified status, active optimizations, index status, and cumulative token savings
   savings       Breakdown of tokens saved by optimization layer (read funnel, output compress, etc.)
-  audit         Delegate to Token Optimizer full audit/report for the active host
-  coach         Delegate to Token Optimizer project coaching
-  dashboard     Generate/refresh local Token Optimizer dashboard
+  audit         Run full session token & cost audit for the active host
+  coach         Run project token-efficiency coaching
+  dashboard     Generate/refresh local analytics dashboard
   expand <id>   Retrieve full raw output from ~/.terser/archive/<id>.txt
   config        Show or set Terser settings (show | set key=value ... | reset)
-  microskills   Inspect/forget/unforget TokenEconomizer repo facts
-  toolprune     Review/apply/restore TokenEconomizer unused tool pruning
-  doctor        Verify Python, vendored engines, jCodeMunch MCP, hooks, and state directory
+  microskills   Inspect/forget/unforget learned repo EnvFacts micro-skills
+  toolprune     Review/apply/restore unused tool pruning
+  doctor        Verify Python, bundled engines, AST index MCP, hooks, and state directory
 """
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
 
 from runtime import (
     __version__,
-    codemunch_bridge,
+    index_bridge,
     config_auditor,
     context_sandbox,
     output_compressor,
@@ -90,17 +90,35 @@ def _load_savings_summary() -> tuple[int, int, dict[str, dict[str, int]]]:
     return total_events, total_saved, dict(by_cat)
 
 
+def _load_outline_override_count() -> int:
+    cdir = state_home() / "read-cache"
+    total = 0
+    try:
+        if cdir.is_dir():
+            for p in cdir.glob("*.json"):
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    meta = data.get("meta") if isinstance(data, dict) else None
+                    if isinstance(meta, dict):
+                        total += int(meta.get("outline_overrides") or 0)
+                except (OSError, ValueError):
+                    continue
+    except OSError:
+        pass
+    return total
+
+
 def _cmd_status(host: str, cwd: str) -> int:
     cfg = load_config()
     events, total_saved, by_cat = _load_savings_summary()
-    idx = codemunch_bridge.workspace_index_summary(cwd)
-    jcm = codemunch_bridge.find_jcodemunch_cmd()
+    idx = index_bridge.workspace_index_summary(cwd)
+    idx_cmd = index_bridge.find_index_cmd()
 
     print(f"Terser v{__version__}  (host={host}, enabled={cfg['enabled']}, shadow={cfg['shadow']})")
     print(f"  State dir     : {state_home()}")
     print(f"  Read funnel   : cache={cfg['read_cache']} delta={cfg['delta_diff']} outline_first={cfg['outline_first']} (>= {cfg['outline_min_lines']}L, backoff={cfg['outline_backoff_limit']})")
     print(f"  Shell pipeline: form_repair={cfg['form_repair']} compress={cfg['bash_compress']} cmd_delta={cfg['cmd_delta']} fts_sandbox={cfg['fts_sandbox']}")
-    print(f"  Code index    : surface={cfg['codemunch_surface']} auto_reindex={cfg['codemunch_auto_reindex']} repo_map={cfg['repo_map']} binary={' '.join(jcm) if jcm else 'missing'}")
+    print(f"  Code index    : surface={cfg['index_surface']} auto_reindex={cfg['index_auto_reindex']} repo_map={cfg['repo_map']} binary={' '.join(idx_cmd) if idx_cmd else 'missing'}")
     if idx:
         print(f"  Workspace idx : {idx['repo']} ({idx['files']} files, {idx['symbols']} symbols)")
     else:
@@ -112,7 +130,13 @@ def _cmd_status(host: str, cwd: str) -> int:
     print(f"  Local savings : {total_saved:,} tokens across {events} event(s) (~${est_usd_blended:.2f}-${est_usd_fresh:.2f} est. input savings)")
     if by_cat:
         for cat, info in sorted(by_cat.items(), key=lambda kv: -kv[1]["saved_tok"]):
-            print(f"    - {cat:<16} {info['saved_tok']:>8,} tok saved ({info['events']} events)")
+            raw_tok = max(1, int(info.get("raw_tok") or 0))
+            pct = min(99.9, (info["saved_tok"] / raw_tok) * 100.0)
+            print(f"    - {cat:<16} {info['saved_tok']:>8,} tok saved ({pct:>4.1f}% across {info['events']} hit(s))")
+    overrides = _load_outline_override_count()
+    outline_hits = int((by_cat.get("read_outline") or {}).get("events") or 0)
+    if outline_hits or overrides:
+        print(f"  Outline stats : {outline_hits} outline(s) served, {overrides} full-file override(s)")
     return 0
 
 
@@ -157,7 +181,7 @@ def _cmd_config(args: list[str]) -> int:
 def _run_measure(host: str, measure_args: list[str]) -> int:
     measure_py = TO_VENDOR_DIR / "measure.py"
     if not measure_py.is_file():
-        print("Token Optimizer vendor scripts missing. Run scripts/bundle_vendors.py.", file=sys.stderr)
+        print("Terser analytics engine missing. Run scripts/bundle_vendors.py.", file=sys.stderr)
         return 1
     env = dict(os.environ, TOKEN_OPTIMIZER_RUNTIME=host, PYTHONUTF8="1")
     proc = subprocess.run([sys.executable, str(measure_py), *measure_args], env=env)
@@ -166,7 +190,7 @@ def _run_measure(host: str, measure_args: list[str]) -> int:
 
 def _run_te_cli(host: str, cwd: str, te_args: list[str]) -> int:
     if not TE_VENDOR_DIR.is_dir():
-        print("TokenEconomizer vendor package missing. Run scripts/bundle_vendors.py.", file=sys.stderr)
+        print("Terser micro-skills engine missing. Run scripts/bundle_vendors.py.", file=sys.stderr)
         return 1
     ensure_vendor_paths()
     try:
@@ -174,7 +198,7 @@ def _run_te_cli(host: str, cwd: str, te_args: list[str]) -> int:
 
         return int(te_cli.main(["--host", host, "--cwd", cwd, *te_args]) or 0)
     except Exception as exc:
-        print(f"TokenEconomizer CLI error: {exc}", file=sys.stderr)
+        print(f"Terser micro-skills CLI error: {exc}", file=sys.stderr)
         return 1
 
 
@@ -182,21 +206,26 @@ def _cmd_doctor(host: str, cwd: str) -> int:
     ok = True
     print(f"Terser Doctor (v{__version__}, host={host})")
     print(f"  [PASS] Python          : {sys.version.split()[0]} ({sys.executable})")
-    if TE_VENDOR_DIR.is_dir():
-        print(f"  [PASS] TokenEconomizer : vendored at {TE_VENDOR_DIR}")
+    fast_bin = _PLUGIN_ROOT / "bin" / ("terser-fast.exe" if os.name == "nt" else "terser-fast")
+    if fast_bin.is_file():
+        print(f"  [PASS] Rust fast-path  : {fast_bin} ({fast_bin.stat().st_size:,} B)")
     else:
-        print(f"  [FAIL] TokenEconomizer : missing at {TE_VENDOR_DIR}")
+        print("  [INFO] Rust fast-path  : not built (pure-Python fallback; run `python scripts/install.py --build-native`)")
+    if TE_VENDOR_DIR.is_dir():
+        print(f"  [PASS] Micro-skills    : bundled at {TE_VENDOR_DIR}")
+    else:
+        print(f"  [FAIL] Micro-skills    : missing at {TE_VENDOR_DIR}")
         ok = False
     if (TO_VENDOR_DIR / "measure.py").is_file():
-        print(f"  [PASS] Token Optimizer : vendored at {TO_VENDOR_DIR}")
+        print(f"  [PASS] Analytics       : bundled at {TO_VENDOR_DIR}")
     else:
-        print(f"  [FAIL] Token Optimizer : missing at {TO_VENDOR_DIR}")
+        print(f"  [FAIL] Analytics       : missing at {TO_VENDOR_DIR}")
         ok = False
-    jcm = codemunch_bridge.find_jcodemunch_cmd()
-    if jcm:
-        print(f"  [PASS] jCodeMunch MCP  : {' '.join(jcm)}")
+    idx_cmd = index_bridge.find_index_cmd()
+    if idx_cmd:
+        print(f"  [PASS] AST Index MCP   : {' '.join(idx_cmd)}")
     else:
-        print("  [WARN] jCodeMunch MCP  : neither `jcodemunch-mcp` nor `uvx` found on PATH")
+        print("  [WARN] AST Index MCP   : AST code-index MCP binary / `uvx` not found on PATH")
     for label, p in (
         ("Antigravity manifest", _PLUGIN_ROOT / "plugin.json"),
         ("Antigravity hooks", _PLUGIN_ROOT / "hooks.json"),
@@ -213,7 +242,7 @@ def _cmd_doctor(host: str, cwd: str) -> int:
             print(f"  [FAIL] {label:<20}: {exc}")
             ok = False
     print(f"  [INFO] Config file     : {config_path()} ({'exists' if config_path().is_file() else 'defaults'})")
-    idx = codemunch_bridge.workspace_index_summary(cwd)
+    idx = index_bridge.workspace_index_summary(cwd)
     print(f"  [INFO] CWD code index  : {idx['repo'] if idx else 'not indexed'}")
     return 0 if ok else 1
 
@@ -245,13 +274,19 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_config(sub)
     if cmd == "expand":
         if not sub:
-            print("Usage: terse expand <archive-id> [start_line end_line]", file=sys.stderr)
+            print("Usage: terse expand <archive-id|--last> [start_line end_line]", file=sys.stderr)
             return 2
+        target_id = sub[0]
+        if target_id in ("--last", "last", "latest"):
+            target_id = context_sandbox.get_latest_archive_id() or ""
+            if not target_id:
+                print(f"No archived outputs found in {state_home()}", file=sys.stderr)
+                return 1
         s_ln = int(sub[1]) if len(sub) >= 2 and sub[1].isdigit() else None
         e_ln = int(sub[2]) if len(sub) >= 3 and sub[2].isdigit() else None
-        text = output_compressor.read_archived_output(sub[0], start_line=s_ln, end_line=e_ln)
+        text = output_compressor.read_archived_output(target_id, start_line=s_ln, end_line=e_ln)
         if text is None:
-            print(f"Archive `{sub[0]}` not found in {state_home()}", file=sys.stderr)
+            print(f"Archive `{target_id}` not found in {state_home()}", file=sys.stderr)
             return 1
         sys.stdout.write(text)
         if not text.endswith("\n"):
@@ -259,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if cmd == "query":
         if len(sub) < 2:
-            print('Usage: terse query <archive-id> "<keywords>"', file=sys.stderr)
+            print('Usage: terse query <archive-id|--last> "<keywords>"', file=sys.stderr)
             return 2
         res = context_sandbox.query_output(sub[0], " ".join(sub[1:]))
         if res is None:

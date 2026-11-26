@@ -1,11 +1,11 @@
 ---
-name: code-munch
-description: Token-efficient AST code navigation, symbol retrieval, call hierarchy, blast radius, and safe refactoring through the 6-tool jCodeMunch Counter front door.
+name: terser-index
+description: Token-efficient AST code navigation, symbol retrieval, call hierarchy, blast radius, and safe refactoring through Terser's 6-tool Counter front door.
 ---
 
-# Code Munch — Symbol-First Navigation Workflow
+# Terser Index — Symbol-First Navigation Workflow
 
-`terser-codemunch` defaults to the **6-tool Counter front door** (~1,050 schema tokens vs ~25,800 full), keeping all 90+ AST/graph actions one call away:
+`terser-index` defaults to the **6-tool Counter front door** (~1,050 schema tokens vs ~25,800 full), keeping all 90+ AST/graph actions one call away:
 
 1. **Discover / route**: call `route(task="...", repo="...")` (or `menu(query="...")` for exact arg shapes).
 2. **Locate symbols**: `order(action="search_symbols", args={"repo": ..., "query": ...})` → then fetch ONLY the exact body with `order(action="get_symbol_source", args={"repo": ..., "symbol_id": ...})`.
