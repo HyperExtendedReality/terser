@@ -49,21 +49,22 @@ def spawn_reindex_file(file_path: str, *, env: dict[str, str] | None = None) -> 
     if workspace_index_summary(str(p.parent), env=env) is None:
         return False
     try:
-        kwargs: dict[str, Any] = {
+        from runtime.config import detached_spawn_kwargs, windowless_python
+
+        py_exe = windowless_python(sys.executable)
+        base_kwargs: dict[str, Any] = {
             "stdout": subprocess.DEVNULL,
             "stderr": subprocess.DEVNULL,
             "stdin": subprocess.DEVNULL,
+            "close_fds": True,
         }
         if env is not None:
-            kwargs["env"] = env
-        if sys.platform == "win32":
-            kwargs["creationflags"] = (
-                getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-                | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-            )
-        else:
-            kwargs["start_new_session"] = True
-        subprocess.Popen([sys.executable, "-E", "-s", "-X", "utf8", str(_INDEX_MCP_PY), "index-file", file_path], **kwargs)
+            base_kwargs["env"] = env
+        cmd = [py_exe, "-E", "-s", "-X", "utf8", str(_INDEX_MCP_PY), "index-file", file_path]
+        try:
+            subprocess.Popen(cmd, **base_kwargs, **detached_spawn_kwargs(breakaway=True))
+        except OSError:
+            subprocess.Popen(cmd, **base_kwargs, **detached_spawn_kwargs(breakaway=False))
         return True
     except (OSError, ValueError):
         return False

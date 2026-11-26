@@ -11,7 +11,7 @@
 [![Hook Latency](https://img.shields.io/badge/Rust%20hot--path-~10ms%20(14.1x)-F97316?style=flat-square)](#native-rust-hot-path-terser-fast)
 [![Python](https://img.shields.io/badge/python-3.10%2B%20stdlib-3776AB?style=flat-square&logo=python&logoColor=white)](#requirements)
 [![Hosts](https://img.shields.io/badge/hosts-Antigravity%20%7C%20Claude%20Code%20%7C%20Codex-6366F1?style=flat-square)](#quick-start)
-[![License](https://img.shields.io/badge/license-MIT-0EA5E9?style=flat-square)](#license)
+[![License](https://img.shields.io/badge/license-GPL--3.0-0EA5E9?style=flat-square)](LICENSE)
 
 **One fast, single-process, fail-open token-efficiency engine for Antigravity 2.0, Claude Code, and Codex.**
 
@@ -257,4 +257,4 @@ python scripts/install.py --bump patch --build-dist
 
 ## License
 
-MIT © Terser Contributors
+[GNU General Public License v3.0 (GPL-3.0)](LICENSE) © 2026 HyperExtendedReality

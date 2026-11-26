@@ -132,6 +132,43 @@ fn tool_signature(tool_name: &str, args: &Map<String, Value>) -> Option<(String,
     None
 }
 
+fn is_shell_edit(tool_name: &str, args: &Map<String, Value>) -> bool {
+    let low = tool_name.to_ascii_lowercase();
+    if !matches!(
+        low.as_str(),
+        "run_command" | "bash" | "shell" | "exec_command" | "local_shell" | "powershell"
+    ) {
+        return false;
+    }
+    let Some(cmd_val) = args
+        .get("CommandLine")
+        .or_else(|| args.get("command"))
+        .or_else(|| args.get("cmd"))
+    else {
+        return false;
+    };
+    let cmd = match cmd_val {
+        Value::String(s) => s.to_ascii_lowercase(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase(),
+        _ => return false,
+    };
+    cmd.contains("sed -i")
+        || cmd.contains("sed --in-place")
+        || cmd.contains("perl -pi")
+        || cmd.contains("git apply")
+        || cmd.contains("apply_patch")
+        || cmd.contains(" patch ")
+        || cmd.starts_with("patch ")
+        || cmd.contains(" tee ")
+        || cmd.contains(" > ")
+        || cmd.contains(" >> ")
+}
+
 fn should_fire(count: i64, threshold: i64) -> bool {
     count >= threshold && ((count - threshold) % REPEAT_AFTER == 0)
 }
@@ -182,7 +219,16 @@ pub fn record_tool_event(
         fail_streaks.insert(key.clone(), json!(c));
         c
     } else {
-        fail_streaks.remove(&key);
+        let low_tool = tool_name.to_ascii_lowercase();
+        if matches!(
+            low_tool.as_str(),
+            "edit_file" | "write_file" | "edit" | "write" | "multiedit" | "apply_patch"
+        ) || is_shell_edit(tool_name, args)
+        {
+            fail_streaks.clear();
+        } else {
+            fail_streaks.remove(&key);
+        }
         0
     };
     while fail_streaks.len() > 50 {

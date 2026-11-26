@@ -28,7 +28,17 @@ TERSER_MARKER = "terser"
 
 
 def _resolve_python() -> str:
-    return os.path.realpath(sys.executable)
+    exe = os.path.realpath(sys.executable)
+    if sys.platform == "win32" and exe:
+        folder, name = os.path.split(exe)
+        candidates = ["pythonw.exe"]
+        if name.lower().startswith("python") and not name.lower().startswith("pythonw"):
+            candidates.insert(0, "pythonw" + name[len("python"):])
+        for cand in candidates:
+            path = os.path.join(folder, cand)
+            if os.path.isfile(path):
+                return path
+    return exe
 
 
 def _antigravity_home() -> Path:

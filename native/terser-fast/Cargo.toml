@@ -3,7 +3,7 @@ name = "terser-fast"
 version = "1.2.0"
 edition = "2021"
 description = "Optional native Rust hot-path hook accelerator for Terser"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [dependencies]
 serde_json = "1"

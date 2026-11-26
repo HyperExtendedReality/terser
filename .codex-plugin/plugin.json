@@ -5,7 +5,7 @@
   "author": {
     "name": "Terser"
   },
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "skills": "./skills/",
   "hooks": "./hooks/codex-hooks.json",
   "keywords": [

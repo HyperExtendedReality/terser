@@ -7,7 +7,7 @@
   "author": {
     "name": "Terser"
   },
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "commands": "./commands/",
   "skills": "./skills/",
   "hooks": "./hooks/hooks.json",

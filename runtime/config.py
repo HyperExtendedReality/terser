@@ -220,3 +220,50 @@ def record_savings(
             fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
     except OSError:
         pass
+
+
+def no_window_kwargs() -> dict[str, Any]:
+    """Subprocess kwargs that prevent console windows from flashing on Windows."""
+    if sys.platform == "win32":
+        import subprocess
+
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
+
+
+def detached_spawn_kwargs(*, breakaway: bool = False) -> dict[str, Any]:
+    """Subprocess kwargs for detached background workers without console window flashes.
+
+    Note: Never combine DETACHED_PROCESS with CREATE_NO_WINDOW on Windows — Windows
+    ignores CREATE_NO_WINDOW when DETACHED_PROCESS is set, leaving the worker without
+    a console so every child console process it spawns flashes a visible terminal window.
+    CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP gives the worker a hidden console that
+    all child processes inherit silently.
+    """
+    if sys.platform == "win32":
+        import subprocess
+
+        flags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+        if breakaway:
+            flags |= getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        return {"creationflags": flags}
+    return {"start_new_session": True}
+
+
+def windowless_python(executable: str | None = None) -> str:
+    """Return pythonw.exe beside `executable` on Windows if present, else `executable`."""
+    exe = executable or sys.executable
+    if sys.platform != "win32" or not exe:
+        return exe
+    folder, name = os.path.split(exe)
+    candidates = ["pythonw.exe"]
+    if name.lower().startswith("python") and not name.lower().startswith("pythonw"):
+        candidates.insert(0, "pythonw" + name[len("python"):])
+    for cand in candidates:
+        path = os.path.join(folder, cand)
+        if os.path.isfile(path):
+            return path
+    return exe

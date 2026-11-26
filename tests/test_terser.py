@@ -711,6 +711,103 @@ class NativeFastPathTests(unittest.TestCase):
         src = index_mcp.dispatch_action("get_symbol_source", {"repo": repo, "symbol_id": sym_id}, env=self.env)
         self.assertIn("return a + b", src["source"])
 
+    def test_windows_no_window_spawn_helpers(self) -> None:
+        from runtime import config as cfg_mod
+
+        nw = cfg_mod.no_window_kwargs()
+        det = cfg_mod.detached_spawn_kwargs(breakaway=False)
+        det_ba = cfg_mod.detached_spawn_kwargs(breakaway=True)
+        if sys.platform == "win32":
+            create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            detached_process = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            new_group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            breakaway = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+
+            self.assertEqual(nw.get("creationflags"), create_no_window)
+            self.assertTrue(det["creationflags"] & create_no_window)
+            self.assertTrue(det["creationflags"] & new_group)
+            # DETACHED_PROCESS overrides CREATE_NO_WINDOW on Windows and causes child console flashes
+            self.assertFalse(det["creationflags"] & detached_process)
+            self.assertFalse(det_ba["creationflags"] & detached_process)
+            self.assertTrue(det_ba["creationflags"] & breakaway)
+        else:
+            self.assertEqual(nw, {})
+            self.assertEqual(det, {"start_new_session": True})
+
+    def test_sandbox_redaction_porter_bm25_and_chunking(self) -> None:
+        # 1. Credential redaction before storing to sandbox.db
+        secret = "ghp_1234567890abcdefghijklmnopqrstuvwx"
+        raw = f"# Auth Setup\nToken: {secret}\n\n## Build Notes\n```python\ndef compiled_worker():\n    return 42\n```\n"
+        aid = context_sandbox.store_output(raw, command=f"curl -H {secret}", env=self.env)
+        self.assertIsNotNone(aid)
+        assert aid is not None
+        expanded = context_sandbox.expand_output(aid, env=self.env) or ""
+        self.assertNotIn(secret, expanded)
+
+        # 2. Porter stemming: querying "compiling" matches "compiled_worker" / "compiled"
+        raw2 = "# Section One\nWe compiled the module cleanly.\n\n# Section Two\nUnrelated filler text.\n"
+        aid2 = context_sandbox.store_output(raw2, command="build", env=self.env)
+        assert aid2 is not None
+        res = context_sandbox.query_output(aid2, "compiling", env=self.env) or ""
+        self.assertIn("compiled", res)
+
+        # 3. Structure-aware chunking keeps fenced code blocks intact
+        lines = ["# Heading", "Intro line", "```py"] + [f"x = {i}" for i in range(20)] + ["```"]
+        chunks = context_sandbox._chunk_lines(lines)
+        self.assertTrue(any("```py" in b and "x = 19" in b and b.rstrip().endswith("```") for _, _, b in chunks))
+
+    def test_mcp_sandbox_actions_and_execute_filtered(self) -> None:
+        from runtime import index_mcp
+
+        # index_sandbox_file + search_sandbox + expand_sandbox
+        doc = self.tmp / "guide.md"
+        doc.write_text("# Overview\nAlpha intro.\n\n# Troubleshooting\nFix needle_err_99 by restarting.\n", encoding="utf-8")
+        idx_res = index_mcp.dispatch_action("index_sandbox_file", {"path": str(doc)}, env=self.env)
+        self.assertIn("archive_id", idx_res)
+        aid = idx_res["archive_id"]
+
+        s_res = index_mcp.dispatch_action("search_sandbox", {"archive_id": aid, "query": "needle_err_99"}, env=self.env)
+        self.assertIn("needle_err_99", s_res.get("result", ""))
+
+        e_res = index_mcp.dispatch_action("expand_sandbox", {"archive_id": aid, "start_line": 1, "end_line": 2}, env=self.env)
+        self.assertIn("Overview", e_res.get("content", ""))
+
+        # execute_filtered: >5KB stdout with intent -> filtered via FTS5
+        py_script = "for i in range(220): print(f'log line {i}: ' + ('CRITICAL_TARGET_XYZ' if i == 150 else 'routine noise padding ' * 2))"
+        ex_res = index_mcp.dispatch_action(
+            "execute_filtered",
+            {"argv": [sys.executable, "-c", py_script], "intent": "CRITICAL_TARGET_XYZ"},
+            env=self.env,
+        )
+        self.assertEqual(ex_res.get("returncode"), 0)
+        self.assertTrue(ex_res.get("filtered"))
+        self.assertIn("CRITICAL_TARGET_XYZ", ex_res.get("output", ""))
+        self.assertTrue(ex_res.get("archive_id"))
+
+    def test_live_session_event_continuity_and_shell_edit_progress(self) -> None:
+        ws = str(self.tmp / "cont_ws")
+        Path(ws).mkdir()
+        context_sandbox.record_session_event("s-old", ws, "edit", "engine.py", env=self.env)
+        context_sandbox.record_session_event("s-old", ws, "error", "pytest: AssertionError", env=self.env)
+
+        from runtime.config import DEFAULT_CONFIG
+
+        cfg = dict(DEFAULT_CONFIG)
+        brief, notice = session_brief.build_session_brief(ws, host="antigravity", cfg=cfg, env=self.env)
+        self.assertIsNotNone(brief)
+        assert brief is not None
+        self.assertIn("engine.py", brief)
+        self.assertIn("AssertionError", brief)
+
+        # Shell-edit progress resets failure streaks in loop_guard
+        sid = "s-shell-edit"
+        loop_guard.record_tool_event(sid, "run_command", {"CommandLine": "pytest"}, is_error=True, cfg=cfg, env=self.env)
+        loop_guard.record_tool_event(sid, "run_command", {"CommandLine": "pytest"}, is_error=True, cfg=cfg, env=self.env)
+        # Successful shell edit clears fail streak
+        loop_guard.record_tool_event(sid, "run_command", {"CommandLine": "sed -i 's/a/b/' app.py"}, is_error=False, cfg=cfg, env=self.env)
+        nudge = loop_guard.record_tool_event(sid, "run_command", {"CommandLine": "pytest"}, is_error=True, cfg=cfg, env=self.env)
+        self.assertIsNone(nudge)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -331,21 +331,27 @@ def _ag_system_step(text: str, *, user_markdown: str | None = None) -> dict[str,
 # ---------------------------------------------------------------------------
 
 def _spawn_detached(cmd: list[str], env: dict[str, str]) -> None:
+    from runtime.config import detached_spawn_kwargs, windowless_python
+
+    launch_cmd = list(cmd)
+    if sys.platform == "win32" and launch_cmd and launch_cmd[0] == sys.executable:
+        launch_cmd[0] = windowless_python(sys.executable)
+
+    base_kwargs: dict[str, Any] = {
+        "env": env,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+    }
     try:
-        kwargs: dict[str, Any] = {
-            "env": env,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-            "stdin": subprocess.DEVNULL,
-        }
-        if sys.platform == "win32":
-            kwargs["creationflags"] = (
-                getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-                | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-            )
-        else:
-            kwargs["start_new_session"] = True
-        subprocess.Popen(cmd, **kwargs)
+        subprocess.Popen(launch_cmd, **base_kwargs, **detached_spawn_kwargs(breakaway=True))
+    except OSError:
+        # Windows job objects may forbid CREATE_BREAKAWAY_FROM_JOB; retry without it
+        try:
+            subprocess.Popen(launch_cmd, **base_kwargs, **detached_spawn_kwargs(breakaway=False))
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -415,23 +421,26 @@ def _run_background_fold(host: str, job_path: str, env: dict[str, str]) -> None:
         child_env = dict(env)
         child_env["TOKEN_OPTIMIZER_RUNTIME"] = host
         child_env["PYTHONUTF8"] = "1"
+        from runtime.config import no_window_kwargs
+
+        nw = no_window_kwargs()
         try:
             if host == "antigravity":
                 subprocess.run(
                     [sys.executable, "-E", "-s", str(measure_py), "antigravity-rollup", "--quiet"],
-                    env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45,
+                    env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45, **nw,
                 )
                 subprocess.run(
                     [sys.executable, "-E", "-s", str(measure_py), "dashboard", "--quiet"],
                     env={**child_env, "TOKEN_OPTIMIZER_INTERACTIVE": "1"},
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, **nw,
                 )
             else:
                 trigger = str(payload.get("_terser_trigger") or "stop")
                 args = [sys.executable, "-E", "-s", str(measure_py), "compact-capture", "--trigger", trigger, "--quiet"]
                 subprocess.run(
                     args, input=json.dumps(payload), text=True,
-                    env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+                    env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20, **nw,
                 )
         except Exception:
             pass
@@ -676,13 +685,24 @@ def handle_post_tool_use(
         args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
         is_err = bool(str(payload.get("error") or "").strip())
 
-        # Edit/Write -> reset read-cache soft_denies + fire-and-forget AST reindex
+        # Edit/Write -> reset read-cache soft_denies + fire-and-forget AST reindex + continuity event
+        ws = _workspace(payload, env)
         if tool_name in ("edit_file", "write_file"):
             fp = str(args.get("Path") or args.get("AbsolutePath") or args.get("path") or "")
             if fp:
                 read_funnel.invalidate_on_edit(sid, fp, env=env)
                 if cfg.get("index_auto_reindex", True):
                     index_bridge.spawn_reindex_file(fp, env=env)
+                if ws and not cfg.get("shadow"):
+                    from runtime import context_sandbox
+
+                    context_sandbox.record_session_event(sid, ws, "edit", Path(fp).name, env=env)
+
+        if is_err and ws and not cfg.get("shadow"):
+            from runtime import context_sandbox
+
+            err_snip = str(payload.get("error") or "")[:120]
+            context_sandbox.record_session_event(sid, ws, "error", f"{tool_name}: {err_snip}", env=env)
 
         loop_guard.record_tool_event(sid, tool_name, args, is_error=is_err, cfg=cfg, env=env)
         return {}
@@ -710,10 +730,15 @@ def handle_post_tool_use(
                 p = m.group(1).strip()
                 if p and p not in edited_paths:
                     edited_paths.append(p)
+        ws_cl = _workspace(payload, env)
         for fp in edited_paths:
             read_funnel.invalidate_on_edit(sid, fp, env=env)
             if cfg.get("index_auto_reindex", True):
                 index_bridge.spawn_reindex_file(fp)
+            if ws_cl and not cfg.get("shadow"):
+                from runtime import context_sandbox
+
+                context_sandbox.record_session_event(sid, ws_cl, "edit", Path(fp).name, env=env)
 
     hso: dict[str, Any] = {}
 
@@ -781,7 +806,14 @@ def handle_post_tool_use(
             hso["hookEventName"] = "PostToolUse"
             hso["updatedToolOutput"] = capped
 
-    # 4. Unified Loop/Thrash Guard
+    # 4. Unified Loop/Thrash Guard + live error continuity event
+    if is_err and not cfg.get("shadow"):
+        ws_err = _workspace(payload, env)
+        if ws_err:
+            from runtime import context_sandbox
+
+            err_snip = str(payload.get("error") or "")[:120]
+            context_sandbox.record_session_event(sid, ws_err, "error", f"{tool_name}: {err_snip}", env=env)
     nudge = loop_guard.record_tool_event(sid, tool_name, tool_input, is_error=is_err, cfg=cfg, env=env)
     if nudge:
         hso["hookEventName"] = "PostToolUseFailure" if is_failure_event else "PostToolUse"
@@ -800,6 +832,8 @@ def handle_pre_compact(host: str, payload: dict[str, Any], cfg: dict[str, Any], 
         measure_py = _PLUGIN_ROOT / "vendor" / "token_optimizer" / "measure.py"
         if measure_py.is_file():
             try:
+                from runtime.config import no_window_kwargs
+
                 proc = subprocess.run(
                     [sys.executable, "-E", "-s", str(measure_py), "dynamic-compact-instructions", "--quiet"],
                     input=json.dumps(payload),
@@ -809,6 +843,7 @@ def handle_pre_compact(host: str, payload: dict[str, Any], cfg: dict[str, Any], 
                     errors="replace",
                     env=dict(env, TOKEN_OPTIMIZER_RUNTIME="claude", PYTHONUTF8="1"),
                     timeout=8,
+                    **no_window_kwargs(),
                 )
                 raw = (proc.stdout or "").strip()
                 if raw.startswith("{"):

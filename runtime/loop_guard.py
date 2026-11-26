@@ -21,6 +21,27 @@ _TTL_SECONDS = 7 * 86400
 _STALE_SECONDS = 1800.0
 _REPEAT_AFTER = 3
 _LABEL_MAX = 80
+_SHELL_EDIT_RE = re.compile(
+    r"(?:"
+    r"\bsed\s+(?:-[^\s]*i|--in-place)\b"
+    r"|\bperl\s+-[^\s]*i"
+    r"|\b(?:patch|apply_patch)\b"
+    r"|\bgit\s+apply\b"
+    r"|\btee\s+(?:-a\s+)?[^\s|&;]+"
+    r"|(?:^|[\s;&|])>{1,2}\s*[^\s&|;]+"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _is_shell_edit(tool_name: str, args: dict[str, Any]) -> bool:
+    low = (tool_name or "").lower()
+    if low not in ("run_command", "bash", "shell", "exec_command", "local_shell", "powershell"):
+        return False
+    cmd = args.get("CommandLine") or args.get("command") or args.get("cmd")
+    if isinstance(cmd, list):
+        cmd = " ".join(str(x) for x in cmd)
+    return isinstance(cmd, str) and bool(_SHELL_EDIT_RE.search(cmd))
 
 
 def _state_dir(env: dict[str, str] | None = None) -> Path:
@@ -141,7 +162,13 @@ def record_tool_event(
         fail_count = int(fail_streaks.get(key) or 0) + 1
         fail_streaks[key] = fail_count
     else:
-        fail_streaks.pop(key, None)
+        # Successful edits (including shell-based edits like sed -i / patch / git apply)
+        # represent real progress and reset prior failure streaks so re-running tests is never falsely nudged.
+        low_tool = (tool_name or "").lower()
+        if low_tool in ("edit_file", "write_file", "edit", "write", "multiedit", "apply_patch") or _is_shell_edit(tool_name, args or {}):
+            fail_streaks.clear()
+        else:
+            fail_streaks.pop(key, None)
         fail_count = 0
     if len(fail_streaks) > 50:
         fail_streaks = dict(list(fail_streaks.items())[-50:])

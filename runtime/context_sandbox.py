@@ -1,12 +1,13 @@
-"""Terser — Local SQLite FTS5 Context Sandbox.
+"""Terser — Local SQLite FTS5 Context Sandbox & Session Continuity Store.
 
-Instead of forcing an agent to dump an entire 100 KB archived output back into
-context via `terse expand <id>`, every oversized command or MCP output is chunked
-and indexed into a local SQLite FTS5 database (`~/.terser/sandbox.db`).
+Every oversized command, MCP, or indexed doc/log output is:
+  1. Scrubbed for credentials/API keys before hitting disk.
+  2. Chunked with Markdown-heading & code-fence awareness.
+  3. Indexed into a local SQLite FTS5 database (`~/.terser/sandbox.db`) with
+     Porter stemming (`porter unicode61`) and BM25 relevance ranking.
 
-Agents can then run:
-  - `terse query <id> "<keywords>"` -> returns only the top matching 30-line chunks (~300 tok)
-  - `terse expand <id> [start_line end_line]` -> returns an exact line range or full text
+Also maintains a lightweight structured `session_events` log (recent edits &
+errors per workspace) for instant, zero-latency compaction/session continuity.
 
 100% Python stdlib (`sqlite3`), local-only, auto-pruned after 7 days, fail-open.
 """
@@ -20,16 +21,155 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from runtime.config import state_home
+from runtime.config import ensure_vendor_paths, normalize_workspace, state_home
 
 _TTL_SECONDS = 7 * 86400
 _MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MB total archive cap
 _CHUNK_LINES = 30
+_MAX_BLOCK_LINES = 80
+_MAX_SESSION_EVENTS = 200
 _ID_RE = re.compile(r"^[0-9a-f]{6,32}$")
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S")
+_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
+
+# Lightweight fallback secret patterns if vendored credential_patterns is unavailable
+_FALLBACK_SECRET_RE = re.compile(
+    r"(?:"
+    r"sk-[A-Za-z0-9_-]{20,}"
+    r"|gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|AKIA[0-9A-Z]{16}"
+    r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AIza[0-9A-Za-z_-]{35}"
+    r"|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+    r")"
+)
+
+
+def redact_text(text: str, *, is_command: bool = False) -> str:
+    """Scrub API keys, tokens, and secrets before persisting text to disk."""
+    if not text:
+        return ""
+    try:
+        ensure_vendor_paths()
+        import credential_patterns  # type: ignore
+
+        return str(credential_patterns.redact_credentials(text, command=is_command))
+    except Exception:
+        return _FALLBACK_SECRET_RE.sub("[REDACTED]", text)
+
+
+def _chunk_lines(lines: list[str]) -> list[tuple[int, int, str]]:
+    """Structure-aware chunking: respects Markdown headings and keeps code fences intact."""
+    if not lines:
+        return []
+    chunks: list[tuple[int, int, str]] = []
+    cur: list[str] = []
+    cur_start = 1
+    in_fence = False
+    fence_marker = ""
+
+    def flush(end_line: int) -> None:
+        nonlocal cur
+        if cur:
+            body = "\n".join(cur)
+            if body.strip():
+                chunks.append((cur_start, end_line, body))
+            cur = []
+
+    for idx, line in enumerate(lines, start=1):
+        m_fence = _FENCE_RE.match(line)
+        if m_fence:
+            marker = m_fence.group(1)
+            if not in_fence:
+                # Start of fenced code block: flush prior chunk if already substantial
+                if len(cur) >= _CHUNK_LINES // 2:
+                    flush(idx - 1)
+                    cur_start = idx
+                in_fence = True
+                fence_marker = marker
+            elif marker == fence_marker:
+                in_fence = False
+                fence_marker = ""
+            cur.append(line)
+            if not in_fence and len(cur) >= _CHUNK_LINES:
+                flush(idx)
+                cur_start = idx + 1
+            continue
+
+        if not in_fence and _HEADING_RE.match(line) and cur:
+            flush(idx - 1)
+            cur_start = idx
+            cur.append(line)
+            continue
+
+        if not cur:
+            cur_start = idx
+        cur.append(line)
+
+        limit = _MAX_BLOCK_LINES if in_fence else _CHUNK_LINES
+        if len(cur) >= limit:
+            flush(idx)
+            cur_start = idx + 1
+
+    flush(len(lines))
+    return chunks
 
 
 def _db_path(env: dict[str, str] | None = None) -> Path:
     return state_home(env) / "sandbox.db"
+
+
+def _ensure_fts_table(conn: sqlite3.Connection) -> bool:
+    """Ensure `chunks_fts` uses Porter stemming (`porter unicode61`), migrating if needed."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+    ).fetchone()
+    if row is not None:
+        sql = str(row[0] or "").lower()
+        if "porter" in sql:
+            return True
+        # Migrate legacy unstemmed FTS5 table in place
+        try:
+            conn.execute("DROP TABLE chunks_fts")
+        except sqlite3.OperationalError:
+            return True
+
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                blob_id UNINDEXED,
+                start_line UNINDEXED,
+                end_line UNINDEXED,
+                body,
+                tokenize='porter unicode61'
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chunks_plain (
+                blob_id TEXT,
+                start_line INTEGER,
+                end_line INTEGER,
+                body TEXT
+            )
+            """
+        )
+        return False
+
+    # If we migrated an existing database with blobs, re-populate chunks_fts
+    if row is not None:
+        for bid, content in conn.execute("SELECT id, content FROM blobs").fetchall():
+            chunks = _chunk_lines(str(content or "").splitlines())
+            if chunks:
+                conn.executemany(
+                    "INSERT INTO chunks_fts (blob_id, start_line, end_line, body) VALUES (?, ?, ?, ?)",
+                    [(str(bid), s, e, b) for s, e, b in chunks],
+                )
+    return True
 
 
 def _connect(env: dict[str, str] | None = None) -> sqlite3.Connection:
@@ -49,29 +189,22 @@ def _connect(env: dict[str, str] | None = None) -> sqlite3.Connection:
         )
         """
     )
-    try:
-        conn.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                blob_id UNINDEXED,
-                start_line UNINDEXED,
-                end_line UNINDEXED,
-                body
-            )
-            """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS session_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            workspace TEXT,
+            kind TEXT,
+            summary TEXT,
+            created_at REAL
         )
-    except sqlite3.OperationalError:
-        # Fallback if a minimal Python build lacks FTS5: plain chunks table
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS chunks_plain (
-                blob_id TEXT,
-                start_line INTEGER,
-                end_line INTEGER,
-                body TEXT
-            )
-            """
-        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_ws_ts ON session_events (workspace, created_at DESC)"
+    )
+    _ensure_fts_table(conn)
     return conn
 
 
@@ -99,7 +232,6 @@ def _prune_old(conn: sqlite3.Connection, now: float, max_bytes: int = _MAX_TOTAL
     old_ids = [r[0] for r in conn.execute("SELECT id FROM blobs WHERE created_at < ?", (cutoff,)).fetchall()]
     _delete_ids(conn, old_ids)
 
-    # Size-cap pruning: evict oldest blobs while total stored bytes exceed max_bytes
     row = conn.execute("SELECT COALESCE(SUM(total_bytes), 0) FROM blobs").fetchone()
     total = int(row[0] or 0) if row else 0
     if total > max_bytes:
@@ -110,6 +242,9 @@ def _prune_old(conn: sqlite3.Connection, now: float, max_bytes: int = _MAX_TOTAL
             evict.append(str(bid))
             total -= int(bsz or 0)
         _delete_ids(conn, evict)
+
+    # Also prune old session events
+    conn.execute("DELETE FROM session_events WHERE created_at < ?", (cutoff,))
 
 
 def get_latest_archive_id(env: dict[str, str] | None = None) -> str | None:
@@ -137,12 +272,15 @@ def store_output(
     command: str = "",
     env: dict[str, str] | None = None,
 ) -> str | None:
-    """Index `raw_text` into sandbox.db and return its short archive ID."""
+    """Redact credentials, chunk with structure awareness, and index into sandbox.db."""
     if not raw_text:
         return None
+    safe_text = redact_text(raw_text, is_command=False)
+    safe_cmd = redact_text(command[:200], is_command=True) if command else ""
     now = time.time()
-    aid = hashlib.sha256(f"{now}:{command}:{len(raw_text)}".encode("utf-8")).hexdigest()[:10]
-    lines = raw_text.splitlines()
+    aid = hashlib.sha256(f"{now}:{safe_cmd}:{len(safe_text)}".encode("utf-8")).hexdigest()[:10]
+    lines = safe_text.splitlines()
+    chunks = _chunk_lines(lines)
     try:
         with closing(_connect(env)) as conn:
             with conn:
@@ -150,23 +288,49 @@ def store_output(
                 conn.execute(
                     "INSERT OR REPLACE INTO blobs (id, command, created_at, total_lines, total_bytes, content) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
-                    (aid, command[:200], now, len(lines), len(raw_text.encode("utf-8", errors="replace")), raw_text),
+                    (aid, safe_cmd, now, len(lines), len(safe_text.encode("utf-8", errors="replace")), safe_text),
                 )
                 use_fts = _has_fts5(conn)
                 table = "chunks_fts" if use_fts else "chunks_plain"
-                rows = []
-                for start in range(0, max(1, len(lines)), _CHUNK_LINES):
-                    chunk = "\n".join(lines[start : start + _CHUNK_LINES])
-                    if chunk.strip():
-                        rows.append((aid, start + 1, min(len(lines), start + _CHUNK_LINES), chunk))
-                if rows:
+                if chunks:
                     conn.executemany(
                         f"INSERT INTO {table} (blob_id, start_line, end_line, body) VALUES (?, ?, ?, ?)",
-                        rows,
+                        [(aid, s, e, b) for s, e, b in chunks],
                     )
         return aid
     except Exception:
         return None
+
+
+def index_file(
+    file_path: str,
+    *,
+    max_bytes: int = 2 * 1024 * 1024,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Index a local document/log file into sandbox.db for BM25 FTS5 retrieval."""
+    p = Path(file_path).expanduser()
+    if not p.is_file():
+        return {"error": f"File not found: {file_path}"}
+    try:
+        raw_bytes = p.read_bytes()
+    except OSError as exc:
+        return {"error": f"Unable to read {file_path}: {exc}"}
+    truncated = len(raw_bytes) > max_bytes
+    text = raw_bytes[:max_bytes].decode("utf-8", errors="replace")
+    aid = store_output(text, command=f"file:{p.name}", env=env)
+    if not aid:
+        return {"error": f"Failed to index {file_path} into sandbox.db"}
+    lines = text.splitlines()
+    return {
+        "archive_id": aid,
+        "path": str(p.resolve()),
+        "lines": len(lines),
+        "bytes": len(raw_bytes),
+        "truncated": truncated,
+        "chunks": len(_chunk_lines(lines)),
+        "hint": f'Query via `search_sandbox` or `terse query {aid} "<terms>"`',
+    }
 
 
 def query_output(
@@ -176,7 +340,7 @@ def query_output(
     limit: int = 5,
     env: dict[str, str] | None = None,
 ) -> str | None:
-    """Search an archived blob with FTS5 (or case-insensitive substring fallback)."""
+    """Search an archived blob with FTS5 Porter+BM25 (or substring fallback)."""
     resolved = _resolve_id(archive_id, env)
     if not resolved or not (query or "").strip():
         return None
@@ -198,7 +362,7 @@ def query_output(
                 try:
                     hits = conn.execute(
                         "SELECT start_line, end_line, body FROM chunks_fts "
-                        "WHERE blob_id = ? AND chunks_fts MATCH ? ORDER BY rank LIMIT ?",
+                        "WHERE blob_id = ? AND chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT ?",
                         (archive_id, fts_q, limit),
                     ).fetchall()
                 except sqlite3.OperationalError:
@@ -254,3 +418,100 @@ def expand_output(
             return "\n".join(f"L{idx}: {ln}" for idx, ln in enumerate(lines[s:e], start=s + 1))
     except Exception:
         return None
+
+
+def record_session_event(
+    session_id: str,
+    workspace: str,
+    kind: str,
+    summary: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Persist a lightweight structured event (edit, error, cmd) for compaction continuity."""
+    norm_ws = normalize_workspace(workspace)
+    clean_sum = " ".join(redact_text(str(summary or ""), is_command=(kind == "cmd")).split())[:180]
+    if not norm_ws or not clean_sum:
+        return
+    now = time.time()
+    try:
+        with closing(_connect(env)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO session_events (session_id, workspace, kind, summary, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (str(session_id or "")[:80], norm_ws, str(kind or "event")[:16], clean_sum, now),
+                )
+                # Keep only the most recent _MAX_SESSION_EVENTS per workspace
+                conn.execute(
+                    "DELETE FROM session_events WHERE workspace = ? AND id NOT IN "
+                    "(SELECT id FROM session_events WHERE workspace = ? ORDER BY created_at DESC LIMIT ?)",
+                    (norm_ws, norm_ws, _MAX_SESSION_EVENTS),
+                )
+    except Exception:
+        pass
+
+
+def build_continuity_snapshot(
+    workspace: str,
+    *,
+    exclude_session_id: str = "",
+    max_chars: int = 500,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Return a compact, priority-tiered list of recent workspace edits & errors."""
+    norm_ws = normalize_workspace(workspace)
+    if not norm_ws or not _db_path(env).is_file():
+        return []
+    try:
+        with closing(_connect(env)) as conn:
+            cutoff = time.time() - 48 * 3600
+            if exclude_session_id:
+                rows = conn.execute(
+                    "SELECT kind, summary FROM session_events "
+                    "WHERE workspace = ? AND created_at >= ? AND session_id != ? "
+                    "ORDER BY created_at DESC LIMIT 40",
+                    (norm_ws, cutoff, exclude_session_id[:80]),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT kind, summary FROM session_events "
+                    "WHERE workspace = ? AND created_at >= ? "
+                    "ORDER BY created_at DESC LIMIT 40",
+                    (norm_ws, cutoff),
+                ).fetchall()
+    except Exception:
+        return []
+
+    if not rows:
+        return []
+
+    edits: list[str] = []
+    errors: list[str] = []
+    for kind, summary in rows:
+        s = str(summary or "").strip()
+        if not s:
+            continue
+        if kind == "edit" and s not in edits and len(edits) < 6:
+            edits.append(s)
+        elif kind == "error" and s not in errors and len(errors) < 3:
+            errors.append(s)
+
+    out: list[str] = []
+    if edits:
+        out.append("- Recent edits: " + ", ".join(edits))
+    if errors:
+        out.append("- Recent errors: " + " | ".join(errors))
+
+    # Enforce strict character budget
+    trimmed: list[str] = []
+    total = 0
+    for ln in out:
+        if total + len(ln) > max_chars:
+            rem = max_chars - total - 3
+            if rem > 20:
+                trimmed.append(ln[:rem].rstrip() + "...")
+            break
+        trimmed.append(ln)
+        total += len(ln) + 1
+    return trimmed

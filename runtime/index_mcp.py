@@ -66,6 +66,10 @@ _ACTIONS_MENU: dict[str, dict[str, str]] = {
     "get_blast_radius": {"args": '{"repo": "<name>", "symbol": "<name>"}', "desc": "Find files referencing a symbol"},
     "assemble_task_context": {"args": '{"repo": "<name>", "task": "<desc>", "token_budget": 4000}', "desc": "Assemble top matching symbols within a token budget"},
     "invalidate_cache": {"args": '{"repo": "<name>"}', "desc": "Delete stored index for a repository"},
+    "search_sandbox": {"args": '{"archive_id": "--last", "query": "<terms>", "limit": 5}', "desc": "BM25 FTS5 search over an archived output or indexed doc"},
+    "expand_sandbox": {"args": '{"archive_id": "--last", "start_line": 1, "end_line": 60}', "desc": "Read an exact line range from an archived output"},
+    "index_sandbox_file": {"args": '{"path": "<abs-path>"}', "desc": "Index a large local doc or log into sandbox.db for BM25 search"},
+    "execute_filtered": {"args": '{"argv": ["<cmd>", "..."], "intent": "<terms>", "cwd": "<dir>"}', "desc": "Run a safe command; index >5KB stdout into FTS5 and return BM25 matches"},
 }
 
 
@@ -277,7 +281,130 @@ def _read_symbol_code(repo_doc: dict[str, Any], sym: dict[str, Any]) -> dict[str
     }
 
 
+def _exec_filtered(args: dict[str, Any], *, env: dict[str, str] | None = None) -> dict[str, Any]:
+    """Run a safe argv command without shell=True; index >5KB stdout into FTS5 when intent is set."""
+    import shlex
+    import subprocess
+    from runtime import context_sandbox
+    from runtime.config import no_window_kwargs, record_savings
+
+    raw_argv = args.get("argv")
+    if isinstance(raw_argv, list) and raw_argv:
+        argv = [str(x) for x in raw_argv if str(x)]
+    elif isinstance(args.get("command"), str) and args["command"].strip():
+        try:
+            argv = shlex.split(args["command"])
+        except ValueError as exc:
+            return {"error": f"Invalid command syntax: {exc}"}
+    else:
+        return {"error": "Provide `argv` (list of strings) or `command`."}
+
+    if not argv:
+        return {"error": "Empty command."}
+    intent = str(args.get("intent") or "").strip()
+    cwd = str(args.get("cwd") or "").strip() or None
+    timeout = max(1, min(60, int(args.get("timeout") or 30)))
+    limit = max(1, min(10, int(args.get("limit") or 5)))
+
+    try:
+        proc = subprocess.run(
+            argv,
+            shell=False,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            **no_window_kwargs(),
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": f"Command timed out after {timeout}s", "argv": argv}
+    except OSError as exc:
+        return {"error": f"Failed to execute {argv[0]}: {exc}"}
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    cmd_label = " ".join(argv)[:160]
+
+    # Tee-on-failure: preserve error output verbatim (archive if huge)
+    if proc.returncode != 0:
+        out: dict[str, Any] = {
+            "returncode": proc.returncode,
+            "stdout": stdout[:8192],
+            "stderr": stderr[:8192],
+        }
+        if len(stdout) + len(stderr) > 8192:
+            aid = context_sandbox.store_output(stdout + "\n" + stderr, command=cmd_label, env=env)
+            if aid:
+                out["archive_id"] = aid
+        return out
+
+    # Intent-driven filtering when stdout > 5 KB
+    if len(stdout) > 5120 and intent:
+        aid = context_sandbox.store_output(stdout, command=cmd_label, env=env)
+        if aid:
+            matched = context_sandbox.query_output(aid, intent, limit=limit, env=env) or ""
+            record_savings(
+                "fts_sandbox",
+                len(stdout),
+                len(matched),
+                host=os.environ.get("TERSER_CLIENT_ID", "mcp"),
+                detail=argv[0],
+                env=env,
+            )
+            return {
+                "returncode": 0,
+                "filtered": True,
+                "archive_id": aid,
+                "raw_bytes": len(stdout),
+                "output": matched,
+                "stderr": stderr[:1024] if stderr else "",
+            }
+
+    return {
+        "returncode": 0,
+        "filtered": False,
+        "raw_bytes": len(stdout),
+        "output": stdout[:16384],
+        "stderr": stderr[:1024] if stderr else "",
+    }
+
+
 def dispatch_action(action: str, args: dict[str, Any], *, env: dict[str, str] | None = None) -> dict[str, Any]:
+    if action == "search_sandbox":
+        from runtime import context_sandbox
+
+        aid = str(args.get("archive_id") or "--last")
+        query = str(args.get("query") or "").strip()
+        limit = max(1, min(15, int(args.get("limit") or 5)))
+        res = context_sandbox.query_output(aid, query, limit=limit, env=env)
+        if res is None:
+            return {"error": f"Archive `{aid}` not found or query empty."}
+        return {"archive_id": aid, "result": res}
+
+    if action == "expand_sandbox":
+        from runtime import context_sandbox
+
+        aid = str(args.get("archive_id") or "--last")
+        s_ln = int(args["start_line"]) if args.get("start_line") is not None else None
+        e_ln = int(args["end_line"]) if args.get("end_line") is not None else None
+        res = context_sandbox.expand_output(aid, start_line=s_ln, end_line=e_ln, env=env)
+        if res is None:
+            return {"error": f"Archive `{aid}` not found."}
+        return {"archive_id": aid, "content": res}
+
+    if action == "index_sandbox_file":
+        from runtime import context_sandbox
+
+        path = str(args.get("path") or "").strip()
+        if not path:
+            return {"error": "Missing `path`."}
+        return context_sandbox.index_file(path, env=env)
+
+    if action == "execute_filtered":
+        return _exec_filtered(args, env=env)
+
     if action == "index_folder":
         return index_folder(str(args.get("path") or os.getcwd()), env=env)
 
@@ -482,7 +609,11 @@ def _handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return {"actions": items}
     if name == "route":
         task = str(arguments.get("task") or "").lower()
-        if any(k in task for k in ("blast", "impact", "reference", "caller")):
+        if any(k in task for k in ("sandbox", "archive", "log output")):
+            rec = "search_sandbox"
+        elif any(k in task for k in ("execute", "run command", "filter output")):
+            rec = "execute_filtered"
+        elif any(k in task for k in ("blast", "impact", "reference", "caller")):
             rec = "get_blast_radius"
         elif any(k in task for k in ("outline", "structure", "map")):
             rec = "get_repo_outline"

@@ -12,7 +12,7 @@ if defined TERSER_PYTHON (
 )
 
 if not defined PY_BIN (
-  for %%P in (python.exe) do (
+  for %%P in (pythonw.exe python.exe) do (
     for /f "delims=" %%F in ('where %%P 2^>nul') do (
       echo %%F | findstr /I /C:"WindowsApps" >nul
       if errorlevel 1 if not defined PY_BIN set "PY_BIN=%%F"

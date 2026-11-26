@@ -170,9 +170,13 @@ def _archive_full_output(raw_text: str, command: str = "", env: dict[str, str] |
                     old.unlink(missing_ok=True)
         except OSError:
             pass
-        aid = hashlib.sha256(f"{now}:{command}:{len(raw_text)}".encode("utf-8")).hexdigest()[:10]
-        header = f"# command: {command}\n# bytes: {len(raw_text)}\n\n" if command else ""
-        (adir / f"{aid}.txt").write_text(header + raw_text, encoding="utf-8", errors="replace")
+        from runtime import context_sandbox
+
+        safe_text = context_sandbox.redact_text(raw_text, is_command=False)
+        safe_cmd = context_sandbox.redact_text(command, is_command=True) if command else ""
+        aid = hashlib.sha256(f"{now}:{safe_cmd}:{len(safe_text)}".encode("utf-8")).hexdigest()[:10]
+        header = f"# command: {safe_cmd}\n# bytes: {len(safe_text)}\n\n" if safe_cmd else ""
+        (adir / f"{aid}.txt").write_text(header + safe_text, encoding="utf-8", errors="replace")
         return aid
     except OSError:
         return None
@@ -487,6 +491,8 @@ def main(argv: list[str] | None = None) -> int:
 
     cmd_str = shlex.join(args)
     try:
+        from runtime.config import no_window_kwargs
+
         proc = subprocess.run(
             args,
             shell=False,
@@ -494,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
             text=True,
             encoding="utf-8",
             errors="replace",
+            **no_window_kwargs(),
         )
     except FileNotFoundError:
         sys.stderr.write(f"[Terser] Command not found: {args[0]}\n")

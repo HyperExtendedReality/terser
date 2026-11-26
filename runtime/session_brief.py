@@ -129,9 +129,16 @@ def build_session_brief(
             sections.append("Repo facts:\n" + "\n".join(facts))
             notice_parts.append(f"{len(facts)} repo fact(s)")
 
-    # 2. Workspace-scoped continuity checkpoint
+    # 2. Workspace-scoped continuity checkpoint (file-based or live sandbox.db event log)
     if cfg.get("continuity_restore", True):
         cont = _load_continuity(workspace, host, env)
+        if not cont:
+            try:
+                from runtime import context_sandbox
+
+                cont = context_sandbox.build_continuity_snapshot(workspace, max_chars=450, env=env)
+            except Exception:
+                cont = []
         if cont:
             sections.append("Prior session:\n" + "\n".join(cont))
             notice_parts.append("continuity restored")

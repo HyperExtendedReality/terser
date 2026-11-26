@@ -331,6 +331,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(task_router.format_route(task_router.classify_task(" ".join(sub))))
         return 0
+    if cmd == "index-doc":
+        if not sub:
+            print("Usage: terse index-doc <file-path>", file=sys.stderr)
+            return 2
+        res = context_sandbox.index_file(sub[0])
+        print(json.dumps(res, indent=2))
+        return 0 if "archive_id" in res else 1
+    if cmd == "security-report":
+        return _run_measure(eff_host, ["security-report", *sub])
     if cmd == "doctor":
         return _cmd_doctor(eff_host, cwd)
     if cmd == "audit":
@@ -341,7 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_measure(eff_host, ["coach", *sub])
     if cmd == "dashboard":
         return _run_measure(eff_host, ["dashboard", "--user", *sub])
-    if cmd in ("microskills", "toolprune", "repos"):
+    if cmd in ("microskills", "toolprune", "repos", "history"):
         return _run_te_cli(eff_host, cwd, [cmd, *sub])
 
     print(__doc__)
