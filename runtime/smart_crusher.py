@@ -190,6 +190,11 @@ def crush_json(
             envelope_path, items = found
 
     if not items or len(items) < 5 or not all(isinstance(x, dict) for x in items):
+        # Lossless minification fallback for large pretty-printed single JSON objects/arrays
+        if not is_ndjson and len(stripped) >= 1500:
+            minified = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+            if len(minified) < int(len(stripped) * 0.80):
+                return minified
         return None
 
     total = len(items)

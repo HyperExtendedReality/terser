@@ -308,7 +308,10 @@ pub fn check_read(
             if let Some(Value::Object(reads)) = store.get_mut("reads") {
                 reads.insert(key, Value::Object(prev));
             }
-            if start_line.is_none() && end_line.is_none() {
+            let total_lines_retry = (raw_bytes.iter().filter(|&&b| b == b'\n').count() + 1) as i64;
+            let rs_r = start_line.unwrap_or(1).max(1);
+            let re_r = end_line.unwrap_or(total_lines_retry).min(total_lines_retry);
+            if (start_line.is_none() && end_line.is_none()) || (re_r - rs_r + 1) >= 400 {
                 if let Some(Value::Object(meta_obj)) = store.get_mut("meta") {
                     let cur = opt_i64(meta_obj.get("outline_overrides")).unwrap_or(0);
                     meta_obj.insert("outline_overrides".into(), json!(cur + 1));
@@ -385,21 +388,33 @@ pub fn check_read(
             return FunnelOutcome::Delegate;
         }
     } else {
-        // Tier 2: Large unranged first read -> delegate to Python for full AST/Markdown/Data outline
+        // Tier 2: Large unranged first read (or huge first-time ranged slice >= 400L) -> delegate to Python
         let outline_overrides = store
             .get("meta")
             .and_then(|v| v.as_object())
             .and_then(|m| opt_i64(m.get("outline_overrides")))
             .unwrap_or(0);
-        if start_line.is_none()
-            && end_line.is_none()
-            && cfg.outline_first
+        let is_unranged = start_line.is_none() && end_line.is_none();
+        let min_bytes = if is_unranged {
+            cfg.outline_min_bytes
+        } else {
+            cfg.outline_min_bytes.max(12288)
+        };
+        if cfg.outline_first
             && (cfg.outline_backoff_limit <= 0 || outline_overrides < cfg.outline_backoff_limit)
             && !cfg.shadow
-            && meta.len() >= cfg.outline_min_bytes
+            && meta.len() >= min_bytes
         {
             let line_count = raw_bytes.iter().filter(|&&b| b == b'\n').count() + 1;
-            if is_lockfile_or_minified(&basename) || line_count >= cfg.outline_min_lines {
+            let total_i64 = line_count as i64;
+            let rs_t2 = start_line.unwrap_or(1).max(1);
+            let re_t2 = end_line.unwrap_or(total_i64).min(total_i64);
+            let req_span = (re_t2 - rs_t2 + 1).max(0);
+            if is_unranged {
+                if is_lockfile_or_minified(&basename) || line_count >= cfg.outline_min_lines {
+                    return FunnelOutcome::Delegate;
+                }
+            } else if req_span >= 400 && (is_lockfile_or_minified(&basename) || line_count >= cfg.outline_min_lines) {
                 return FunnelOutcome::Delegate;
             }
         }

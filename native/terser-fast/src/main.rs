@@ -570,6 +570,20 @@ fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host:
             "text": snap,
         }),
     );
+    const MAX_CMD_DELTA_ENTRIES: usize = 40;
+    if store.len() > MAX_CMD_DELTA_ENTRIES {
+        let mut entries: Vec<(String, f64)> = store
+            .iter()
+            .map(|(k, v)| (k.clone(), v.get("ts").and_then(|t| t.as_f64()).unwrap_or(0.0)))
+            .collect();
+        entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let keep: std::collections::HashSet<String> = entries
+            .into_iter()
+            .take(MAX_CMD_DELTA_ENTRIES)
+            .map(|(k, _)| k)
+            .collect();
+        store.retain(|k, _| keep.contains(k));
+    }
     atomic_write_json(&path, &Value::Object(store));
     result
 }
@@ -623,10 +637,41 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let stderr_str = String::from_utf8_lossy(&output.stderr);
 
-    // Tee-on-failure: preserve 100% of error output verbatim on non-zero exit
+    // On non-zero exit: preserve 100% of errors, warnings, tracebacks, diffs, and exit code,
+    // while still stripping strictly lossless ANSI/spinner/build-progress noise.
     if code != 0 {
-        let _ = io::stdout().write_all(&output.stdout);
-        let _ = io::stderr().write_all(&output.stderr);
+        if stdout_str.len() > 300 {
+            let cleaned = compress::strip_ansi_and_progress(&stdout_str);
+            let cleaned = compress::elide_lockfile_diffs(&cleaned);
+            let cleaned = compress::apply_stream_filters(&cleaned, &cmd_str);
+            let served = if cleaned.len() < (stdout_str.len() * 90) / 100 {
+                record_savings("bash_compress", stdout_str.len(), cleaned.len(), &host, prog);
+                cleaned
+            } else {
+                stdout_str.into_owned()
+            };
+            let _ = io::stdout().write_all(served.as_bytes());
+            if !served.ends_with('\n') {
+                let _ = io::stdout().write_all(b"\n");
+            }
+        } else {
+            let _ = io::stdout().write_all(&output.stdout);
+        }
+        if stderr_str.len() > 300 {
+            let cleaned_err = compress::strip_ansi_and_progress(&stderr_str);
+            let cleaned_err = compress::apply_stream_filters(&cleaned_err, &cmd_str);
+            let served_err = if cleaned_err.len() < (stderr_str.len() * 90) / 100 {
+                cleaned_err
+            } else {
+                stderr_str.into_owned()
+            };
+            let _ = io::stderr().write_all(served_err.as_bytes());
+            if !served_err.ends_with('\n') {
+                let _ = io::stderr().write_all(b"\n");
+            }
+        } else if !stderr_str.is_empty() {
+            let _ = io::stderr().write_all(&output.stderr);
+        }
         return code;
     }
 

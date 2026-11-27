@@ -481,6 +481,114 @@ def compact_web_and_markdown(text: str) -> str:
     return cur
 
 
+_MULTI_SPACE_RE = re.compile(r" {2,}")
+_BASE64_DATA_URI_RE = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=]{512,}")
+_BASE64_RAW_RE = re.compile(r"(?<![A-Za-z0-9+/_.-])[A-Za-z0-9+/]{512,}={0,2}(?![A-Za-z0-9+/_.-])")
+
+
+def compact_aligned_tables(text: str) -> str:
+    """Losslessly compact space-padded fixed-width CLI tables (docker ps, kubectl get, pip list) to TSV."""
+    if not text or len(text) < 300 or "diff --git " in text or "Traceback " in text:
+        return text
+    lines = text.splitlines()
+    if len(lines) < 4:
+        return text
+
+    def _is_table_row(ln: str) -> bool:
+        s = ln.strip()
+        if not s or s[0] in ("{", "[", "}", "]", "#", "<"):
+            return False
+        # Require at least 2 interior runs of 2+ spaces (i.e. >= 3 space-padded columns)
+        return len(_MULTI_SPACE_RE.findall(s)) >= 2
+
+    out: list[str] = []
+    i, n = 0, len(lines)
+    changed = False
+    while i < n:
+        if _is_table_row(lines[i]):
+            j = i + 1
+            while j < n and _is_table_row(lines[j]):
+                j += 1
+            if (j - i) >= 4:
+                raw_block = "\n".join(lines[i:j])
+                tsv_rows = [_MULTI_SPACE_RE.sub("\t", ln.strip()) for ln in lines[i:j]]
+                tsv_block = "\n".join(tsv_rows)
+                if len(tsv_block) < int(len(raw_block) * 0.85):
+                    out.extend(tsv_rows)
+                    changed = True
+                    i = j
+                    continue
+            out.extend(lines[i:j])
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out) if changed else text
+
+
+def fold_base64_blobs(
+    text: str,
+    *,
+    command: str = "",
+    env: dict[str, str] | None = None,
+) -> tuple[str, str | None]:
+    """Reversibly replace >=512-char base64/data-URI blobs with compact digests, archiving full raw text."""
+    if not text or len(text) < 512:
+        return text, None
+    has_match = bool(_BASE64_DATA_URI_RE.search(text) or _BASE64_RAW_RE.search(text))
+    if not has_match:
+        return text, None
+
+    aid = _archive_full_output(text, command=command or "base64_output", env=env)
+    arch_tag = f" archive:{aid}" if aid else ""
+
+    def _repl(m: re.Match[str]) -> str:
+        blob = m.group(0)
+        digest = hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()[:8]
+        if blob.startswith("data:"):
+            prefix = blob.split(",", 1)[0]
+            return f"[{prefix} {len(blob)}B sha256:{digest}{arch_tag}]"
+        return f"[base64:{len(blob)}B sha256:{digest}{arch_tag}]"
+
+    folded = _BASE64_DATA_URI_RE.sub(_repl, text)
+    folded = _BASE64_RAW_RE.sub(_repl, folded)
+    if len(folded) < int(len(text) * 0.90):
+        return folded, aid
+    return text, None
+
+
+def compact_file_list(paths: list[str]) -> str:
+    """Losslessly factor shared directory prefixes in a file listing (`dir/: a, b, c`) when saving >=15%."""
+    clean = [p.strip() for p in paths if p and p.strip()]
+    if len(clean) < 4:
+        return "\n".join(clean)
+    flat = "\n".join(clean)
+    groups: dict[str, list[str]] = {}
+    order: list[str] = []
+    for raw in clean:
+        norm = raw.replace("\\", "/")
+        if "/" in norm:
+            parent, name = norm.rsplit("/", 1)
+        else:
+            parent, name = "", norm
+        if parent not in groups:
+            groups[parent] = []
+            order.append(parent)
+        groups[parent].append(name)
+
+    lines: list[str] = []
+    for parent in order:
+        names = groups[parent]
+        if parent and len(names) >= 2:
+            lines.append(f"{parent}/: {', '.join(names)}")
+        elif parent:
+            lines.append(f"{parent}/{names[0]}")
+        else:
+            lines.extend(names)
+    grouped = "\n".join(lines)
+    return grouped if len(grouped) < int(len(flat) * 0.85) else flat
+
+
 def apply_stream_filters(text: str, command: str) -> str:
     """Apply high-signal stream filters for Cargo, Go test, bundlers, and package managers."""
     if not text or not command:
@@ -611,12 +719,17 @@ def compress_output(
     raw_len = len(text)
     cur = strip_ansi_and_progress(text) if enhanced else text
 
-    # Stage 2: lockfile diff elision + framework stack folding + compiler note dedup + web/table compaction + filters
+    # Stage 2: lockfile diff elision + framework stack folding + compiler note dedup + base64 + web/table compaction + filters
+    archive_id: str | None = None
     if enhanced:
         cur = elide_lockfile_diffs(cur)
         cur = fold_framework_stack_frames(cur)
         cur = dedup_compiler_notes(cur)
+        cur, b64_aid = fold_base64_blobs(cur, command=command, env=env)
+        if b64_aid:
+            archive_id = b64_aid
         cur = compact_web_and_markdown(cur)
+        cur = compact_aligned_tables(cur)
     if command:
         cur = apply_stream_filters(cur, command) if enhanced else cur
         cur = _vendor_compress(cur, command, returncode=returncode, stderr=stderr)
@@ -637,9 +750,9 @@ def compress_output(
             cur = group_grep_output(cur)
             cur = collapse_duplicate_lines(cur)
 
-    archive_id: str | None = None
     if len(cur) > max_chars:
-        archive_id = _archive_full_output(text, command=command, env=env)
+        if archive_id is None:
+            archive_id = _archive_full_output(text, command=command, env=env)
         cur = _error_pinned_window(cur, max_chars=max_chars, archive_id=archive_id)
 
     if len(cur) < raw_len:

@@ -46,6 +46,8 @@ _SOFT_DENY_CAP = 1                  # Always allow on immediate retry!
 _DELTA_MAX_DIFF_LINES = 60
 _DELTA_MAX_RATIO = 0.40
 _MAX_OUTLINE_LINES = 90
+_LARGE_SLICE_MIN_LINES = 400
+_LARGE_SLICE_MIN_BYTES = 12288
 
 _SID_RE = re.compile(r"^[0-9a-zA-Z_.-]{1,96}$")
 
@@ -583,7 +585,10 @@ def check_read(
             prev["ts"] = now
             if text_snapshot is not None:
                 prev["snapshot"] = text_snapshot
-            if start_line is None and end_line is None:
+            total_lines_retry = raw_bytes.count(b"\n") + 1
+            rs_r = max(1, start_line) if start_line is not None else 1
+            re_r = min(total_lines_retry, end_line) if end_line is not None else total_lines_retry
+            if (start_line is None and end_line is None) or (re_r - rs_r + 1) >= _LARGE_SLICE_MIN_LINES:
                 meta = store.setdefault("meta", {})
                 meta["outline_overrides"] = int(meta.get("outline_overrides") or 0) + 1
             _save_store(session_id, store, now, env)
@@ -658,24 +663,31 @@ def check_read(
                 record_savings("read_delta", len(raw_bytes), len(reason), host=host, detail=basename, env=env)
                 return {"action": "deny", "reason": reason}
 
-    # Tier 2: First unranged read of a LARGE code/doc/data file -> inline line-numbered outline ONCE
-    # (Auto-backs off if the session already overrode `outline_backoff_limit` outlines for full reads.)
+    # Tier 2: First unranged read (or huge first-time ranged slice >= 400L) of a LARGE code/doc/data file
+    # -> inline line-numbered outline ONCE (auto-backs off after `outline_backoff_limit` overrides).
     backoff_limit = int(cfg.get("outline_backoff_limit", 2))
     outline_overrides = int((store.get("meta") or {}).get("outline_overrides") or 0)
     is_lockfile = bool(_LOCKFILE_NAME_RE.search(basename))
+    is_unranged = start_line is None and end_line is None
+    outline_min_bytes = int(cfg.get("outline_min_bytes", 10240))
     if (
         prev is None
-        and start_line is None
-        and end_line is None
         and cfg.get("outline_first", True)
         and (backoff_limit <= 0 or outline_overrides < backoff_limit)
         and not cfg.get("shadow")
-        and st.st_size >= int(cfg.get("outline_min_bytes", 10240))
+        and st.st_size >= (outline_min_bytes if is_unranged else max(_LARGE_SLICE_MIN_BYTES, outline_min_bytes))
     ):
         text_for_outline = text_snapshot or raw_bytes.decode("utf-8", errors="replace")
         total_lines = text_for_outline.count("\n") + 1
+        rs_t2 = max(1, start_line) if start_line is not None else 1
+        re_t2 = min(total_lines, end_line) if end_line is not None else total_lines
+        req_span_t2 = max(0, re_t2 - rs_t2 + 1)
         min_lines = 1 if is_lockfile else int(cfg.get("outline_min_lines", 250))
-        if total_lines >= min_lines:
+        qualifies_t2 = (
+            (is_unranged and total_lines >= min_lines)
+            or (not is_unranged and req_span_t2 >= _LARGE_SLICE_MIN_LINES and total_lines >= min_lines)
+        )
+        if qualifies_t2:
             outline = build_code_outline(file_path, text_for_outline, env=env)
             if outline:
                 reads[key] = {
@@ -689,11 +701,12 @@ def check_read(
                 }
                 _save_store(session_id, store, now, env)
                 range_hint = "StartLine/EndLine" if host == "antigravity" else "offset/limit"
+                slice_note = "" if is_unranged else f" (requested {req_span_t2} lines: L{rs_t2}-L{re_t2})"
                 reason = (
-                    f"[Terser] `{basename}` is {total_lines} lines ({st.st_size:,} B). "
+                    f"[Terser] `{basename}` is {total_lines} lines ({st.st_size:,} B){slice_note}. "
                     f"Outline (exact line spans):\n{outline}\n\n"
                     f"Read only the needed span with {range_hint} (or `terser-index` `get_symbol_source`), "
-                    "or retry this read immediately to load the full file."
+                    "or retry this read immediately to load the full requested span."
                 )
                 record_savings("read_outline", len(raw_bytes), len(reason), host=host, detail=basename, env=env)
                 return {"action": "deny", "reason": reason}
@@ -767,6 +780,53 @@ def seed_after_write(
     if len(raw_bytes) <= _MAX_SNAPSHOT_BYTES:
         entry["snapshot"] = raw_bytes.decode("utf-8", errors="replace")
     store["reads"][key] = entry
+    _save_store(session_id, store, now, env)
+
+
+def seed_after_edit(
+    session_id: str,
+    file_path: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Update the editing session's cached sha/snapshot after a successful partial Edit.
+
+    Only updates if the editing session already loaded the FULL file (so line shifts from
+    deletions can never mask previously-unread lines), letting immediate verification
+    re-reads hit T0 instead of echoing back the agent's own edit as a T1 diff.
+    Sibling/parent subagents are always invalidated.
+    """
+    if not session_id or not file_path or not _SID_RE.match(session_id):
+        return
+    invalidate_on_edit(session_id, file_path, env=env)
+    key = _norm_path(file_path)
+    store = _load_store(session_id, env)
+    prev = store["reads"].get(key)
+    if not isinstance(prev, dict) or prev.get("outline_only"):
+        return
+    # Safety: only seed on full-file coverage so line shifts cannot hide unread lines
+    if not _intervals_cover(prev, None, None):
+        return
+    target = Path(file_path)
+    try:
+        st = target.stat()
+        if not target.is_file() or st.st_size == 0 or st.st_size > _MAX_FILE_BYTES:
+            return
+        raw_bytes = target.read_bytes()
+    except OSError:
+        return
+    if b"\x00" in raw_bytes[:4096]:
+        return
+    now = time.time()
+    prev["sha"] = hashlib.sha256(raw_bytes).hexdigest()
+    prev["soft_denies"] = 0
+    prev["outline_only"] = False
+    prev["ts"] = now
+    if len(raw_bytes) <= _MAX_SNAPSHOT_BYTES:
+        prev["snapshot"] = raw_bytes.decode("utf-8", errors="replace")
+    else:
+        prev.pop("snapshot", None)
+    store["reads"][key] = prev
     _save_store(session_id, store, now, env)
 
 

@@ -273,8 +273,11 @@ def _wrap_command_for_compression(
             return False
         head = Path(toks[0]).stem.lower()
         sub = toks[1].lower() if len(toks) > 1 else ""
-        # Use ~3ms native Rust exec for build/pkg/diff commands (no Python startup overhead)
-        return head in ("cargo", "go", "npm", "pnpm", "yarn", "pip", "uv", "tsc") or (head == "git" and sub == "diff")
+        # Use ~3ms native Rust exec for build/test/pkg/infra/diff commands (no Python startup overhead)
+        return head in (
+            "cargo", "go", "npm", "pnpm", "yarn", "pip", "uv", "tsc",
+            "pytest", "jest", "vitest", "docker", "gradle", "gradlew", "dotnet",
+        ) or (head == "git" and sub == "diff")
 
     if os.name == "nt":
         tokens = _split_powershell_command(command)
@@ -844,13 +847,15 @@ def handle_post_tool_use(
         args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
         is_err = bool(str(payload.get("error") or "").strip())
 
-        # Edit/Write -> reset read-cache soft_denies (or seed after full write) + AST reindex + continuity
+        # Edit/Write -> seed read-cache after successful write/edit (or invalidate on error) + AST reindex + continuity
         ws = _workspace(payload, env)
         if tool_name in ("edit_file", "write_file"):
             fp = str(args.get("Path") or args.get("AbsolutePath") or args.get("path") or "")
             if fp:
                 if tool_name == "write_file" and not is_err and not args.get("Append"):
                     read_funnel.seed_after_write(sid, fp, env=env)
+                elif tool_name == "edit_file" and not is_err:
+                    read_funnel.seed_after_edit(sid, fp, env=env)
                 else:
                     read_funnel.invalidate_on_edit(sid, fp, env=env)
                 if cfg.get("index_auto_reindex", True):
@@ -896,6 +901,8 @@ def handle_post_tool_use(
         for fp in edited_paths:
             if tool_name == "Write" and not is_err:
                 read_funnel.seed_after_write(sid, fp, env=env)
+            elif tool_name in ("Edit", "MultiEdit") and not is_err:
+                read_funnel.seed_after_edit(sid, fp, env=env)
             else:
                 read_funnel.invalidate_on_edit(sid, fp, env=env)
             if cfg.get("index_auto_reindex", True):
@@ -955,7 +962,7 @@ def handle_post_tool_use(
                 hso["hookEventName"] = "PostToolUse"
                 hso["updatedMCPToolOutput"] = comp
 
-    # 3b. Runaway Glob / Grep output guard (Claude Code & Codex): group by file + cap huge scans + FTS5 archive
+    # 3b. Runaway Glob / Grep output guard (Claude Code & Codex): group by file/dir + cap huge scans + FTS5 archive
     if (
         host in ("claude", "codex")
         and tool_name in ("Glob", "Grep")
@@ -963,7 +970,10 @@ def handle_post_tool_use(
         and not cfg.get("shadow")
     ):
         raw_text = tool_resp if isinstance(tool_resp, str) else json.dumps(tool_resp, default=str) if tool_resp is not None else ""
-        grouped = output_compressor.group_grep_output(raw_text) if tool_name == "Grep" else raw_text
+        if tool_name == "Grep":
+            grouped = output_compressor.group_grep_output(raw_text)
+        else:
+            grouped = output_compressor.compact_file_list(raw_text.splitlines())
         lines = grouped.splitlines()
         if len(raw_text) > 8192 and len(lines) > 120:
             aid = output_compressor._archive_full_output(raw_text, command=tool_name, env=env)
@@ -971,7 +981,7 @@ def handle_post_tool_use(
             capped = "\n".join(lines[:60]) + f"\n... [{len(lines) - 60} more {tool_name} lines omitted{ptr}]"
             hso["hookEventName"] = "PostToolUse"
             hso["updatedToolOutput"] = capped
-        elif tool_name == "Grep" and len(grouped) < int(len(raw_text) * 0.85):
+        elif len(grouped) < int(len(raw_text) * 0.85):
             hso["hookEventName"] = "PostToolUse"
             hso["updatedToolOutput"] = grouped
 

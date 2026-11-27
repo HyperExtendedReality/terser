@@ -1315,6 +1315,141 @@ class TokenEfficiencyUpgradesTests(unittest.TestCase):
         self.assertNotIn("| ---", comp_md)
         self.assertLess(len(comp_md), len(md_table) * 0.65)
 
+    def test_edit_seeding_large_slice_outline_and_lossless_compactors(self) -> None:
+        from runtime import index_bridge, index_mcp
+        from runtime.config import DEFAULT_CONFIG
+
+        cfg = dict(DEFAULT_CONFIG)
+
+        # 1. seed_after_edit: editing session gets T0 on re-read; sibling subagent is invalidated
+        ef = self.tmp / "editable.py"
+        ef.write_text("".join(f"v_{i} = {i}\n" for i in range(40)), encoding="utf-8")
+        self.assertIsNone(read_funnel.check_read("parent-1", str(ef), cfg=cfg, env=self.env))
+        self.assertIsNone(read_funnel.check_read("parent-1--sub1", str(ef), cfg=cfg, env=self.env))
+        # Simulate successful edit_file by parent-1
+        ef.write_text("".join(f"v_{i} = {i * 10}\n" if i == 5 else f"v_{i} = {i}\n" for i in range(40)), encoding="utf-8")
+        read_funnel.seed_after_edit("parent-1", str(ef), env=self.env)
+        # Parent re-read hits T0 unchanged (no self-diff echo!)
+        parent_reread = read_funnel.check_read("parent-1", str(ef), cfg=cfg, env=self.env)
+        self.assertIsNotNone(parent_reread)
+        assert parent_reread is not None
+        self.assertIn("unchanged", parent_reread["reason"])
+        # Sibling subagent gets T1 diff (NOT stale T0!)
+        sub_reread = read_funnel.check_read("parent-1--sub1", str(ef), cfg=cfg, env=self.env)
+        self.assertIsNotNone(sub_reread)
+        assert sub_reread is not None
+        self.assertIn("+v_5 = 50", sub_reread["reason"])
+        # Ranged-only session must NOT be seeded on partial edit (prevents shifted unread lines from hitting T0)
+        rf = self.tmp / "ranged_edit.py"
+        rf.write_text("".join(f"r_{i} = {i}\n" for i in range(60)), encoding="utf-8")
+        self.assertIsNone(read_funnel.check_read("r-sess", str(rf), start_line=1, end_line=20, cfg=cfg, env=self.env))
+        rf.write_text("".join(f"r_{i} = {i}\n" for i in range(10, 60)), encoding="utf-8")
+        read_funnel.seed_after_edit("r-sess", str(rf), env=self.env)
+        ranged_after = read_funnel.check_read("r-sess", str(rf), start_line=1, end_line=20, cfg=cfg, env=self.env)
+        # Either passes through or returns diff — must NEVER say "unchanged"
+        if ranged_after is not None:
+            self.assertNotIn("unchanged", ranged_after["reason"])
+
+        # 2. Large-slice Tier 2 outline guard on unread large file
+        huge = self.tmp / "huge_mod.py"
+        huge.write_text(
+            "".join(
+                f"def worker_{i}(arg):\n    '''Detailed worker docstring padding for realistic size {i}.'''\n    return arg + {i}\n\n"
+                for i in range(140)
+            ),
+            encoding="utf-8",
+        )
+        self.assertGreater(huge.stat().st_size, 12288)
+        res_slice = read_funnel.check_read("s-slice", str(huge), start_line=1, end_line=450, cfg=cfg, env=self.env)
+        self.assertIsNotNone(res_slice)
+        assert res_slice is not None
+        self.assertIn("Outline", res_slice["reason"])
+        self.assertIn("L1-L450", res_slice["reason"])
+        # Immediate retry loads the requested slice
+        self.assertIsNone(read_funnel.check_read("s-slice", str(huge), start_line=1, end_line=450, cfg=cfg, env=self.env))
+
+        # 3. Lossless single-object JSON minification
+        pretty_obj = json.dumps(
+            {f"section_{i}": {"enabled": True, "timeout_ms": i * 100, "tags": ["alpha", "beta"]} for i in range(25)},
+            indent=4,
+        )
+        crushed_obj = smart_crusher.crush_json(pretty_obj, env=self.env)
+        self.assertIsNotNone(crushed_obj)
+        assert crushed_obj is not None
+        self.assertLess(len(crushed_obj), len(pretty_obj) * 0.80)
+        self.assertEqual(json.loads(crushed_obj), json.loads(pretty_obj))
+
+        # 4. Space-padded CLI table compaction
+        cli_table = "\n".join([
+            "CONTAINER ID        IMAGE                       STATUS              NAMES",
+            "a1b2c3d4e5f6        postgres:16-alpine          Up 3 hours          app-db-primary",
+            "b2c3d4e5f6a7        redis:7-alpine              Up 3 hours          app-cache-main",
+            "c3d4e5f6a7b8        nginx:1.25-alpine           Up 2 hours          app-edge-proxy",
+            "d4e5f6a7b8c9        myapp/api:latest            Up 1 hour           app-api-server",
+            "e5f6a7b8c9d0        myapp/worker:latest         Up 1 hour           app-bg-worker",
+        ])
+        comp_tbl = output_compressor.compact_aligned_tables(cli_table)
+        self.assertIn("a1b2c3d4e5f6\tpostgres:16-alpine\tUp 3 hours\tapp-db-primary", comp_tbl)
+        self.assertLess(len(comp_tbl), len(cli_table) * 0.85)
+
+        # 5. Reversible base64 / data-URI blob folding
+        b64_payload = "A" * 1200
+        raw_b64 = f'{{"status":"ok","preview":"data:image/png;base64,{b64_payload}"}}'
+        folded_b64, b64_aid = output_compressor.fold_base64_blobs(raw_b64, command="mcp_screenshot", env=self.env)
+        self.assertIsNotNone(b64_aid)
+        self.assertIn("[data:image/png;base64", folded_b64)
+        self.assertLess(len(folded_b64), 200)
+        restored = output_compressor.read_archived_output(b64_aid or "", env=self.env)
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        self.assertIn(b64_payload, restored)
+
+        # 6. Directory-prefix factoring for file trees & Glob
+        paths = [
+            f"src/features/dashboard/components/Widget{i}.tsx" for i in range(8)
+        ] + [
+            f"src/features/auth/hooks/useAuth{i}.ts" for i in range(4)
+        ]
+        comp_tree = output_compressor.compact_file_list(paths)
+        self.assertIn("src/features/dashboard/components/: Widget0.tsx", comp_tree)
+        self.assertIn("src/features/auth/hooks/: useAuth0.ts", comp_tree)
+        self.assertLess(len(comp_tree), len("\n".join(paths)) * 0.65)
+
+        # 7. SQLite-first index (.meta.json + .db) + compact get_file_tree MCP response
+        ws = self.tmp / "sqlite_ws"
+        (ws / "pkg" / "sub").mkdir(parents=True)
+        for i in range(6):
+            (ws / "pkg" / "sub" / f"mod_{i}.py").write_text(f"def fn_{i}():\n    return {i}\n", encoding="utf-8")
+        idx_res = index_mcp.index_folder(str(ws), env=self.env)
+        repo = idx_res["repo"]
+        self.assertTrue((index_mcp.index_dir(self.env) / f"{repo}.meta.json").is_file())
+        self.assertTrue((index_mcp.index_dir(self.env) / f"{repo}.db").is_file())
+        self.assertFalse((index_mcp.index_dir(self.env) / f"{repo}.json").exists())
+        summary = index_bridge.workspace_index_summary(str(ws), env=self.env)
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary["repo"], repo)
+        tree_payload = index_mcp.dispatch_action("get_file_tree", {"repo": repo}, env=self.env)
+        tree_text = index_mcp.format_mcp_response("get_file_tree", tree_payload)
+        self.assertIn("pkg/sub/: mod_0.py", tree_text)
+
+        # 8. Native Rust `terser-fast exec` strips lossless noise even on non-zero exit
+        fast_bin = ROOT / "bin" / ("terser-fast.exe" if os.name == "nt" else "terser-fast")
+        if fast_bin.is_file():
+            fail_script = (
+                "import sys\n"
+                "for i in range(25): print(f'\\x1b[32m   Compiling crate_{i} v0.1.0\\x1b[0m')\n"
+                "print('\\x1b[31merror[E0308]: mismatched types\\x1b[0m')\n"
+                "sys.exit(101)\n"
+            )
+            r = subprocess.run(
+                [str(fast_bin), "exec", "--host", "antigravity", "--", sys.executable, "-c", fail_script],
+                capture_output=True, text=True, env=self.env, timeout=10,
+            )
+            self.assertEqual(r.returncode, 101)
+            self.assertIn("error[E0308]: mismatched types", r.stdout)
+            self.assertNotIn("\x1b[", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

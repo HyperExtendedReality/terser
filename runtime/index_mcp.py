@@ -287,6 +287,115 @@ def _db_path(slug: str, env: dict[str, str] | None = None) -> Path:
     return index_dir(env) / f"{slug}.db"
 
 
+def _meta_path(slug: str, env: dict[str, str] | None = None) -> Path:
+    return index_dir(env) / f"{slug}.meta.json"
+
+
+def _resolve_repo_slug(repo: str, *, env: dict[str, str] | None = None) -> tuple[str, dict[str, Any]] | None:
+    """Resolve `repo` name/prefix to `(slug, meta_dict)` using tiny `.meta.json` or SQLite (O(1))."""
+    idir = index_dir(env)
+    if not idir.is_dir() or not repo:
+        return None
+    low = repo.lower()
+    # 1. Exact or prefix match against tiny .meta.json files
+    exact_meta = idir / f"{repo}.meta.json"
+    candidates = [exact_meta] if exact_meta.is_file() else []
+    if not candidates:
+        for p in sorted(idir.glob("*.meta.json")):
+            slug = p.name[:-10]  # strip ".meta.json"
+            if slug.lower() == low or slug.lower().startswith(low + "-"):
+                candidates.append(p)
+                break
+    for mp in candidates:
+        try:
+            m = json.loads(mp.read_text(encoding="utf-8"))
+            if isinstance(m, dict) and m.get("source_root"):
+                return str(m.get("repo") or mp.name[:-10]), m
+        except Exception:
+            continue
+    return None
+
+
+def _db_query_file_outline(slug: str, fp: str, *, env: dict[str, str] | None = None) -> list[dict[str, Any]] | None:
+    dbp = _db_path(slug, env)
+    if not dbp.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, name, qualified_name, kind, file, start_line, end_line, signature, doc "
+                "FROM symbols WHERE file = ? ORDER BY start_line ASC",
+                (fp,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+    except sqlite3.Error:
+        return None
+
+
+def _db_query_search_symbols(slug: str, terms: list[str], limit: int, *, env: dict[str, str] | None = None) -> list[dict[str, Any]] | None:
+    dbp = _db_path(slug, env)
+    if not dbp.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            if not terms:
+                return []
+            where = " OR ".join(
+                "(lower(name) LIKE ? OR lower(qualified_name) LIKE ? OR lower(signature) LIKE ? OR lower(file) LIKE ?)"
+                for _ in terms
+            )
+            params: list[str] = []
+            for t in terms:
+                like = f"%{t}%"
+                params.extend([like, like, like, like])
+            rows = conn.execute(
+                f"SELECT id, name, qualified_name, kind, file, start_line, end_line, signature, doc FROM symbols WHERE {where}",
+                params,
+            ).fetchall()
+            scored: list[tuple[int, dict[str, Any]]] = []
+            for r in rows:
+                s = dict(r)
+                hay = f"{s.get('qualified_name','')} {s.get('signature','')} {s.get('file','')}".lower()
+                score = sum(3 if t in s.get("name", "").lower() else (1 if t in hay else 0) for t in terms)
+                if score > 0:
+                    scored.append((score, s))
+            scored.sort(key=lambda x: (-x[0], x[1].get("file", ""), x[1].get("start_line", 0)))
+            return [s for _, s in scored[:limit]]
+    except sqlite3.Error:
+        return None
+
+
+def _db_query_symbol_by_id(slug: str, sid: str, *, env: dict[str, str] | None = None) -> dict[str, Any] | None:
+    dbp = _db_path(slug, env)
+    if not dbp.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT id, name, qualified_name, kind, file, start_line, end_line, signature, doc "
+                "FROM symbols WHERE id = ? OR qualified_name = ? LIMIT 1",
+                (sid, sid),
+            ).fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error:
+        return None
+
+
+def _db_query_files(slug: str, *, env: dict[str, str] | None = None) -> list[str] | None:
+    dbp = _db_path(slug, env)
+    if not dbp.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+            rows = conn.execute("SELECT path FROM files ORDER BY path ASC").fetchall()
+            return [str(r[0]) for r in rows]
+    except sqlite3.Error:
+        return None
+
+
 def _init_index_db(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -450,17 +559,20 @@ def index_folder(path: str, *, env: dict[str, str] | None = None) -> dict[str, A
             for tok in f_imps:
                 import_edges.append((rel, tok))
 
-    doc = {
+    meta = {
         "repo": slug,
         "source_root": str(root),
         "indexed_at": round(time.time(), 1),
         "file_count": len(files),
         "symbol_count": len(symbols),
-        "source_files": files,
-        "symbols": symbols,
     }
-    atomic_write_json(index_dir(env) / f"{slug}.json", doc)
     _write_index_db(slug, str(root), files, symbols, import_edges, env=env)
+    atomic_write_json(_meta_path(slug, env), meta)
+    # Remove any legacy monolithic `<slug>.json` now superseded by `.db` + `.meta.json`
+    try:
+        (index_dir(env) / f"{slug}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
     return {
         "repo": slug,
         "source_root": str(root),
@@ -473,6 +585,34 @@ def _load_repo(repo: str, *, env: dict[str, str] | None = None) -> dict[str, Any
     idir = index_dir(env)
     if not idir.is_dir():
         return None
+    # Prefer SQLite + tiny .meta.json (fast, O(1) metadata)
+    resolved = _resolve_repo_slug(repo, env=env)
+    if resolved is not None:
+        slug, meta = resolved
+        dbp = _db_path(slug, env)
+        if dbp.is_file():
+            try:
+                with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    files = [str(r[0]) for r in conn.execute("SELECT path FROM files ORDER BY path ASC").fetchall()]
+                    syms = [
+                        dict(r)
+                        for r in conn.execute(
+                            "SELECT id, name, qualified_name, kind, file, start_line, end_line, signature, doc FROM symbols"
+                        ).fetchall()
+                    ]
+                return {
+                    "repo": slug,
+                    "source_root": meta.get("source_root", ""),
+                    "indexed_at": meta.get("indexed_at", 0),
+                    "file_count": len(files),
+                    "symbol_count": len(syms),
+                    "source_files": files,
+                    "symbols": syms,
+                }
+            except sqlite3.Error:
+                pass
+    # Legacy .json fallback
     direct = idir / f"{repo}.json"
     if direct.is_file():
         try:
@@ -481,6 +621,8 @@ def _load_repo(repo: str, *, env: dict[str, str] | None = None) -> dict[str, Any
             return None
     low = repo.lower()
     for p in idir.glob("*.json"):
+        if p.name.endswith(".meta.json"):
+            continue
         if p.stem.lower() == low or p.stem.lower().startswith(low + "-"):
             try:
                 return json.loads(p.read_text(encoding="utf-8"))
@@ -497,7 +639,46 @@ def reindex_file(file_path: str, *, env: dict[str, str] | None = None) -> bool:
     idir = index_dir(env)
     if not idir.is_dir():
         return False
+
+    # Fast O(1) SQLite + .meta.json path (avoids reading/rewriting multi-MB repo JSON)
+    for meta_file in idir.glob("*.meta.json"):
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        sr = str(meta.get("source_root") or "")
+        norm_sr = normalize_workspace(sr)
+        if not norm_sr or not norm_fp.startswith(norm_sr + "/"):
+            continue
+        slug = str(meta.get("repo") or meta_file.name[:-10])
+        dbp = _db_path(slug, env)
+        if not dbp.is_file():
+            continue
+        root = Path(sr)
+        try:
+            rel = fp.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        new_syms, new_imps = _index_single_file_with_imports(root, fp) if fp.is_file() else ([], set())
+        _update_index_db_file(slug, rel, fp.is_file(), new_syms, new_imps, env=env)
+        try:
+            with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+                f_cnt = int(conn.execute("SELECT COUNT(*) FROM files").fetchone()[0])
+                s_cnt = int(conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0])
+            meta["file_count"] = f_cnt
+            meta["symbol_count"] = s_cnt
+            meta["indexed_at"] = round(time.time(), 1)
+            atomic_write_json(meta_file, meta)
+        except sqlite3.Error:
+            pass
+        return True
+
+    # Legacy .json fallback
     for meta_file in idir.glob("*.json"):
+        if meta_file.name.endswith(".meta.json"):
+            continue
         try:
             data = json.loads(meta_file.read_text(encoding="utf-8"))
         except Exception:
@@ -515,12 +696,12 @@ def reindex_file(file_path: str, *, env: dict[str, str] | None = None) -> bool:
             continue
         syms = [s for s in (data.get("symbols") or []) if s.get("file") != rel]
         files = set(data.get("source_files") or [])
-        new_syms: list[dict[str, Any]] = []
-        new_imps: set[str] = set()
+        new_syms_leg: list[dict[str, Any]] = []
+        new_imps_leg: set[str] = set()
         if fp.is_file():
             files.add(rel)
-            new_syms, new_imps = _index_single_file_with_imports(root, fp)
-            syms.extend(new_syms)
+            new_syms_leg, new_imps_leg = _index_single_file_with_imports(root, fp)
+            syms.extend(new_syms_leg)
         else:
             files.discard(rel)
         data["source_files"] = sorted(files)
@@ -529,7 +710,7 @@ def reindex_file(file_path: str, *, env: dict[str, str] | None = None) -> bool:
         data["symbol_count"] = len(syms)
         data["indexed_at"] = round(time.time(), 1)
         atomic_write_json(meta_file, data)
-        _update_index_db_file(str(data.get("repo") or meta_file.stem), rel, fp.is_file(), new_syms, new_imps, env=env)
+        _update_index_db_file(str(data.get("repo") or meta_file.stem), rel, fp.is_file(), new_syms_leg, new_imps_leg, env=env)
         return True
     return False
 
@@ -683,8 +864,24 @@ def dispatch_action(action: str, args: dict[str, Any], *, env: dict[str, str] | 
     if action == "list_repos":
         idir = index_dir(env)
         repos = []
+        seen_slugs: set[str] = set()
         if idir.is_dir():
+            for p in sorted(idir.glob("*.meta.json")):
+                try:
+                    d = json.loads(p.read_text(encoding="utf-8"))
+                    slug = str(d.get("repo") or p.name[:-10])
+                    seen_slugs.add(slug)
+                    repos.append({
+                        "repo": slug,
+                        "source_root": d.get("source_root", ""),
+                        "files": d.get("file_count", 0),
+                        "symbols": d.get("symbol_count", 0),
+                    })
+                except Exception:
+                    continue
             for p in sorted(idir.glob("*.json")):
+                if p.name.endswith(".meta.json") or p.stem in seen_slugs:
+                    continue
                 try:
                     d = json.loads(p.read_text(encoding="utf-8"))
                     repos.append({
@@ -698,12 +895,47 @@ def dispatch_action(action: str, args: dict[str, Any], *, env: dict[str, str] | 
         return {"repos": repos}
 
     repo_name = str(args.get("repo") or "")
+    # Fast SQLite-first paths (avoid loading entire repo into memory for targeted queries)
+    resolved = _resolve_repo_slug(repo_name, env=env)
+    if resolved is not None:
+        r_slug, r_meta = resolved
+        if action == "invalidate_cache":
+            for ext in (".meta.json", ".json", ".db", ".db-wal", ".db-shm"):
+                try:
+                    (index_dir(env) / f"{r_slug}{ext}").unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return {"invalidated": r_slug}
+        if action == "get_file_tree":
+            db_files = _db_query_files(r_slug, env=env)
+            if db_files is not None:
+                return {"repo": r_slug, "files": db_files}
+        if action == "get_file_outline":
+            fp = str(args.get("file_path") or "").replace("\\", "/")
+            db_syms = _db_query_file_outline(r_slug, fp, env=env)
+            if db_syms is not None:
+                return {"file": fp, "symbols": db_syms}
+        if action == "search_symbols":
+            q = str(args.get("query") or "").strip().lower()
+            terms = [t for t in re.split(r"\s+", q) if t]
+            limit = int(args.get("limit") or 20)
+            db_matches = _db_query_search_symbols(r_slug, terms, limit, env=env)
+            if db_matches is not None:
+                return {"repo": r_slug, "matches": db_matches}
+        if action == "get_symbol_source":
+            sid = str(args.get("symbol_id") or "")
+            db_sym = _db_query_symbol_by_id(r_slug, sid, env=env)
+            if db_sym is not None:
+                return _read_symbol_code({"source_root": r_meta.get("source_root", "")}, db_sym)
+            if _db_path(r_slug, env).is_file():
+                return {"error": f"Symbol `{sid}` not found in `{r_slug}`."}
+
     doc = _load_repo(repo_name, env=env)
     if doc is None:
         return {"error": f"Repository `{repo_name}` not indexed. Call `index_folder` first."}
 
     if action == "invalidate_cache":
-        for ext in (".json", ".db", ".db-wal", ".db-shm"):
+        for ext in (".meta.json", ".json", ".db", ".db-wal", ".db-shm"):
             p = index_dir(env) / f"{doc['repo']}{ext}"
             try:
                 p.unlink(missing_ok=True)
@@ -942,8 +1174,11 @@ def format_mcp_response(action: str, payload: dict[str, Any]) -> str:
         return "\n".join(lines)
 
     if action == "get_file_tree" and isinstance(payload.get("files"), list):
-        files = payload["files"]
-        return f"repo={payload.get('repo','')} ({len(files)} files):\n" + "\n".join(files)
+        from runtime import output_compressor
+
+        files = [str(f) for f in payload["files"]]
+        body = output_compressor.compact_file_list(files)
+        return f"repo={payload.get('repo','')} ({len(files)} files):\n{body}"
 
     if action == "get_symbol_source" and isinstance(payload.get("source"), str):
         return f"{payload.get('id')} ({payload.get('file')} L{payload.get('start_line')}-{payload.get('end_line')}):\n{payload['source']}"

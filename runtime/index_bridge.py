@@ -79,7 +79,10 @@ def workspace_index_summary(workspace: str, env: dict[str, str] | None = None) -
     if not idx_dir.is_dir():
         return None
     try:
-        for meta_file in idx_dir.glob("*.json"):
+        # Prefer tiny ~150B *.meta.json files first (<1ms) before falling back to legacy *.json
+        meta_files = list(idx_dir.glob("*.meta.json"))
+        legacy_files = [p for p in idx_dir.glob("*.json") if not p.name.endswith(".meta.json")]
+        for meta_file in [*meta_files, *legacy_files]:
             if meta_file.name.startswith("_") or meta_file.name in ("config.json", "session_stats.json"):
                 continue
             try:
@@ -99,7 +102,8 @@ def workspace_index_summary(workspace: str, env: dict[str, str] | None = None) -
             if not sr:
                 continue
             if target == sr or target.startswith(sr + "/") or sr.startswith(target + "/"):
-                repo_id = str(data.get("repo") or meta_file.stem)
+                default_slug = meta_file.name[:-10] if meta_file.name.endswith(".meta.json") else meta_file.stem
+                repo_id = str(data.get("repo") or default_slug)
                 sym_count = len(data.get("symbols") or []) if isinstance(data.get("symbols"), list) else int(data.get("symbol_count") or 0)
                 file_count = len(data.get("source_files") or []) if isinstance(data.get("source_files"), list) else int(data.get("file_count") or 0)
                 return {
