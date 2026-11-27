@@ -21,6 +21,19 @@
         "micro-skills",
         "tool-pruning"
       ]
+    },
+    {
+      "name": "terser-hud",
+      "source": "./mods/terser-hud",
+      "displayName": "Terser HUD",
+      "version": "0.1.0",
+      "description": "Terser status band above the Claude prompt: savings, API usage, cost, context fill, cache, grade, and router controls.",
+      "category": "productivity",
+      "tags": [
+        "tokens",
+        "hud",
+        "status"
+      ]
     }
   ]
 }
