@@ -172,6 +172,96 @@ def _range_covered(
     return req_end <= prev_end
 
 
+def _merge_intervals(
+    existing: list[Any] | None,
+    new_start: int | None,
+    new_end: int | None,
+) -> list[list[int | None]]:
+    """Merge a new 1-based inclusive [start, end] range into a sorted list of disjoint intervals."""
+    items: list[tuple[int, int | None]] = []
+    if isinstance(existing, list):
+        for iv in existing:
+            if isinstance(iv, (list, tuple)) and len(iv) == 2:
+                s = _parse_int(iv[0])
+                e = _parse_int(iv[1])
+                items.append((max(1, s) if s is not None else 1, e))
+    ns = max(1, new_start) if new_start is not None else 1
+    ne = new_end
+    items.append((ns, ne))
+    items.sort(key=lambda x: (x[0], float("inf") if x[1] is None else x[1]))
+
+    merged: list[list[int | None]] = []
+    for s, e in items:
+        if not merged:
+            merged.append([s, e])
+            continue
+        ps, pe = merged[-1]
+        if pe is None:
+            continue
+        if s <= pe + 1:
+            merged[-1][1] = None if e is None else max(pe, e)
+        else:
+            merged.append([s, e])
+    return merged
+
+
+def _uncovered_subranges(
+    existing: list[Any] | None,
+    req_start: int | None,
+    req_end: int | None,
+    total_lines: int,
+) -> tuple[list[tuple[int, int]], int]:
+    """Return ``(uncovered_spans, covered_line_count)`` for ``[req_start, req_end]``."""
+    rs = max(1, req_start) if req_start is not None else 1
+    re_ = min(total_lines, req_end) if req_end is not None else total_lines
+    if rs > re_:
+        return [], 0
+
+    cov: list[tuple[int, int]] = []
+    if isinstance(existing, list):
+        for iv in existing:
+            if isinstance(iv, (list, tuple)) and len(iv) == 2:
+                s = _parse_int(iv[0]) or 1
+                e = _parse_int(iv[1])
+                cs = max(rs, s)
+                ce = min(re_, total_lines if e is None else e)
+                if cs <= ce:
+                    cov.append((cs, ce))
+    if not cov:
+        return [(rs, re_)], 0
+    cov.sort()
+
+    uncovered: list[tuple[int, int]] = []
+    covered_lines = 0
+    cursor = rs
+    for cs, ce in cov:
+        if cs > cursor:
+            uncovered.append((cursor, cs - 1))
+        if ce >= cursor:
+            covered_lines += ce - max(cursor, cs) + 1
+            cursor = ce + 1
+    if cursor <= re_:
+        uncovered.append((cursor, re_))
+    return uncovered, covered_lines
+
+
+def _intervals_cover(
+    prev: dict[str, Any],
+    req_start: int | None,
+    req_end: int | None,
+) -> bool:
+    ivs = prev.get("intervals")
+    if isinstance(ivs, list) and ivs:
+        for iv in ivs:
+            if isinstance(iv, (list, tuple)) and len(iv) == 2:
+                ps = _parse_int(iv[0])
+                pe = _parse_int(iv[1])
+                if _range_covered(ps, pe, req_start, req_end):
+                    return True
+        return False
+    return _range_covered(prev.get("start"), prev.get("end"), req_start, req_end)
+
+
 def _slice_lines(text: str, start_line: int | None, end_line: int | None) -> list[str]:
     lines = text.splitlines(keepends=True)
     s = max(0, (start_line - 1) if start_line else 0)
@@ -217,14 +307,125 @@ def _format_range(start_line: int | None, end_line: int | None) -> str:
 
 
 _DOC_EXTS = frozenset({".md", ".mdx", ".markdown"})
+_DATA_EXTS = frozenset({".json", ".yaml", ".yml", ".toml"})
+_LOG_EXTS = frozenset({".log", ".ndjson", ".jsonl", ".csv", ".tsv"})
+_LOCKFILE_NAME_RE = re.compile(
+    r"(?i)(?:^(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|cargo\.lock|"
+    r"poetry\.lock|uv\.lock|pipfile\.lock|composer\.lock|gemfile\.lock|go\.sum)$|"
+    r"\.(?:min\.js|min\.css|map|snap)$)"
+)
 _MD_HEADING_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*#*$")
+_YAML_TOP_RE = re.compile(r"^([A-Za-z0-9_.-]+)\s*:\s*(.*)$")
+_TOML_SEC_RE = re.compile(r"^(\[\[?.+?\]?\])$")
+_LOG_SIGNAL_RE = re.compile(r"(?i)\b(?:error|err|fatal|panic|exception|traceback|failed|fail|warn|warning|critical)\b")
 
 
-def build_code_outline(file_path: str, text: str) -> str | None:
-    """Build a compact line-numbered symbol or doc-heading outline for a large file.
+def _outline_structured_data(file_path: str, text: str, *, env: dict[str, str] | None = None) -> str | None:
+    """Tier 2c: Build compact line-numbered outlines for large lockfiles, JSON/YAML/TOML, and logs/CSV."""
+    p = Path(file_path)
+    ext = p.suffix.lower()
+    lines = text.splitlines()
+
+    # Lockfiles / minified / generated bundles
+    if _LOCKFILE_NAME_RE.search(p.name):
+        preview = "\n".join(f"L{i}: {ln[:100]}" for i, ln in enumerate(lines[:5], start=1))
+        return (
+            f"[Lockfile/generated file: {len(lines):,} lines — avoid full dumps; "
+            f"use grep or ranged reads for specific packages.]\n{preview}"
+        )
+
+    # Large JSON -> top-level keys with approximate line numbers & sizes
+    if ext == ".json":
+        try:
+            parsed = json.loads(text)
+        except (ValueError, json.JSONDecodeError):
+            parsed = None
+        if isinstance(parsed, dict) and len(parsed) >= 2:
+            key_lines: dict[str, int] = {}
+            for lineno, ln in enumerate(lines, start=1):
+                m = re.match(r'^\s{0,4}"([^"]+)"\s*:', ln)
+                if m and m.group(1) not in key_lines:
+                    key_lines[m.group(1)] = lineno
+            rows: list[str] = []
+            for k, v in list(parsed.items())[:_MAX_OUTLINE_LINES]:
+                ln_tag = f"L{key_lines[k]}: " if k in key_lines else ""
+                if isinstance(v, list):
+                    desc = f"array[{len(v)}]"
+                elif isinstance(v, dict):
+                    desc = f"object{{{len(v)} keys}}"
+                else:
+                    desc = repr(v)[:60]
+                rows.append(f"{ln_tag}{k}: {desc}")
+            if len(parsed) > _MAX_OUTLINE_LINES:
+                rows.append(f"... (+{len(parsed) - _MAX_OUTLINE_LINES} more keys)")
+            return "\n".join(rows)
+        if isinstance(parsed, list) and len(parsed) >= 5:
+            sample = json.dumps(parsed[0], separators=(",", ":"))[:140]
+            return f"JSON array[{len(parsed)} items]\nFirst item: {sample}"
+
+    # Large YAML / TOML -> top-level sections/keys with exact line numbers
+    if ext in (".yaml", ".yml"):
+        rows = []
+        for lineno, ln in enumerate(lines, start=1):
+            m = _YAML_TOP_RE.match(ln)
+            if m:
+                val = m.group(2).strip()[:60]
+                rows.append(f"L{lineno}: {m.group(1)}: {val}" if val else f"L{lineno}: {m.group(1)}:")
+                if len(rows) >= _MAX_OUTLINE_LINES:
+                    rows.append("... (more keys follow)")
+                    break
+        if len(rows) >= 3:
+            return "\n".join(rows)
+
+    if ext == ".toml":
+        rows = []
+        for lineno, ln in enumerate(lines, start=1):
+            s = ln.strip()
+            if _TOML_SEC_RE.match(s):
+                rows.append(f"L{lineno}: {s[:90]}")
+                if len(rows) >= _MAX_OUTLINE_LINES:
+                    rows.append("... (more sections follow)")
+                    break
+        if len(rows) >= 2:
+            return "\n".join(rows)
+
+    # Large logs / NDJSON / CSV -> auto-index into SQLite FTS5 sandbox + return head/signals/tail
+    if ext in _LOG_EXTS:
+        aid: str | None = None
+        try:
+            from runtime import context_sandbox
+
+            aid = context_sandbox.store_output(text, command=f"read:{p.name}", env=env)
+        except Exception:
+            aid = None
+        parts: list[str] = [f"Header ({len(lines):,} lines total):"]
+        for i, ln in enumerate(lines[:5], start=1):
+            parts.append(f"L{i}: {ln[:140]}")
+        sig_lines = [
+            f"L{i}: {ln[:140]}"
+            for i, ln in enumerate(lines[5:-5], start=6)
+            if _LOG_SIGNAL_RE.search(ln)
+        ]
+        if sig_lines:
+            parts.append(f"Signal lines ({len(sig_lines)} matches, showing up to 12):")
+            parts.extend(sig_lines[:12])
+        if len(lines) > 10:
+            parts.append("Tail:")
+            for i, ln in enumerate(lines[-5:], start=len(lines) - 4):
+                parts.append(f"L{i}: {ln[:140]}")
+        if aid:
+            parts.append(f'Indexed in sandbox: `terse query {aid} "<terms>"` or `terse expand {aid} <start> <end>`')
+        return "\n".join(parts)
+
+    return None
+
+
+def build_code_outline(file_path: str, text: str, *, env: dict[str, str] | None = None) -> str | None:
+    """Build a compact line-numbered symbol, doc-heading, or structured-data outline for a large file.
 
     Prefers Terser's bundled ``structure_map`` when available, falling back to
-    Python's ``ast`` module (for .py), Markdown heading TOC (for .md), or a fast regex extractor.
+    Python's ``ast`` module (for .py), Markdown heading TOC (for .md), structured data
+    outlines (JSON/YAML/TOML/lockfiles/logs), or a fast regex extractor.
     """
     ext = Path(file_path).suffix.lower()
 
@@ -246,6 +447,10 @@ def build_code_outline(file_path: str, text: str) -> str | None:
                     rows.append("... (more headings follow)")
                     break
         return "\n".join(rows) if len(rows) >= 3 else None
+
+    # 0b. Tier 2c: Lockfiles, JSON/YAML/TOML configs, and large logs/CSV/NDJSON
+    if ext in _DATA_EXTS or ext in _LOG_EXTS or _LOCKFILE_NAME_RE.search(Path(file_path).name):
+        return _outline_structured_data(file_path, text, env=env)
 
     if ext not in _CODE_EXTS:
         return None
@@ -373,6 +578,7 @@ def check_read(
             prev["sha"] = sha
             prev["start"] = start_line
             prev["end"] = end_line
+            prev["intervals"] = _merge_intervals(None, start_line, end_line)
             prev["soft_denies"] = 0
             prev["ts"] = now
             if text_snapshot is not None:
@@ -383,8 +589,8 @@ def check_read(
             _save_store(session_id, store, now, env)
             return None
 
-        # Tier 0: Unchanged re-read
-        if prev_sha == sha and _range_covered(prev_start, prev_end, start_line, end_line):
+        # Tier 0: Unchanged re-read (full coverage OR high partial-overlap trimming)
+        if prev_sha == sha and _intervals_cover(prev, start_line, end_line):
             if soft_denies < _SOFT_DENY_CAP and not cfg.get("shadow"):
                 prev["soft_denies"] = soft_denies + 1
                 prev["ts"] = now
@@ -401,6 +607,33 @@ def check_read(
             _save_store(session_id, store, now, env)
             return None
 
+        # Tier 0b: Partial-overlap range trimming — if >=40 lines & >=40% of requested span is already loaded
+        if (
+            prev_sha == sha
+            and soft_denies < _SOFT_DENY_CAP
+            and not cfg.get("shadow")
+            and (start_line is not None or end_line is not None)
+        ):
+            total_lines = raw_bytes.count(b"\n") + 1
+            rs = max(1, start_line) if start_line is not None else 1
+            re_ = min(total_lines, end_line) if end_line is not None else total_lines
+            req_span = max(1, re_ - rs + 1)
+            prev_ivs = prev.get("intervals") if isinstance(prev.get("intervals"), list) and prev.get("intervals") else [[prev.get("start") or 1, prev.get("end")]]
+            uncovered, cov_lines = _uncovered_subranges(prev_ivs, start_line, end_line, total_lines)
+            if uncovered and cov_lines >= 40 and (cov_lines / req_span) >= 0.40:
+                prev["soft_denies"] = soft_denies + 1
+                prev["ts"] = now
+                _save_store(session_id, store, now, env)
+                spans_str = ", ".join(f"L{s}-L{e}" for s, e in uncovered[:4])
+                range_hint = "StartLine/EndLine" if host == "antigravity" else "offset/limit"
+                reason = (
+                    f"[Terser] `{basename}`: {cov_lines}/{req_span} requested lines are already in context. "
+                    f"Read only the unread span ({spans_str}) using {range_hint}, or retry to load the full range."
+                )
+                est_saved_bytes = int(len(raw_bytes) * (cov_lines / max(total_lines, 1)))
+                record_savings("read_trim", max(len(reason) + 1, est_saved_bytes), len(reason), host=host, detail=basename, env=env)
+                return {"action": "deny", "reason": reason}
+
         # Tier 1: Compact unified delta diff on small edits
         if (
             cfg.get("delta_diff", True)
@@ -409,7 +642,7 @@ def check_read(
             and not cfg.get("shadow")
             and isinstance(prev.get("snapshot"), str)
             and text_snapshot is not None
-            and _range_covered(prev_start, prev_end, start_line, end_line)
+            and _intervals_cover(prev, start_line, end_line)
         ):
             diff = _compact_unified_diff(prev["snapshot"], text_snapshot, basename, start_line, end_line)
             if diff:
@@ -425,10 +658,11 @@ def check_read(
                 record_savings("read_delta", len(raw_bytes), len(reason), host=host, detail=basename, env=env)
                 return {"action": "deny", "reason": reason}
 
-    # Tier 2: First unranged read of a LARGE code/doc file -> inline line-numbered outline ONCE
+    # Tier 2: First unranged read of a LARGE code/doc/data file -> inline line-numbered outline ONCE
     # (Auto-backs off if the session already overrode `outline_backoff_limit` outlines for full reads.)
     backoff_limit = int(cfg.get("outline_backoff_limit", 2))
     outline_overrides = int((store.get("meta") or {}).get("outline_overrides") or 0)
+    is_lockfile = bool(_LOCKFILE_NAME_RE.search(basename))
     if (
         prev is None
         and start_line is None
@@ -440,13 +674,15 @@ def check_read(
     ):
         text_for_outline = text_snapshot or raw_bytes.decode("utf-8", errors="replace")
         total_lines = text_for_outline.count("\n") + 1
-        if total_lines >= int(cfg.get("outline_min_lines", 250)):
-            outline = build_code_outline(file_path, text_for_outline)
+        min_lines = 1 if is_lockfile else int(cfg.get("outline_min_lines", 250))
+        if total_lines >= min_lines:
+            outline = build_code_outline(file_path, text_for_outline, env=env)
             if outline:
                 reads[key] = {
                     "sha": sha,
                     "start": None,
                     "end": None,
+                    "intervals": [],
                     "soft_denies": 1,
                     "outline_only": True,
                     "ts": now,
@@ -462,17 +698,25 @@ def check_read(
                 record_savings("read_outline", len(raw_bytes), len(reason), host=host, detail=basename, env=env)
                 return {"action": "deny", "reason": reason}
 
-    # Tier 3: First read / wider range / large change -> record snapshot and allow
-    merged_start, merged_end = start_line, end_line
+    # Tier 3: First read / wider range / large change -> record snapshot & disjoint intervals and allow
+    existing_ivs = None
     if isinstance(prev, dict) and prev.get("sha") == sha:
-        p_s, p_e = prev.get("start"), prev.get("end")
-        merged_start = None if (p_s is None or start_line is None) else min(p_s, start_line)
-        merged_end = None if (p_e is None or end_line is None) else max(p_e, end_line)
+        if isinstance(prev.get("intervals"), list) and prev["intervals"]:
+            existing_ivs = prev["intervals"]
+        else:
+            existing_ivs = [[prev.get("start") or 1, prev.get("end")]]
+    merged_ivs = _merge_intervals(existing_ivs, start_line, end_line)
+    if len(merged_ivs) == 1:
+        legacy_start = None if (merged_ivs[0][0] == 1 and merged_ivs[0][1] is None) else merged_ivs[0][0]
+        legacy_end = merged_ivs[0][1]
+    else:
+        legacy_start, legacy_end = start_line, end_line
 
     entry: dict[str, Any] = {
         "sha": sha,
-        "start": merged_start,
-        "end": merged_end,
+        "start": legacy_start,
+        "end": legacy_end,
+        "intervals": merged_ivs,
         "soft_denies": 0,
         "outline_only": False,
         "ts": now,
@@ -482,6 +726,48 @@ def check_read(
     reads[key] = entry
     _save_store(session_id, store, now, env)
     return None
+
+
+def seed_after_write(
+    session_id: str,
+    file_path: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Seed the writing session's read cache after a full-file Write so immediate verification re-reads hit T0.
+
+    Also invalidates sibling/parent subagent caches so they never serve stale T0 hits.
+    """
+    if not session_id or not file_path or not _SID_RE.match(session_id):
+        return
+    invalidate_on_edit(session_id, file_path, env=env)
+    target = Path(file_path)
+    try:
+        st = target.stat()
+        if not target.is_file() or st.st_size == 0 or st.st_size > _MAX_FILE_BYTES:
+            return
+        raw_bytes = target.read_bytes()
+    except OSError:
+        return
+    if b"\x00" in raw_bytes[:4096]:
+        return
+    now = time.time()
+    sha = hashlib.sha256(raw_bytes).hexdigest()
+    key = _norm_path(file_path)
+    store = _load_store(session_id, env)
+    entry: dict[str, Any] = {
+        "sha": sha,
+        "start": None,
+        "end": None,
+        "intervals": [[1, None]],
+        "soft_denies": 0,
+        "outline_only": False,
+        "ts": now,
+    }
+    if len(raw_bytes) <= _MAX_SNAPSHOT_BYTES:
+        entry["snapshot"] = raw_bytes.decode("utf-8", errors="replace")
+    store["reads"][key] = entry
+    _save_store(session_id, store, now, env)
 
 
 def invalidate_on_edit(

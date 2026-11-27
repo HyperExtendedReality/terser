@@ -165,14 +165,21 @@ pub fn apply_stream_filters(text: &str, command: &str) -> String {
     let cmd_low = command.to_ascii_lowercase();
     let is_cargo = cmd_low.contains("cargo");
     let is_go = cmd_low.starts_with("go ") || cmd_low.contains(" go ");
-    let is_pytest = cmd_low.contains("pytest");
+    let is_test = cmd_low.contains("pytest")
+        || cmd_low.contains("unittest")
+        || cmd_low.contains("jest")
+        || cmd_low.contains("vitest");
     let is_pkg = cmd_low.contains("npm ")
         || cmd_low.contains("pnpm ")
         || cmd_low.contains("yarn ")
         || cmd_low.contains("pip ")
         || cmd_low.contains("uv ");
+    let is_infra = cmd_low.contains("docker")
+        || cmd_low.contains("terraform")
+        || cmd_low.contains("gradle")
+        || cmd_low.contains("dotnet");
 
-    if !is_cargo && !is_go && !is_pytest && !is_pkg {
+    if !is_cargo && !is_go && !is_test && !is_pkg && !is_infra {
         return text.to_string();
     }
 
@@ -180,24 +187,30 @@ pub fn apply_stream_filters(text: &str, command: &str) -> String {
     let mut dropped: usize = 0;
 
     for line in text.lines() {
-        if is_signal_line(line) {
+        let t = line.trim_start();
+        let test_pass = is_test
+            && ((t.contains("::") && (t.ends_with(" PASSED") || t.contains(" PASSED [") || t.ends_with(" SKIPPED")))
+                || (t.starts_with("test_") && t.ends_with("... ok"))
+                || t.starts_with("✓ ")
+                || t.starts_with("PASS "));
+        if !test_pass && is_signal_line(line) {
             out.push(line);
             continue;
         }
-        let t = line.trim_start();
-        let noise = (is_cargo
-            && (t.starts_with("Compiling ")
-                || t.starts_with("Downloading ")
-                || t.starts_with("Downloaded ")
-                || t.starts_with("Updating ")
-                || t.starts_with("Fresh ")
-                || t.starts_with("Checking ")
-                || t.starts_with("Blocking waiting for file lock")))
+        let noise = test_pass
+            || (is_cargo
+                && (t.starts_with("Compiling ")
+                    || t.starts_with("Downloading ")
+                    || t.starts_with("Downloaded ")
+                    || t.starts_with("Updating ")
+                    || t.starts_with("Fresh ")
+                    || t.starts_with("Checking ")
+                    || t.starts_with("Blocking waiting for file lock")))
             || (is_go
                 && (t.starts_with("=== RUN")
                     || t.starts_with("--- PASS:")
                     || (t.starts_with("? ") && t.contains("[no test files]"))))
-            || (is_pytest
+            || (is_test
                 && (t.starts_with("platform ")
                     || t.starts_with("rootdir:")
                     || t.starts_with("plugins:")
@@ -208,7 +221,12 @@ pub fn apply_stream_filters(text: &str, command: &str) -> String {
                     || t.starts_with("Using cached ")
                     || t.starts_with("Requirement already satisfied")
                     || t.starts_with("Progress:")
-                    || t.starts_with("Resolving ")));
+                    || t.starts_with("Resolving ")))
+            || (is_infra
+                && (t.contains("Already exists")
+                    || t.contains("Pulling fs layer")
+                    || t.contains("Refreshing state...")
+                    || t.contains("UP-TO-DATE")));
 
         if noise {
             dropped += 1;

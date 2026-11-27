@@ -188,18 +188,70 @@ def _split_powershell_command(command: str) -> list[str] | None:
     return tokens or None
 
 
+def _split_safe_and_chain(command: str) -> list[str] | None:
+    """Split top-level `&&` chains outside quotes (2-4 segments) for safe per-segment wrapping."""
+    if "&&" not in command:
+        return None
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+        elif ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+        elif ch == "&" and i + 1 < n and command[i + 1] == "&":
+            seg = "".join(buf).strip()
+            if not seg:
+                return None
+            parts.append(seg)
+            buf = []
+            i += 2
+        else:
+            buf.append(ch)
+            i += 1
+    if quote is not None:
+        return None
+    tail = "".join(buf).strip()
+    if not tail:
+        return None
+    parts.append(tail)
+    return parts if 2 <= len(parts) <= 4 else None
+
+
 def _wrap_command_for_compression(
     command: str,
     cfg: dict[str, Any],
     *,
     session_id: str = "",
 ) -> tuple[str | None, bool]:
-    """If `command` is safe & whitelisted, wrap it in output_compressor.py.
+    """If `command` is safe & whitelisted (or a safe `&&` chain of whitelisted commands), wrap it.
 
     Returns ``(rewritten_command_or_None, is_auto_approvable_readonly)``.
     """
     if not cfg.get("bash_compress", True) or cfg.get("shadow"):
         return None, False
+
+    # Support safe `&&`-chained commands when every segment independently passes validation
+    chain = _split_safe_and_chain(command)
+    if chain:
+        wrapped_parts: list[str] = []
+        all_readonly = True
+        for seg in chain:
+            w, ro = _wrap_command_for_compression(seg, cfg, session_id=session_id)
+            if not w:
+                return None, False
+            wrapped_parts.append(w)
+            all_readonly = all_readonly and ro
+        return " && ".join(wrapped_parts), all_readonly
+
     try:
         ensure_vendor_paths()
         import bash_hook as _bh  # type: ignore
@@ -234,10 +286,11 @@ def _wrap_command_for_compression(
         if _bh._has_dangerous_chars(check_str) or not _bh._is_whitelisted(check_str):
             return None, False
         if _prefer_native_exec(tokens):
+            sid_arg = f" --sid {_ps_quote(safe_sid)}" if safe_sid else ""
             rewritten = (
                 "& "
                 + _ps_quote(str(fast_bin))
-                + " exec --host antigravity -- "
+                + f" exec --host antigravity{sid_arg} -- "
                 + " ".join(_ps_quote(t) for t in tokens)
             )
         else:
@@ -262,9 +315,10 @@ def _wrap_command_for_compression(
             return None, False
         check_str = command
         if _prefer_native_exec(tokens):
+            sid_arg = f" --sid {shlex.quote(safe_sid)}" if safe_sid else ""
             rewritten = (
                 shlex.quote(str(fast_bin))
-                + " exec --host antigravity -- "
+                + f" exec --host antigravity{sid_arg} -- "
                 + " ".join(shlex.quote(t) for t in tokens)
             )
         else:
@@ -639,7 +693,25 @@ def handle_pre_tool_use(host: str, payload: dict[str, Any], cfg: dict[str, Any],
                     and prompt.strip()
                     and "[Terser Subagent]" not in prompt
                 ):
-                    return {"decision": "allow", "overwrite": {"Prompt": f"{prompt.rstrip()}\n\n{_SUBAGENT_BRIEF_AG}"}}
+                    overwrite: dict[str, Any] = {
+                        "Prompt": f"{prompt.rstrip()}\n\n{_SUBAGENT_BRIEF_AG}"
+                    }
+                    # Zero-cost complexity routing: downgrade clearly routine research lookups to `flash`
+                    # only when Model was omitted or set to `inherit` (never overrides explicit model choice).
+                    req_model = str(args.get("Model") or "").strip().lower()
+                    if (
+                        cfg.get("subagent_model_routing", True)
+                        and type_name == "research"
+                        and req_model in ("", "inherit")
+                    ):
+                        try:
+                            from runtime import task_router
+
+                            if task_router.classify_task(prompt).get("tier") == "low":
+                                overwrite["Model"] = "flash"
+                        except Exception:
+                            pass
+                    return {"decision": "allow", "overwrite": overwrite}
             elif tool_name == "swarm":
                 action = str(args.get("action") or "").strip().lower()
                 brief = args.get("brief")
@@ -727,6 +799,32 @@ def handle_pre_tool_use(host: str, payload: dict[str, Any], cfg: dict[str, Any],
             }
         return None
 
+    # 5. Claude Code Agent/Task subagent complexity routing (only when model is unset on Explore/read-only lookups)
+    if (
+        host == "claude"
+        and tool_name in ("Agent", "Task")
+        and cfg.get("subagent_model_routing", True)
+        and not cfg.get("shadow")
+    ):
+        req_model = str(tool_input.get("model") or "").strip().lower()
+        sub_type = str(tool_input.get("subagent_type") or "").strip().lower()
+        prompt = str(tool_input.get("prompt") or "")
+        if not req_model and sub_type in ("explore", "research", "general-purpose", "") and prompt.strip():
+            try:
+                from runtime import task_router
+
+                if task_router.classify_task(prompt).get("tier") == "low":
+                    updated = dict(tool_input, model="haiku")
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "updatedInput": updated,
+                        }
+                    }
+            except Exception:
+                pass
+        return None
+
     return None
 
 
@@ -746,12 +844,15 @@ def handle_post_tool_use(
         args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
         is_err = bool(str(payload.get("error") or "").strip())
 
-        # Edit/Write -> reset read-cache soft_denies + fire-and-forget AST reindex + continuity event
+        # Edit/Write -> reset read-cache soft_denies (or seed after full write) + AST reindex + continuity
         ws = _workspace(payload, env)
         if tool_name in ("edit_file", "write_file"):
             fp = str(args.get("Path") or args.get("AbsolutePath") or args.get("path") or "")
             if fp:
-                read_funnel.invalidate_on_edit(sid, fp, env=env)
+                if tool_name == "write_file" and not is_err and not args.get("Append"):
+                    read_funnel.seed_after_write(sid, fp, env=env)
+                else:
+                    read_funnel.invalidate_on_edit(sid, fp, env=env)
                 if cfg.get("index_auto_reindex", True):
                     index_bridge.spawn_reindex_file(fp, env=env)
                 if ws and not cfg.get("shadow"):
@@ -793,7 +894,10 @@ def handle_post_tool_use(
                     edited_paths.append(p)
         ws_cl = _workspace(payload, env)
         for fp in edited_paths:
-            read_funnel.invalidate_on_edit(sid, fp, env=env)
+            if tool_name == "Write" and not is_err:
+                read_funnel.seed_after_write(sid, fp, env=env)
+            else:
+                read_funnel.invalidate_on_edit(sid, fp, env=env)
             if cfg.get("index_auto_reindex", True):
                 index_bridge.spawn_reindex_file(fp)
             if ws_cl and not cfg.get("shadow"):
@@ -803,23 +907,23 @@ def handle_post_tool_use(
 
     hso: dict[str, Any] = {}
 
-    # 2. Invisible PostToolUse Bash output compression + cross-run Command Delta (Claude Code)
+    # 2. Invisible PostToolUse Bash/Shell output compression + cross-run Command Delta (Claude Code & Codex)
     if (
-        host == "claude"
-        and tool_name == "Bash"
+        host in ("claude", "codex")
+        and tool_name in ("Bash", "bash", "shell", "exec_command")
         and cfg.get("bash_compress", True)
         and not cfg.get("shadow")
         and isinstance(tool_resp, dict)
     ):
         stdout = tool_resp.get("stdout")
         if isinstance(stdout, str) and len(stdout) > 300:
-            cmd = str(tool_input.get("command") or "")
+            cmd = str(tool_input.get("command") or tool_input.get("cmd") or "")
             comp = stdout
             stats = {"raw_chars": len(stdout), "served_chars": len(stdout)}
             if len(stdout) > 1500:
                 comp, stats = output_compressor.compress_output(
                     stdout, command=cmd, enhanced=bool(cfg.get("enhanced_compression", True)),
-                    host=host, env=env,
+                    host=host, workspace=_workspace(payload, env), env=env,
                 )
             if cfg.get("cmd_delta", True):
                 comp, delta_used = cmd_delta.apply_command_delta(
@@ -832,9 +936,9 @@ def handle_post_tool_use(
                 hso["hookEventName"] = "PostToolUse"
                 hso["updatedToolOutput"] = updated_resp
 
-    # 3. Oversized MCP output compression + archival (Claude Code)
+    # 3. Oversized MCP output compression + archival (Claude Code & Codex)
     if (
-        host == "claude"
+        host in ("claude", "codex")
         and tool_name.startswith("mcp__")
         and cfg.get("archive_large_outputs", True)
         and not cfg.get("shadow")
@@ -845,27 +949,31 @@ def handle_post_tool_use(
             comp, stats = output_compressor.compress_output(
                 raw_text, command=tool_name, max_chars=threshold // 2,
                 enhanced=bool(cfg.get("enhanced_compression", True)),
-                host=host, env=env,
+                host=host, workspace=_workspace(payload, env), env=env,
             )
             if stats["served_chars"] < int(stats["raw_chars"] * 0.85):
                 hso["hookEventName"] = "PostToolUse"
                 hso["updatedMCPToolOutput"] = comp
 
-    # 3b. Runaway Glob / Grep output guard (Claude Code): cap huge scans + FTS5 archive
+    # 3b. Runaway Glob / Grep output guard (Claude Code & Codex): group by file + cap huge scans + FTS5 archive
     if (
-        host == "claude"
+        host in ("claude", "codex")
         and tool_name in ("Glob", "Grep")
         and cfg.get("archive_large_outputs", True)
         and not cfg.get("shadow")
     ):
         raw_text = tool_resp if isinstance(tool_resp, str) else json.dumps(tool_resp, default=str) if tool_resp is not None else ""
-        lines = raw_text.splitlines()
+        grouped = output_compressor.group_grep_output(raw_text) if tool_name == "Grep" else raw_text
+        lines = grouped.splitlines()
         if len(raw_text) > 8192 and len(lines) > 120:
             aid = output_compressor._archive_full_output(raw_text, command=tool_name, env=env)
             ptr = f' (`terse query {aid} "<terms>"` or `terse expand {aid} 1 100`)' if aid else ""
             capped = "\n".join(lines[:60]) + f"\n... [{len(lines) - 60} more {tool_name} lines omitted{ptr}]"
             hso["hookEventName"] = "PostToolUse"
             hso["updatedToolOutput"] = capped
+        elif tool_name == "Grep" and len(grouped) < int(len(raw_text) * 0.85):
+            hso["hookEventName"] = "PostToolUse"
+            hso["updatedToolOutput"] = grouped
 
     # 4. Unified Loop/Thrash Guard + live error continuity event
     if is_err and not cfg.get("shadow"):

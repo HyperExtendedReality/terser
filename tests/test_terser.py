@@ -978,5 +978,343 @@ class NativeFastPathTests(unittest.TestCase):
             self.assertFalse((Path(self.env["TERSER_HOME"]) / "read-cache" / "nat-p1--agent-99.json").exists())
 
 
+class TokenEfficiencyUpgradesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.env = dict(os.environ, TERSER_HOME=str(self.tmp / "terser_home"))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_index_mcp_exact_brace_end_lines_and_compact_formatting(self) -> None:
+        from runtime import index_mcp
+
+        ws = self.tmp / "ts_ws"
+        ws.mkdir()
+        body_lines = [f"  const v{i} = {i}; // comment with }} brace" for i in range(40)]
+        ts_src = "export function bigHandler(x: number) {\n" + "\n".join(body_lines) + "\n  return v39;\n}\n\nexport function tiny() {\n  return 1;\n}\n"
+        (ws / "app.ts").write_text(ts_src, encoding="utf-8")
+
+        res = index_mcp.index_folder(str(ws), env=self.env)
+        repo = res["repo"]
+        found = index_mcp.dispatch_action("search_symbols", {"repo": repo, "query": "bigHandler"}, env=self.env)
+        sym = found["matches"][0]
+        # Must capture full 43-line function instead of truncating at +25
+        self.assertEqual(sym["start_line"], 1)
+        self.assertEqual(sym["end_line"], 43)
+
+        tiny = index_mcp.dispatch_action("search_symbols", {"repo": repo, "query": "tiny"}, env=self.env)["matches"][0]
+        self.assertEqual(tiny["end_line"] - tiny["start_line"], 2)
+
+        # Compact MCP formatting must be significantly smaller than indented JSON
+        indented = json.dumps(found, indent=2)
+        compact = index_mcp.format_mcp_response("search_symbols", found)
+        self.assertLess(len(compact), len(indented) * 0.65)
+        self.assertIn("bigHandler", compact)
+
+    def test_read_funnel_tier2c_data_lockfiles_logs_disjoint_intervals_and_write_seed(self) -> None:
+        from runtime.config import DEFAULT_CONFIG
+
+        cfg = dict(DEFAULT_CONFIG, outline_min_bytes=500, outline_min_lines=10)
+
+        # 1. Large JSON -> Tier 2c key/schema outline
+        jf = self.tmp / "openapi.json"
+        jf.write_text(
+            json.dumps({"openapi": "3.1.0", "info": {"title": "API", "v": "1"}, "paths": {f"/p{i}": {"get": i} for i in range(40)}}, indent=2),
+            encoding="utf-8",
+        )
+        r_json = read_funnel.check_read("s-t2c", str(jf), cfg=cfg, env=self.env)
+        self.assertIsNotNone(r_json)
+        self.assertIn("paths: object{40 keys}", r_json["reason"])
+
+        # 2. Lockfile -> Tier 2c soft-deny even if single-line minified
+        lf = self.tmp / "package-lock.json"
+        lf.write_text("{" + '"a":1,' * 200 + '"z":2}', encoding="utf-8")
+        r_lock = read_funnel.check_read("s-t2c", str(lf), cfg=cfg, env=self.env)
+        self.assertIsNotNone(r_lock)
+        self.assertIn("Lockfile/generated", r_lock["reason"])
+
+        # 3. Large log -> auto-indexed in sandbox.db with signal lines preserved
+        logf = self.tmp / "server.log"
+        log_lines = [f"2026-11-26 10:00:{i:02d} INFO ok line {i} padding padding" for i in range(40)]
+        log_lines[20] = "2026-11-26 10:00:20 ERROR database connection refused"
+        logf.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        r_log = read_funnel.check_read("s-t2c", str(logf), cfg=cfg, env=self.env)
+        self.assertIsNotNone(r_log)
+        self.assertIn("database connection refused", r_log["reason"])
+        self.assertIn("terse query ", r_log["reason"])
+
+        # 4. Disjoint intervals: reading 1-10 then 30-40 must NOT claim 15-25 is covered
+        codef = self.tmp / "ranges.py"
+        codef.write_text("\n".join(f"x_{i} = {i}" for i in range(50)) + "\n", encoding="utf-8")
+        self.assertIsNone(read_funnel.check_read("s-iv", str(codef), start_line=1, end_line=10, cfg=cfg, env=self.env))
+        self.assertIsNone(read_funnel.check_read("s-iv", str(codef), start_line=30, end_line=40, cfg=cfg, env=self.env))
+        # Unread middle gap MUST pass through (None)!
+        self.assertIsNone(read_funnel.check_read("s-iv", str(codef), start_line=15, end_line=25, cfg=cfg, env=self.env))
+        # Already-read subrange MUST hit T0 dedup!
+        dup = read_funnel.check_read("s-iv", str(codef), start_line=2, end_line=8, cfg=cfg, env=self.env)
+        self.assertIsNotNone(dup)
+        self.assertEqual(dup["action"], "deny")
+
+        # 5. seed_after_write -> immediate verification re-read hits T0 dedup
+        wf = self.tmp / "written.py"
+        wf.write_text("def fresh():\n    return 42\n", encoding="utf-8")
+        read_funnel.seed_after_write("s-wr", str(wf), env=self.env)
+        r_wr = read_funnel.check_read("s-wr", str(wf), cfg=cfg, env=self.env)
+        self.assertIsNotNone(r_wr)
+        self.assertEqual(r_wr["action"], "deny")
+
+    def test_output_compressor_path_elision_grep_grouping_and_new_stream_filters(self) -> None:
+        ws = "/home/developer/projects/monorepo/packages/core"
+        raw_paths = "\n".join(f"{ws}/src/mod_{i}.ts:{i}:1 error TS2322: mismatch" for i in range(12))
+        elided = output_compressor.elide_workspace_paths(raw_paths, workspace=ws)
+        self.assertTrue(elided.startswith(f"[root: {ws}]"))
+        self.assertIn("./src/mod_0.ts", elided)
+        self.assertLess(len(elided), len(raw_paths))
+
+        raw_grep = "\n".join(
+            [f"packages/core/src/engine/processor.py:{i}: match_value = {i}" for i in range(10, 20)]
+            + [f"packages/core/src/engine/helper.py:{i}: match_value = {i}" for i in range(1, 6)]
+        )
+        grouped = output_compressor.group_grep_output(raw_grep)
+        self.assertIn("packages/core/src/engine/processor.py:\n  10:", grouped)
+        self.assertLess(len(grouped), len(raw_grep) * 0.6)
+
+        pytest_v = "\n".join(
+            [f"tests/test_app.py::test_case_{i} PASSED [ {i*5}%]" for i in range(1, 12)]
+            + ["tests/test_app.py::test_broken FAILED", "AssertionError: expected 1 == 2", "1 failed, 11 passed in 0.42s"]
+        )
+        filtered = output_compressor.apply_stream_filters(pytest_v, "pytest -v")
+        self.assertIn("test_broken FAILED", filtered)
+        self.assertIn("AssertionError", filtered)
+        self.assertIn("1 failed, 11 passed", filtered)
+        self.assertNotIn("test_case_5 PASSED", filtered)
+
+    def test_smart_crusher_ndjson_and_nested_graphql_and_cmd_delta_timing_norm(self) -> None:
+        # NDJSON
+        nd_lines = [
+            json.dumps({"service": "api", "env": "prod", "id": i, "latency_ms": 12 + (i % 3), "status": "ok"})
+            for i in range(20)
+        ]
+        nd_text = "\n".join(nd_lines)
+        crushed_nd = smart_crusher.crush_json(nd_text, command="kubectl logs", env=self.env)
+        self.assertIsNotNone(crushed_nd)
+        parsed_nd = json.loads(crushed_nd)
+        self.assertEqual(parsed_nd.get("_format"), "columnar")
+        self.assertEqual(parsed_nd.get("_source"), "ndjson")
+        self.assertLess(len(crushed_nd), len(nd_text) * 0.65)
+
+        # Nested GraphQL envelope (data.repository.issues.nodes)
+        gql = json.dumps({
+            "data": {
+                "repository": {
+                    "name": "terser",
+                    "issues": {
+                        "nodes": [
+                            {"state": "OPEN", "author": "alice", "num": i, "title": f"Issue number {i} description text"}
+                            for i in range(15)
+                        ]
+                    },
+                }
+            }
+        })
+        crushed_gql = smart_crusher.crush_json(gql, command="gh api graphql", env=self.env)
+        self.assertIsNotNone(crushed_gql)
+        parsed_gql = json.loads(crushed_gql)
+        self.assertEqual(parsed_gql["data"]["repository"]["issues"]["nodes"]["_format"], "columnar")
+
+        # cmd_delta timing-only-varying output -> 1-line identical receipt!
+        base = "\n".join(f"test_{i} ok padding padding" for i in range(20))
+        out1 = base + "\n20 passed in 1.42s"
+        out2 = base + "\n20 passed in 1.89s"
+        _, used1 = cmd_delta.apply_command_delta("s-time", "pytest", out1, returncode=0, env=self.env)
+        res2, used2 = cmd_delta.apply_command_delta("s-time", "pytest", out2, returncode=0, env=self.env)
+        self.assertFalse(used1)
+        self.assertTrue(used2)
+        self.assertIn("Identical output", res2)
+        self.assertIn("1.89s", res2)
+
+    def test_and_chain_wrapping_subagent_routing_and_codex_grep_grouping(self) -> None:
+        from runtime.config import DEFAULT_CONFIG
+
+        # 1. Safe &&-chain wrapping
+        wrapped, _ = unified_hook._wrap_command_for_compression("git status && git diff", DEFAULT_CONFIG, session_id="s-ch")
+        self.assertIsNotNone(wrapped)
+        self.assertIn(" && ", wrapped)
+
+        # 2. Subagent complexity routing: low-complexity research -> Model: flash
+        routed = unified_hook.dispatch(
+            "PreToolUse",
+            {
+                "conversationId": "ag-route-1",
+                "toolCall": {
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "research", "Prompt": "Find where typo in readme is"},
+                },
+            },
+            host_hint="antigravity",
+            env=self.env,
+        )
+        assert isinstance(routed, dict)
+        self.assertEqual(routed["overwrite"].get("Model"), "flash")
+
+        # Explicit Model="pro" must NEVER be downgraded
+        explicit = unified_hook.dispatch(
+            "PreToolUse",
+            {
+                "conversationId": "ag-route-1",
+                "toolCall": {
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "research", "Model": "pro", "Prompt": "Find where typo in readme is"},
+                },
+            },
+            host_hint="antigravity",
+            env=self.env,
+        )
+        assert isinstance(explicit, dict)
+        self.assertNotIn("Model", explicit["overwrite"])
+
+        # 3. Codex PostToolUse Grep grouping parity
+        raw_grep = "\n".join(f"src/very/deep/module/handler.py:{i}: const token = {i};" for i in range(1, 15))
+        cx = unified_hook.dispatch(
+            "PostToolUse",
+            {"session_id": "cx-grep-1", "tool_name": "Grep", "tool_input": {"pattern": "token"}, "tool_response": raw_grep},
+            host_hint="codex",
+            env=self.env,
+        )
+        hso = (cx or {}).get("hookSpecificOutput") or {}
+        self.assertIn("updatedToolOutput", hso)
+        self.assertIn("src/very/deep/module/handler.py:\n  1:", hso["updatedToolOutput"])
+
+    def test_compiler_note_dedup_claude_agent_routing_and_native_exec_delta(self) -> None:
+        from runtime import index_mcp
+
+        # 1. Repeated rustc/clippy note/help boilerplate deduplication
+        diag = "\n".join([
+            "error[E0308]: mismatched types in src/a.rs:10",
+            "  = note: for more information about this error, try `rustc --explain E0308`",
+            "error[E0308]: mismatched types in src/b.rs:22",
+            "  = note: for more information about this error, try `rustc --explain E0308`",
+            "error[E0308]: mismatched types in src/c.rs:35",
+            "  = note: for more information about this error, try `rustc --explain E0308`",
+        ])
+        deduped = output_compressor.dedup_compiler_notes(diag)
+        self.assertEqual(deduped.count("rustc --explain E0308"), 1)
+        self.assertIn("src/a.rs:10", deduped)
+        self.assertIn("src/b.rs:22", deduped)
+        self.assertIn("src/c.rs:35", deduped)
+
+        # 2. Compact MCP source block formatting for assemble_task_context (no JSON newline escaping)
+        formatted = index_mcp.format_mcp_response(
+            "assemble_task_context",
+            {
+                "repo": "demo",
+                "approx_tokens": 50,
+                "symbols": [{"id": "a.py::fn", "file": "a.py", "start_line": 1, "end_line": 2, "source": "1: def fn():\n2:     return 1"}],
+            },
+        )
+        self.assertIn("--- a.py::fn (a.py L1-2) ---\n1: def fn():\n2:     return 1", formatted)
+
+        # 3. Claude Code Agent routing: low-complexity Explore -> model: haiku
+        cl_route = unified_hook.dispatch(
+            "PreToolUse",
+            {
+                "session_id": "cl-ag-1",
+                "tool_name": "Agent",
+                "tool_input": {"subagent_type": "Explore", "prompt": "Find where typo in readme is"},
+            },
+            host_hint="claude",
+            env=self.env,
+        )
+        hso = (cl_route or {}).get("hookSpecificOutput") or {}
+        self.assertEqual((hso.get("updatedInput") or {}).get("model"), "haiku")
+
+        # 4. Native Rust `terser-fast exec --sid` identical-outcome cmd_delta
+        fast_bin = Path(__file__).resolve().parent.parent / "bin" / ("terser-fast.exe" if os.name == "nt" else "terser-fast")
+        if fast_bin.is_file():
+            py_cmd = "for i in range(25): print(f'module_{chr(65 + (i % 26))}_{chr(97 + ((i * 7) % 26))} stable output payload line')"
+            r1 = subprocess.run(
+                [str(fast_bin), "exec", "--host", "antigravity", "--sid", "nat-delta-1", "--", sys.executable, "-c", py_cmd],
+                capture_output=True, text=True, env=self.env, timeout=10,
+            )
+            r2 = subprocess.run(
+                [str(fast_bin), "exec", "--host", "antigravity", "--sid", "nat-delta-1", "--", sys.executable, "-c", py_cmd],
+                capture_output=True, text=True, env=self.env, timeout=10,
+            )
+            self.assertEqual(r1.returncode, 0)
+            self.assertEqual(r2.returncode, 0)
+            self.assertIn("[Terser Delta] Identical output", r2.stdout)
+            self.assertLess(len(r2.stdout), len(r1.stdout) * 0.5)
+
+    def test_partial_overlap_trimming_sqlite_blast_radius_and_web_table_compaction(self) -> None:
+        from runtime import index_mcp
+        from runtime.config import DEFAULT_CONFIG
+
+        cfg = dict(DEFAULT_CONFIG)
+
+        # 1. Partial-overlap range trimming
+        bigf = self.tmp / "overlap.py"
+        bigf.write_text("\n".join(f"line_{i} = {i}" for i in range(1, 221)) + "\n", encoding="utf-8")
+        self.assertIsNone(read_funnel.check_read("s-ov", str(bigf), start_line=1, end_line=100, cfg=cfg, env=self.env))
+        trimmed = read_funnel.check_read("s-ov", str(bigf), start_line=1, end_line=180, cfg=cfg, env=self.env)
+        self.assertIsNotNone(trimmed)
+        self.assertEqual(trimmed["action"], "deny")
+        self.assertIn("L101-L180", trimmed["reason"])
+        # Immediate retry passes through!
+        self.assertIsNone(read_funnel.check_read("s-ov", str(bigf), start_line=1, end_line=180, cfg=cfg, env=self.env))
+
+        # 2. SQLite symbol + import-edge blast radius (filters incidental comment-only noise)
+        ws = self.tmp / "graph_ws"
+        ws.mkdir()
+        (ws / "core.py").write_text("def compute_score(x):\n    return x * 2\n", encoding="utf-8")
+        (ws / "caller.py").write_text("from core import compute_score\nres = compute_score(5)\n", encoding="utf-8")
+        (ws / "unrelated.py").write_text("# Note: we discussed compute_score in docs\nVAL = 1\n", encoding="utf-8")
+
+        res = index_mcp.index_folder(str(ws), env=self.env)
+        repo = res["repo"]
+        self.assertTrue((index_mcp.index_dir(self.env) / f"{repo}.db").is_file())
+        br = index_mcp.dispatch_action("get_blast_radius", {"repo": repo, "symbol": "compute_score"}, env=self.env)
+        files_hit = [item["file"] for item in br["impacted_files"]]
+        self.assertIn("core.py", files_hit)
+        self.assertIn("caller.py", files_hit)
+        self.assertNotIn("unrelated.py", files_hit)
+
+        # Incremental single-file reindex updates SQLite
+        (ws / "extra.py").write_text("import core\nval = core.compute_score(9)\n", encoding="utf-8")
+        self.assertTrue(index_mcp.reindex_file(str(ws / "extra.py"), env=self.env))
+        br2 = index_mcp.dispatch_action("get_blast_radius", {"repo": repo, "symbol": "compute_score"}, env=self.env)
+        self.assertIn("extra.py", [item["file"] for item in br2["impacted_files"]])
+
+        # 3. HTML boilerplate stripping + Markdown padded table compaction
+        html_doc = (
+            "<!DOCTYPE html><html><head><style>body { color: red; " + "x" * 200 + " }</style>"
+            "<script>console.log('tracking " + "y" * 200 + "');</script></head>"
+            "<body><nav>Home | Docs | Pricing | Login | Careers</nav>"
+            "<main><h1>API Reference</h1><p>Use <a href='https://example.com/auth'>OAuth2</a> tokens.</p></main>"
+            "<footer>Copyright 2026 Example Corp All Rights Reserved</footer></body></html>"
+        )
+        comp_html = output_compressor.compact_web_and_markdown(html_doc)
+        self.assertIn("API Reference", comp_html)
+        self.assertIn("[OAuth2](https://example.com/auth)", comp_html)
+        self.assertNotIn("console.log", comp_html)
+        self.assertNotIn("Pricing", comp_html)
+        self.assertLess(len(comp_html), len(html_doc) * 0.4)
+
+        md_table = "\n".join([
+            "| Endpoint             | Method   | Status     | Latency      |",
+            "| -------------------- | -------- | ---------- | ------------ |",
+            "| /api/v1/users        | GET      | 200 OK     | 12ms         |",
+            "| /api/v1/orders       | POST     | 201 OK     | 34ms         |",
+            "| /api/v1/inventory    | GET      | 200 OK     | 18ms         |",
+            "| /api/v1/checkout     | POST     | 200 OK     | 45ms         |",
+            "| /api/v1/webhooks     | PUT      | 204 OK     | 22ms         |",
+        ])
+        comp_md = output_compressor.compact_web_and_markdown(md_table)
+        self.assertIn("/api/v1/users\tGET\t200 OK\t12ms", comp_md)
+        self.assertNotIn("| ---", comp_md)
+        self.assertLess(len(comp_md), len(md_table) * 0.65)
+
+
 if __name__ == "__main__":
     unittest.main()

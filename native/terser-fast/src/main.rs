@@ -5,9 +5,12 @@ mod config;
 mod loop_guard;
 mod read_funnel;
 
-use crate::config::{load_config, record_savings, safe_sid_filename, state_home, Config};
+use crate::config::{
+    atomic_write_json, load_config, now_secs, record_savings, safe_sid_filename, state_home, Config,
+};
 use crate::read_funnel::FunnelOutcome;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
@@ -245,6 +248,16 @@ fn handle_pre_tool_use(host: &str, payload: &Map<String, Value>, cfg: &Config) -
                     .trim()
                     .to_ascii_lowercase();
                 if !matches!(type_name.as_str(), "browser" | "image-generator") {
+                    let req_model = args
+                        .get("Model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
+                    // Delegate research subagents with unset/inherit Model so Python task_router can route low-complexity lookups
+                    if type_name == "research" && matches!(req_model.as_str(), "" | "inherit") {
+                        return DispatchResult::Delegate;
+                    }
                     if let Some(prompt) = args.get("Prompt").and_then(|v| v.as_str()) {
                         if !prompt.trim().is_empty() && !prompt.contains("[Terser Subagent]") {
                             let updated = format!("{}\n\n{SUBAGENT_BRIEF_AG}", prompt.trim_end());
@@ -344,7 +357,7 @@ fn handle_pre_tool_use(host: &str, payload: &Map<String, Value>, cfg: &Config) -
         };
     }
 
-    if matches!(tool_name, "Grep" | "Bash" | "bash" | "shell" | "exec_command") {
+    if matches!(tool_name, "Grep" | "Bash" | "bash" | "shell" | "exec_command" | "Agent" | "Task") {
         return DispatchResult::Delegate;
     }
 
@@ -402,9 +415,9 @@ fn handle_post_tool_use(
         .unwrap_or(&empty);
     let tool_resp = payload.get("tool_response");
 
-    // Delegate heavy output compression / archival on Claude Code
-    if host == "claude" && !cfg.shadow {
-        if tool_name == "Bash" && cfg.bash_compress {
+    // Delegate heavy output compression / archival on Claude Code & Codex
+    if matches!(host, "claude" | "codex") && !cfg.shadow {
+        if matches!(tool_name, "Bash" | "bash" | "shell" | "exec_command") && cfg.bash_compress {
             if let Some(stdout) = tool_resp
                 .and_then(|v| v.as_object())
                 .and_then(|o| o.get("stdout"))
@@ -423,7 +436,7 @@ fn handle_post_tool_use(
         }
         if matches!(tool_name, "Glob" | "Grep") && cfg.archive_large_outputs {
             let approx_len = tool_resp.map(|v| v.to_string().len()).unwrap_or(0);
-            if approx_len > 8192 {
+            if approx_len > 600 {
                 return DispatchResult::Delegate;
             }
         }
@@ -475,9 +488,96 @@ fn handle_subagent_stop(host: &str, payload: &Map<String, Value>) -> DispatchRes
     DispatchResult::Done(None)
 }
 
+fn sha256_str(text: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(text.as_bytes());
+    let d = h.finalize();
+    let mut out = String::with_capacity(64);
+    for b in d {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn normalize_digits_for_delta(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect()
+}
+
+fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host: &str) -> String {
+    if sid.is_empty() || output.len() < 300 {
+        return output.to_string();
+    }
+    let norm_cmd: String = cmd_str.split_whitespace().collect::<Vec<_>>().join(" ");
+    let key = sha256_str(&norm_cmd)[..20].to_string();
+    let cur_sha = sha256_str(output);
+    let cur_norm_sha = sha256_str(&normalize_digits_for_delta(output));
+    let now = now_secs();
+
+    let path = state_home()
+        .join("cmd-delta")
+        .join(format!("{}.json", safe_sid_filename(sid)));
+    let mut store: Map<String, Value> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    let mut result = output.to_string();
+    if let Some(prev) = store.get(&key).and_then(|v| v.as_object()) {
+        let prev_ts = prev.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let prev_rc = prev.get("rc").and_then(|v| v.as_i64()).unwrap_or(-999) as i32;
+        let prev_sha = prev.get("sha").and_then(|v| v.as_str()).unwrap_or("");
+        let prev_norm = prev
+            .get("norm_sha")
+            .and_then(|v| v.as_str())
+            .unwrap_or(prev_sha);
+        if (now - prev_ts) <= 1800.0
+            && prev_rc == rc
+            && (prev_sha == cur_sha || prev_norm == cur_norm_sha)
+        {
+            let elapsed = ((now - prev_ts) as i64).max(1);
+            let line_count = output.lines().count();
+            let tail = output
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            let short_cmd: String = cmd_str.chars().take(50).collect();
+            let tail_part = if tail.is_empty() {
+                String::new()
+            } else {
+                let short_tail: String = tail.chars().take(160).collect();
+                format!(" Last line: `{short_tail}`")
+            };
+            result = format!(
+                "[Terser Delta] Identical output to previous `{short_cmd}` run ({elapsed}s ago, exit={rc}, {line_count} lines).{tail_part}"
+            );
+            record_savings("cmd_delta", output.len(), result.len(), host, &short_cmd);
+        }
+    }
+
+    let snap: String = output.chars().take(32768).collect();
+    store.insert(
+        key,
+        json!({
+            "sha": cur_sha,
+            "norm_sha": cur_norm_sha,
+            "rc": rc,
+            "ts": now,
+            "text": snap,
+        }),
+    );
+    atomic_write_json(&path, &Value::Object(store));
+    result
+}
+
 fn run_exec_mode(raw_args: &[String]) -> i32 {
-    // Syntax: terser-fast exec [--host <h>] -- <prog> [args...]
+    // Syntax: terser-fast exec [--host <h>] [--sid <sid>] -- <prog> [args...]
     let mut host = "antigravity".to_string();
+    let mut sid = String::new();
     let mut idx = 0;
     while idx < raw_args.len() {
         if raw_args[idx] == "--" {
@@ -486,6 +586,11 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
         }
         if raw_args[idx] == "--host" && idx + 1 < raw_args.len() {
             host = raw_args[idx + 1].clone();
+            idx += 2;
+            continue;
+        }
+        if raw_args[idx] == "--sid" && idx + 1 < raw_args.len() {
+            sid = raw_args[idx + 1].clone();
             idx += 2;
             continue;
         }
@@ -526,15 +631,18 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
     }
 
     if stdout_str.len() > 300 {
-        let compressed = compress::compress_output(&stdout_str, &cmd_str);
+        let mut compressed = compress::compress_output(&stdout_str, &cmd_str);
         if compressed.len() < (stdout_str.len() * 85) / 100 {
             record_savings("bash_compress", stdout_str.len(), compressed.len(), &host, prog);
-            let _ = io::stdout().write_all(compressed.as_bytes());
-            if !compressed.ends_with('\n') {
-                let _ = io::stdout().write_all(b"\n");
-            }
         } else {
-            let _ = io::stdout().write_all(&output.stdout);
+            compressed = stdout_str.into_owned();
+        }
+        if !sid.is_empty() {
+            compressed = apply_native_cmd_delta(&sid, &cmd_str, &compressed, 0, &host);
+        }
+        let _ = io::stdout().write_all(compressed.as_bytes());
+        if !compressed.ends_with('\n') {
+            let _ = io::stdout().write_all(b"\n");
         }
     } else {
         let _ = io::stdout().write_all(&output.stdout);

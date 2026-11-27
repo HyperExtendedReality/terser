@@ -96,12 +96,6 @@ fn range_covered(
     start: Option<i64>,
     end: Option<i64>,
 ) -> bool {
-    if prev_start.is_none() && prev_end.is_none() {
-        return true;
-    }
-    if start.is_none() && end.is_none() {
-        return false;
-    }
     let ps = prev_start.unwrap_or(1);
     let s = start.unwrap_or(1);
     if s < ps {
@@ -113,6 +107,100 @@ fn range_covered(
         }
     }
     true
+}
+
+fn intervals_cover(prev: &Map<String, Value>, start: Option<i64>, end: Option<i64>) -> bool {
+    if let Some(Value::Array(ivs)) = prev.get("intervals") {
+        if !ivs.is_empty() {
+            for iv in ivs {
+                if let Value::Array(pair) = iv {
+                    if pair.len() == 2 {
+                        let ps = opt_i64(pair.first());
+                        let pe = opt_i64(pair.get(1));
+                        if range_covered(ps, pe, start, end) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+    }
+    range_covered(opt_i64(prev.get("start")), opt_i64(prev.get("end")), start, end)
+}
+
+fn merge_intervals(
+    existing: Option<&Vec<Value>>,
+    new_start: Option<i64>,
+    new_end: Option<i64>,
+) -> Vec<(i64, Option<i64>)> {
+    let mut items: Vec<(i64, Option<i64>)> = Vec::new();
+    if let Some(arr) = existing {
+        for iv in arr {
+            if let Value::Array(pair) = iv {
+                if pair.len() == 2 {
+                    let s = opt_i64(pair.first()).unwrap_or(1).max(1);
+                    let e = opt_i64(pair.get(1));
+                    items.push((s, e));
+                }
+            }
+        }
+    }
+    items.push((new_start.unwrap_or(1).max(1), new_end));
+    items.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| match (a.1, b.1) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (Some(x), Some(y)) => x.cmp(&y),
+        })
+    });
+    let mut merged: Vec<(i64, Option<i64>)> = Vec::new();
+    for (s, e) in items {
+        if let Some(last) = merged.last_mut() {
+            match last.1 {
+                None => continue,
+                Some(pe) if s <= pe + 1 => {
+                    last.1 = match e {
+                        None => None,
+                        Some(ne) => Some(pe.max(ne)),
+                    };
+                }
+                _ => merged.push((s, e)),
+            }
+        } else {
+            merged.push((s, e));
+        }
+    }
+    merged
+}
+
+fn intervals_to_json(ivs: &[(i64, Option<i64>)]) -> Value {
+    Value::Array(
+        ivs.iter()
+            .map(|(s, e)| json!([s, e]))
+            .collect(),
+    )
+}
+
+fn is_lockfile_or_minified(basename: &str) -> bool {
+    let low = basename.to_ascii_lowercase();
+    matches!(
+        low.as_str(),
+        "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "cargo.lock"
+            | "poetry.lock"
+            | "uv.lock"
+            | "pipfile.lock"
+            | "composer.lock"
+            | "gemfile.lock"
+            | "go.sum"
+    ) || low.ends_with(".min.js")
+        || low.ends_with(".min.css")
+        || low.ends_with(".snap")
+        || low.ends_with(".map")
 }
 
 fn format_range(start: Option<i64>, end: Option<i64>) -> String {
@@ -198,8 +286,6 @@ pub fn check_read(
 
     if let Some(mut prev) = prev_opt {
         let prev_sha = prev.get("sha").and_then(|v| v.as_str()).unwrap_or("");
-        let prev_start = opt_i64(prev.get("start"));
-        let prev_end = opt_i64(prev.get("end"));
         let soft_denies = opt_i64(prev.get("soft_denies")).unwrap_or(0);
         let outline_only = prev
             .get("outline_only")
@@ -208,10 +294,12 @@ pub fn check_read(
 
         // Retry after outline-only -> allow full file & record override
         if outline_only {
+            let ivs = merge_intervals(None, start_line, end_line);
             prev.insert("outline_only".into(), Value::Bool(false));
             prev.insert("sha".into(), Value::String(sha));
             prev.insert("start".into(), start_line.map(Into::into).unwrap_or(Value::Null));
             prev.insert("end".into(), end_line.map(Into::into).unwrap_or(Value::Null));
+            prev.insert("intervals".into(), intervals_to_json(&ivs));
             prev.insert("soft_denies".into(), json!(0));
             prev.insert("ts".into(), json!(now));
             if let Some(snap) = text_snapshot {
@@ -231,7 +319,7 @@ pub fn check_read(
         }
 
         // Tier 0: Unchanged re-read
-        if prev_sha == sha && range_covered(prev_start, prev_end, start_line, end_line) {
+        if prev_sha == sha && intervals_cover(&prev, start_line, end_line) {
             if soft_denies < SOFT_DENY_CAP && !cfg.shadow {
                 prev.insert("soft_denies".into(), json!(soft_denies + 1));
                 prev.insert("ts".into(), json!(now));
@@ -256,6 +344,35 @@ pub fn check_read(
             return FunnelOutcome::Allow;
         }
 
+        // Tier 0b: Partial-overlap range trimming -> delegate to Python when >=40 lines overlap
+        if prev_sha == sha
+            && soft_denies < SOFT_DENY_CAP
+            && !cfg.shadow
+            && (start_line.is_some() || end_line.is_some())
+        {
+            let total_lines = (raw_bytes.iter().filter(|&&b| b == b'\n').count() + 1) as i64;
+            let rs = start_line.unwrap_or(1).max(1);
+            let re = end_line.unwrap_or(total_lines).min(total_lines);
+            let mut has_large_overlap = false;
+            if let Some(Value::Array(ivs)) = prev.get("intervals") {
+                for iv in ivs {
+                    if let Value::Array(pair) = iv {
+                        if pair.len() == 2 {
+                            let s = opt_i64(pair.first()).unwrap_or(1).max(rs);
+                            let e = opt_i64(pair.get(1)).unwrap_or(total_lines).min(re);
+                            if e >= s && (e - s + 1) >= 40 {
+                                has_large_overlap = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if has_large_overlap {
+                return FunnelOutcome::Delegate;
+            }
+        }
+
         // Tier 1: File changed slightly & snapshot exists -> delegate to Python unified diff
         if cfg.delta_diff
             && prev_sha != sha
@@ -263,12 +380,12 @@ pub fn check_read(
             && !cfg.shadow
             && prev.get("snapshot").and_then(|v| v.as_str()).is_some()
             && text_snapshot.is_some()
-            && range_covered(prev_start, prev_end, start_line, end_line)
+            && intervals_cover(&prev, start_line, end_line)
         {
             return FunnelOutcome::Delegate;
         }
     } else {
-        // Tier 2: Large unranged first read -> delegate to Python for full AST/Markdown outline
+        // Tier 2: Large unranged first read -> delegate to Python for full AST/Markdown/Data outline
         let outline_overrides = store
             .get("meta")
             .and_then(|v| v.as_object())
@@ -282,36 +399,48 @@ pub fn check_read(
             && meta.len() >= cfg.outline_min_bytes
         {
             let line_count = raw_bytes.iter().filter(|&&b| b == b'\n').count() + 1;
-            if line_count >= cfg.outline_min_lines {
+            if is_lockfile_or_minified(&basename) || line_count >= cfg.outline_min_lines {
                 return FunnelOutcome::Delegate;
             }
         }
     }
 
-    // Tier 3: First read / ranged read / wider range / large change -> record & allow
-    let mut merged_start = start_line;
-    let mut merged_end = end_line;
-    if let Some(Value::Object(reads)) = store.get("reads") {
-        if let Some(Value::Object(prev)) = reads.get(&key) {
+    // Tier 3: First read / ranged read / wider range / large change -> record disjoint intervals & allow
+    let existing_ivs = store
+        .get("reads")
+        .and_then(|v| v.as_object())
+        .and_then(|reads| reads.get(&key))
+        .and_then(|v| v.as_object())
+        .and_then(|prev| {
             if prev.get("sha").and_then(|v| v.as_str()) == Some(sha.as_str()) {
-                let ps = opt_i64(prev.get("start"));
+                if let Some(Value::Array(arr)) = prev.get("intervals") {
+                    if !arr.is_empty() {
+                        return Some(arr.clone());
+                    }
+                }
+                let ps = opt_i64(prev.get("start")).unwrap_or(1);
                 let pe = opt_i64(prev.get("end"));
-                merged_start = match (ps, start_line) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    _ => None,
-                };
-                merged_end = match (pe, end_line) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    _ => None,
-                };
+                return Some(vec![json!([ps, pe])]);
             }
+            None
+        });
+    let merged_ivs = merge_intervals(existing_ivs.as_ref(), start_line, end_line);
+    let (legacy_start, legacy_end) = if merged_ivs.len() == 1 {
+        let (s, e) = merged_ivs[0];
+        if s == 1 && e.is_none() {
+            (None, None)
+        } else {
+            (Some(s), e)
         }
-    }
+    } else {
+        (start_line, end_line)
+    };
 
     let mut entry = Map::new();
     entry.insert("sha".into(), Value::String(sha));
-    entry.insert("start".into(), merged_start.map(Into::into).unwrap_or(Value::Null));
-    entry.insert("end".into(), merged_end.map(Into::into).unwrap_or(Value::Null));
+    entry.insert("start".into(), legacy_start.map(Into::into).unwrap_or(Value::Null));
+    entry.insert("end".into(), legacy_end.map(Into::into).unwrap_or(Value::Null));
+    entry.insert("intervals".into(), intervals_to_json(&merged_ivs));
     entry.insert("soft_denies".into(), json!(0));
     entry.insert("outline_only".into(), Value::Bool(false));
     entry.insert("ts".into(), json!(now));

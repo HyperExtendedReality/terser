@@ -222,6 +222,79 @@ _PKG_NOISE_RE = re.compile(
     r"Resolving |Prepared \d+ packages|Packages:|Progress:|added \d+ packages in |audited \d+ packages)"
 )
 _BUNDLER_NOISE_RE = re.compile(r"^\s*(?:transforming \(\d+\)|✓ \d+ modules transformed|rendering chunks|computing gzip size)")
+_TEST_PASS_LINE_RE = re.compile(
+    r"^\s*(?:.*::\S+\s+(?:PASSED|SKIPPED|XFAIL)(?:\s+\[\s*\d+%\])?$|"
+    r"test_\S+\s+\([^)]+\)\s+\.\.\.\s+(?:ok|skipped\b.*)$|"
+    r"(?:✓|✔|PASS)\s+\S+.*$)"
+)
+_INFRA_NOISE_RE = re.compile(
+    r"^\s*(?:[0-9a-f]{6,12}:\s*(?:Already exists|Pulling fs layer|Waiting|Verifying Checksum|Download complete|Pull complete)|"
+    r"#\d+\s+(?:CACHED|DONE \d|transferring )|.*:\s*Refreshing state\.\.\.|"
+    r">\s*Task\s+:\S+\s+(?:UP-TO-DATE|FROM-CACHE|NO-SOURCE)|"
+    r"\[INFO\]\s*Downloading from\s+|Restored\s+.*\s+in\s+\d+\s*ms)"
+)
+_GREP_LINE_RE = re.compile(r"^(?P<path>(?:[A-Za-z]:)?[^:\s][^:\r\n]{1,220}):(?P<line>\d+):(?P<rest>.*)$")
+
+
+def elide_workspace_paths(text: str, workspace: str | None = None) -> str:
+    """Losslessly replace repeated workspace root prefixes with `./` + a single `[root: ...]` header."""
+    if not text or len(text) < 400:
+        return text
+    ws = (workspace or os.getcwd() or "").rstrip("/\\")
+    if len(ws) < 12:
+        return text
+    variants = {ws + "/", ws + "\\", ws.replace("\\", "/") + "/", ws.replace("/", "\\") + "\\"}
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    pat = re.compile("|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True)), flags)
+    matches = pat.findall(text)
+    if len(matches) < 4:
+        return text
+    replaced = pat.sub("./", text)
+    if len(replaced) + len(ws) + 12 < len(text):
+        return f"[root: {ws}]\n{replaced}"
+    return text
+
+
+def group_grep_output(text: str) -> str:
+    """Losslessly group `path:line:content` search output by file header to remove repeated paths."""
+    if not text or "diff --git " in text or "Traceback " in text:
+        return text
+    lines = text.splitlines()
+    if len(lines) < 6:
+        return text
+    parsed: list[tuple[str, str, str] | None] = []
+    counts: dict[str, int] = {}
+    matched = 0
+    for ln in lines:
+        m = _GREP_LINE_RE.match(ln)
+        if m:
+            p = m.group("path")
+            # Avoid misclassifying URLs or timestamps (e.g. http://... or 12:34:56)
+            if p.startswith(("http", "https")) or p.isdigit():
+                parsed.append(None)
+            else:
+                parsed.append((p, m.group("line"), m.group("rest")))
+                counts[p] = counts.get(p, 0) + 1
+                matched += 1
+        else:
+            parsed.append(None)
+    if matched < 6 or matched < int(len(lines) * 0.65) or not any(c >= 2 for c in counts.values()):
+        return text
+
+    out: list[str] = []
+    cur_file: str | None = None
+    for idx, item in enumerate(parsed):
+        if item is None:
+            cur_file = None
+            out.append(lines[idx])
+            continue
+        p, ln_no, rest = item
+        if p != cur_file:
+            out.append(f"{p}:")
+            cur_file = p
+        out.append(f"  {ln_no}:{rest}")
+    grouped = "\n".join(out)
+    return grouped if len(grouped) < int(len(text) * 0.90) else text
 
 
 _LOCKFILE_OR_GEN_RE = re.compile(
@@ -305,6 +378,109 @@ def fold_framework_stack_frames(text: str, min_run: int = 3) -> str:
     return "\n".join(out)
 
 
+_COMPILER_NOTE_RE = re.compile(r"^\s*(?:=\s*)?(?:note|help):\s+(.+)$")
+
+
+def dedup_compiler_notes(text: str) -> str:
+    """Deduplicate repeated identical `note:` / `help:` boilerplate in rustc/clippy/tsc/mypy output."""
+    if not text or ("note:" not in text and "help:" not in text):
+        return text
+    lines = text.splitlines()
+    seen_notes: dict[str, int] = {}
+    out: list[str] = []
+    omitted = 0
+    for ln in lines:
+        m = _COMPILER_NOTE_RE.match(ln)
+        if m:
+            norm = " ".join(m.group(1).split())
+            if len(norm) >= 24:
+                cnt = seen_notes.get(norm, 0) + 1
+                seen_notes[norm] = cnt
+                if cnt >= 2:
+                    omitted += 1
+                    continue
+        out.append(ln)
+    if omitted >= 2:
+        out.append(f"[Terser: {omitted} repeated compiler note/help lines deduplicated]")
+        return "\n".join(out)
+    return text
+
+
+_HTML_TAG_PROBE_RE = re.compile(r"(?i)<(?:!doctype\s+html|html|head|body|nav|footer|script|style|div|table)\b")
+_HTML_BOILERPLATE_RE = re.compile(
+    r"(?is)<(?:script|style|noscript|svg|nav|footer|iframe|template)\b[^>]*>.*?</(?:script|style|noscript|svg|nav|footer|iframe|template)>|<!--.*?-->"
+)
+_HTML_LINK_RE = re.compile(r'(?is)<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>')
+_HTML_BLOCK_BREAK_RE = re.compile(r"(?i)</?(?:p|div|br|li|tr|h[1-6]|section|article|header|main|pre|blockquote)\b[^>]*>")
+_HTML_ANY_TAG_RE = re.compile(r"<[^>]+>")
+_MD_TABLE_SEP_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+
+
+def compact_web_and_markdown(text: str) -> str:
+    """Strip HTML nav/script/style boilerplate and compact padded Markdown tables into lossless TSV."""
+    if not text or len(text) < 400:
+        return text
+
+    cur = text
+    # 1. HTML boilerplate stripping (only when text clearly contains HTML markup)
+    if len(_HTML_TAG_PROBE_RE.findall(cur[:8192])) >= 3:
+        import html as _html
+
+        cleaned = _HTML_BOILERPLATE_RE.sub("\n", cur)
+        cleaned = _HTML_LINK_RE.sub(
+            lambda m: f"[{_HTML_ANY_TAG_RE.sub('', m.group(2)).strip()}]({m.group(1)})"
+            if _HTML_ANY_TAG_RE.sub("", m.group(2)).strip()
+            else m.group(1),
+            cleaned,
+        )
+        cleaned = _HTML_BLOCK_BREAK_RE.sub("\n", cleaned)
+        cleaned = _HTML_ANY_TAG_RE.sub(" ", cleaned)
+        cleaned = _html.unescape(cleaned)
+        cleaned_lines = [" ".join(ln.split()) for ln in cleaned.splitlines()]
+        cleaned = "\n".join(ln for ln in cleaned_lines if ln)
+        if cleaned and len(cleaned) < int(len(cur) * 0.85):
+            cur = cleaned
+
+    # 2. Padded Markdown pipe-table compaction -> lossless TSV
+    if "|" in cur and "---" in cur:
+        lines = cur.splitlines()
+        out: list[str] = []
+        i, n = 0, len(lines)
+        changed = False
+        while i < n:
+            if (
+                i + 2 < n
+                and "|" in lines[i]
+                and _MD_TABLE_SEP_RE.match(lines[i + 1])
+                and "|" in lines[i + 2]
+            ):
+                j = i + 2
+                while j < n and "|" in lines[j] and lines[j].strip():
+                    j += 1
+                row_count = j - i
+                if row_count >= 4:
+                    raw_block = "\n".join(lines[i:j])
+                    tsv_rows: list[str] = []
+                    for k in range(i, j):
+                        if k == i + 1:
+                            continue  # omit separator row
+                        row = lines[k].strip().strip("|")
+                        cells = [" ".join(c.strip().split()) for c in row.split("|")]
+                        tsv_rows.append("\t".join(cells))
+                    tsv_block = "\n".join(tsv_rows)
+                    if len(tsv_block) < int(len(raw_block) * 0.85):
+                        out.extend(tsv_rows)
+                        changed = True
+                        i = j
+                        continue
+            out.append(lines[i])
+            i += 1
+        if changed:
+            cur = "\n".join(out)
+
+    return cur
+
+
 def apply_stream_filters(text: str, command: str) -> str:
     """Apply high-signal stream filters for Cargo, Go test, bundlers, and package managers."""
     if not text or not command:
@@ -335,6 +511,19 @@ def apply_stream_filters(text: str, command: str) -> str:
         omitted = len(lines) - len(kept)
         if omitted >= 4:
             filtered = [f"[build: {omitted} progress lines omitted]", *kept]
+    elif re.search(r"\b(?:pytest|unittest|jest|vitest|mocha)\b", low):
+        kept = [
+            ln for ln in lines
+            if not _TEST_PASS_LINE_RE.match(ln) or re.search(r"(?i)\b(?:fail|error|exception|traceback)\b", ln)
+        ]
+        omitted = len(lines) - len(kept)
+        if omitted >= 4:
+            filtered = [f"[tests: {omitted} passing/skipped test lines omitted]", *kept]
+    elif re.search(r"\b(?:docker|terraform|tofu|dotnet|gradle|gradlew|mvn|mvnw)\b", low):
+        kept = [ln for ln in lines if _SIGNAL_LINE_RE.search(ln) or not _INFRA_NOISE_RE.match(ln)]
+        omitted = len(lines) - len(kept)
+        if omitted >= 4:
+            filtered = [f"[infra/build: {omitted} unchanged/progress lines omitted]", *kept]
 
     if filtered is not None:
         return "\n".join(filtered)
@@ -409,6 +598,7 @@ def compress_output(
     max_chars: int = _DEFAULT_MAX_CHARS,
     enhanced: bool = True,
     host: str = "unknown",
+    workspace: str | None = None,
     env: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Run the 5-stage quality-preserving output compression pipeline.
@@ -421,10 +611,12 @@ def compress_output(
     raw_len = len(text)
     cur = strip_ansi_and_progress(text) if enhanced else text
 
-    # Stage 2: lockfile diff elision + stream filters + specialized command handlers
+    # Stage 2: lockfile diff elision + framework stack folding + compiler note dedup + web/table compaction + filters
     if enhanced:
         cur = elide_lockfile_diffs(cur)
         cur = fold_framework_stack_frames(cur)
+        cur = dedup_compiler_notes(cur)
+        cur = compact_web_and_markdown(cur)
     if command:
         cur = apply_stream_filters(cur, command) if enhanced else cur
         cur = _vendor_compress(cur, command, returncode=returncode, stderr=stderr)
@@ -441,6 +633,8 @@ def compress_output(
         if crushed is not None:
             cur = crushed
         else:
+            cur = elide_workspace_paths(cur, workspace=workspace)
+            cur = group_grep_output(cur)
             cur = collapse_duplicate_lines(cur)
 
     archive_id: str | None = None

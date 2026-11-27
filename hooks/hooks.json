@@ -47,7 +47,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Read|Grep|Bash|mcp__.*",
+        "matcher": "Read|Grep|Bash|Agent|Task|mcp__.*",
         "hooks": [
           {
             "type": "command",

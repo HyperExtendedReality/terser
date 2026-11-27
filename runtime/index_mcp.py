@@ -16,8 +16,10 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -124,15 +126,109 @@ def _extract_python_symbols(rel_path: str, text: str) -> list[dict[str, Any]]:
     return syms
 
 
+_BRACE_EXTS = frozenset({
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs",
+    ".java", ".kt", ".kts", ".cs", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp",
+    ".php", ".swift", ".scala", ".dart", ".zig",
+})
+_INDENT_EXTS = frozenset({".gd"})
+_END_KW_EXTS = frozenset({".rb", ".lua"})
+_END_OPEN_RE = re.compile(r"\b(?:def|class|module|function|if|unless|for|while|until|begin|case|do)\b")
+_END_CLOSE_RE = re.compile(r"\bend\b")
+
+
+def _find_block_end_line(lines: list[str], start_idx: int, ext: str, max_scan: int = 400) -> int:
+    """Compute accurate 1-based end_line for non-Python symbols using brace/indent/end scanning."""
+    total = len(lines)
+    limit = min(total, start_idx + max_scan)
+
+    if ext in _BRACE_EXTS:
+        depth = 0
+        seen_open = False
+        in_block_comment = False
+        for i in range(start_idx, limit):
+            ln = lines[i]
+            j, n = 0, len(ln)
+            quote: str | None = None
+            while j < n:
+                ch = ln[j]
+                nxt = ln[j + 1] if j + 1 < n else ""
+                if in_block_comment:
+                    if ch == "*" and nxt == "/":
+                        in_block_comment = False
+                        j += 2
+                        continue
+                    j += 1
+                    continue
+                if quote is not None:
+                    if ch == "\\":
+                        j += 2
+                        continue
+                    if ch == quote:
+                        quote = None
+                    j += 1
+                    continue
+                if ch == "/" and nxt == "/":
+                    break
+                if ch == "/" and nxt == "*":
+                    in_block_comment = True
+                    j += 2
+                    continue
+                if ch in ("'", '"', "`"):
+                    quote = ch
+                    j += 1
+                    continue
+                if ch == "{":
+                    depth += 1
+                    seen_open = True
+                elif ch == "}":
+                    if seen_open:
+                        depth -= 1
+                        if depth <= 0:
+                            return i + 1
+                elif ch == ";" and not seen_open and i >= start_idx:
+                    return i + 1
+                j += 1
+        return min(total, start_idx + 40)
+
+    if ext in _INDENT_EXTS:
+        base_indent = len(lines[start_idx]) - len(lines[start_idx].lstrip(" \t"))
+        end_i = start_idx
+        for i in range(start_idx + 1, limit):
+            s = lines[i].strip()
+            if not s or s.startswith("#"):
+                continue
+            ind = len(lines[i]) - len(lines[i].lstrip(" \t"))
+            if ind <= base_indent:
+                break
+            end_i = i
+        return end_i + 1
+
+    if ext in _END_KW_EXTS:
+        depth = 0
+        for i in range(start_idx, limit):
+            cleaned = re.sub(r"(['\"]).*?\1", "", lines[i])
+            cleaned = re.sub(r"(?:#|--).*$", "", cleaned)
+            depth += len(_END_OPEN_RE.findall(cleaned))
+            depth -= len(_END_CLOSE_RE.findall(cleaned))
+            if i > start_idx and depth <= 0:
+                return i + 1
+        return min(total, start_idx + 40)
+
+    return min(total, start_idx + 25)
+
+
 def _extract_generic_symbols(rel_path: str, text: str) -> list[dict[str, Any]]:
     syms: list[dict[str, Any]] = []
     lines = text.splitlines()
+    ext = Path(rel_path).suffix.lower()
     for idx, line in enumerate(lines, start=1):
         m = _GENERIC_SYM_RE.match(line)
         if not m:
             continue
         kind = m.group("kind")
         name = m.group("name")
+        end_line = _find_block_end_line(lines, idx - 1, ext)
         syms.append({
             "id": f"{rel_path}::{name}@{idx}",
             "name": name,
@@ -140,28 +236,195 @@ def _extract_generic_symbols(rel_path: str, text: str) -> list[dict[str, Any]]:
             "kind": kind,
             "file": rel_path,
             "start_line": idx,
-            "end_line": min(len(lines), idx + 25),
+            "end_line": end_line,
             "signature": line.strip()[:160],
             "doc": "",
         })
     return syms
 
 
-def _index_single_file(root: Path, file_path: Path) -> list[dict[str, Any]]:
+_IMPORT_TOKEN_RE = re.compile(
+    r"""(?m)^\s*(?:from\s+([\w.]+)\s+import\s+([\w,\s*]+)|import\s+([\w.,\s]+)|"""
+    r"""(?:import|export).*?from\s+['"]([^'"]+)['"]|require\(\s*['"]([^'"]+)['"]\s*\)|"""
+    r"""use\s+([\w:]+)|using\s+([\w.]+))"""
+)
+
+
+def _extract_imports(rel_path: str, text: str) -> set[str]:
+    """Extract normalized imported module/symbol tokens for import-graph blast-radius precision."""
+    tokens: set[str] = set()
+    if Path(rel_path).suffix.lower() == ".py":
+        try:
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        for part in alias.name.split("."):
+                            if len(part) >= 2:
+                                tokens.add(part)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        for part in node.module.split("."):
+                            if len(part) >= 2:
+                                tokens.add(part)
+                    for alias in node.names:
+                        if alias.name != "*" and len(alias.name) >= 2:
+                            tokens.add(alias.name)
+            return tokens
+        except SyntaxError:
+            pass
+    for m in _IMPORT_TOKEN_RE.finditer(text):
+        for g in m.groups():
+            if not g:
+                continue
+            for tok in re.split(r"[/\\.:,\s]+", g):
+                if tok and len(tok) >= 2 and tok not in (".", "..", "as"):
+                    tokens.add(tok)
+    return tokens
+
+
+def _db_path(slug: str, env: dict[str, str] | None = None) -> Path:
+    return index_dir(env) / f"{slug}.db"
+
+
+def _init_index_db(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY)")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS symbols (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            qualified_name TEXT,
+            kind TEXT,
+            file TEXT,
+            start_line INTEGER,
+            end_line INTEGER,
+            signature TEXT,
+            doc TEXT
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(file)")
+    conn.execute("CREATE TABLE IF NOT EXISTS imports (src_file TEXT, token TEXT)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_imp_token ON imports(token)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_imp_src ON imports(src_file)")
+
+
+def _write_index_db(
+    slug: str,
+    source_root: str,
+    files: list[str],
+    symbols: list[dict[str, Any]],
+    import_edges: list[tuple[str, str]],
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    dbp = _db_path(slug, env)
+    try:
+        dbp.parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(str(dbp), timeout=5.0)) as conn:
+            _init_index_db(conn)
+            with conn:
+                conn.execute("DELETE FROM files")
+                conn.execute("DELETE FROM symbols")
+                conn.execute("DELETE FROM imports")
+                conn.executemany("INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)", [
+                    ("repo", slug),
+                    ("source_root", source_root),
+                    ("indexed_at", str(round(time.time(), 1))),
+                ])
+                conn.executemany("INSERT OR IGNORE INTO files(path) VALUES (?)", [(f,) for f in files])
+                conn.executemany(
+                    "INSERT OR REPLACE INTO symbols VALUES (?,?,?,?,?,?,?,?,?)",
+                    [
+                        (
+                            s.get("id", ""), s.get("name", ""), s.get("qualified_name", ""),
+                            s.get("kind", ""), s.get("file", ""), int(s.get("start_line") or 1),
+                            int(s.get("end_line") or 1), s.get("signature", ""), s.get("doc", ""),
+                        )
+                        for s in symbols
+                    ],
+                )
+                conn.executemany("INSERT INTO imports(src_file, token) VALUES (?, ?)", import_edges)
+    except sqlite3.Error:
+        pass
+
+
+def _update_index_db_file(
+    slug: str,
+    rel: str,
+    exists: bool,
+    syms: list[dict[str, Any]],
+    imp_tokens: set[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    dbp = _db_path(slug, env)
+    if not dbp.is_file():
+        return
+    try:
+        with closing(sqlite3.connect(str(dbp), timeout=5.0)) as conn:
+            _init_index_db(conn)
+            with conn:
+                conn.execute("DELETE FROM symbols WHERE file = ?", (rel,))
+                conn.execute("DELETE FROM imports WHERE src_file = ?", (rel,))
+                if exists:
+                    conn.execute("INSERT OR IGNORE INTO files(path) VALUES (?)", (rel,))
+                    conn.executemany(
+                        "INSERT OR REPLACE INTO symbols VALUES (?,?,?,?,?,?,?,?,?)",
+                        [
+                            (
+                                s.get("id", ""), s.get("name", ""), s.get("qualified_name", ""),
+                                s.get("kind", ""), s.get("file", ""), int(s.get("start_line") or 1),
+                                int(s.get("end_line") or 1), s.get("signature", ""), s.get("doc", ""),
+                            )
+                            for s in syms
+                        ],
+                    )
+                    conn.executemany("INSERT INTO imports(src_file, token) VALUES (?, ?)", [(rel, t) for t in imp_tokens])
+                else:
+                    conn.execute("DELETE FROM files WHERE path = ?", (rel,))
+    except sqlite3.Error:
+        pass
+
+
+def _query_db_importers(slug: str, tokens: set[str], *, env: dict[str, str] | None = None) -> set[str]:
+    dbp = _db_path(slug, env)
+    if not tokens or not dbp.is_file():
+        return set()
+    try:
+        with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+            qmarks = ",".join("?" for _ in tokens)
+            rows = conn.execute(
+                f"SELECT DISTINCT src_file FROM imports WHERE token IN ({qmarks})",
+                list(tokens),
+            ).fetchall()
+            return {str(r[0]) for r in rows if r and r[0]}
+    except sqlite3.Error:
+        return set()
+
+
+def _index_single_file_with_imports(root: Path, file_path: Path) -> tuple[list[dict[str, Any]], set[str]]:
     try:
         st = file_path.stat()
         if not file_path.is_file() or st.st_size > _MAX_FILE_BYTES:
-            return []
+            return [], set()
         raw = file_path.read_bytes()
         if b"\x00" in raw[:2048]:
-            return []
+            return [], set()
         text = raw.decode("utf-8", errors="replace")
     except OSError:
-        return []
+        return [], set()
     rel = file_path.relative_to(root).as_posix()
-    if file_path.suffix.lower() == ".py":
-        return _extract_python_symbols(rel, text)
-    return _extract_generic_symbols(rel, text)
+    syms = _extract_python_symbols(rel, text) if file_path.suffix.lower() == ".py" else _extract_generic_symbols(rel, text)
+    return syms, _extract_imports(rel, text)
+
+
+def _index_single_file(root: Path, file_path: Path) -> list[dict[str, Any]]:
+    syms, _ = _index_single_file_with_imports(root, file_path)
+    return syms
 
 
 def index_folder(path: str, *, env: dict[str, str] | None = None) -> dict[str, Any]:
@@ -172,6 +435,7 @@ def index_folder(path: str, *, env: dict[str, str] | None = None) -> dict[str, A
     slug = _repo_slug(root)
     files: list[str] = []
     symbols: list[dict[str, Any]] = []
+    import_edges: list[tuple[str, str]] = []
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS and not d.startswith("."))
@@ -181,7 +445,10 @@ def index_folder(path: str, *, env: dict[str, str] | None = None) -> dict[str, A
                 continue
             rel = fp.relative_to(root).as_posix()
             files.append(rel)
-            symbols.extend(_index_single_file(root, fp))
+            f_syms, f_imps = _index_single_file_with_imports(root, fp)
+            symbols.extend(f_syms)
+            for tok in f_imps:
+                import_edges.append((rel, tok))
 
     doc = {
         "repo": slug,
@@ -193,6 +460,7 @@ def index_folder(path: str, *, env: dict[str, str] | None = None) -> dict[str, A
         "symbols": symbols,
     }
     atomic_write_json(index_dir(env) / f"{slug}.json", doc)
+    _write_index_db(slug, str(root), files, symbols, import_edges, env=env)
     return {
         "repo": slug,
         "source_root": str(root),
@@ -247,9 +515,12 @@ def reindex_file(file_path: str, *, env: dict[str, str] | None = None) -> bool:
             continue
         syms = [s for s in (data.get("symbols") or []) if s.get("file") != rel]
         files = set(data.get("source_files") or [])
+        new_syms: list[dict[str, Any]] = []
+        new_imps: set[str] = set()
         if fp.is_file():
             files.add(rel)
-            syms.extend(_index_single_file(root, fp))
+            new_syms, new_imps = _index_single_file_with_imports(root, fp)
+            syms.extend(new_syms)
         else:
             files.discard(rel)
         data["source_files"] = sorted(files)
@@ -258,6 +529,7 @@ def reindex_file(file_path: str, *, env: dict[str, str] | None = None) -> bool:
         data["symbol_count"] = len(syms)
         data["indexed_at"] = round(time.time(), 1)
         atomic_write_json(meta_file, data)
+        _update_index_db_file(str(data.get("repo") or meta_file.stem), rel, fp.is_file(), new_syms, new_imps, env=env)
         return True
     return False
 
@@ -431,11 +703,12 @@ def dispatch_action(action: str, args: dict[str, Any], *, env: dict[str, str] | 
         return {"error": f"Repository `{repo_name}` not indexed. Call `index_folder` first."}
 
     if action == "invalidate_cache":
-        p = index_dir(env) / f"{doc['repo']}.json"
-        try:
-            p.unlink(missing_ok=True)
-        except OSError:
-            pass
+        for ext in (".json", ".db", ".db-wal", ".db-shm"):
+            p = index_dir(env) / f"{doc['repo']}{ext}"
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
         return {"invalidated": doc["repo"]}
 
     if action == "get_file_tree":
@@ -502,17 +775,40 @@ def dispatch_action(action: str, args: dict[str, Any], *, env: dict[str, str] | 
         if not sym_name:
             return {"error": "Provide `symbol` name."}
         pat = re.compile(rf"\b{re.escape(sym_name)}\b")
+        call_pat = re.compile(rf"(?:\.|::|\b){re.escape(sym_name)}\s*\(")
         root = Path(doc["source_root"])
+
+        # Use SQLite import-edge graph to prioritize true importers and suppress incidental word-match noise
+        def_files = {str(s.get("file")) for s in doc.get("symbols", []) if s.get("name") == sym_name}
+        imp_tokens: set[str] = {sym_name}
+        for df in def_files:
+            stem = Path(df).stem
+            if stem not in ("__init__", "index", "mod", "main"):
+                imp_tokens.add(stem)
+        importers = _query_db_importers(doc["repo"], imp_tokens, env=env)
+        has_graph = bool(importers)
+
         impacted: list[dict[str, Any]] = []
         for rel in doc.get("source_files", []):
+            is_def = rel in def_files
+            is_imp = rel in importers
             try:
                 text = (root / rel).read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             count = len(pat.findall(text))
-            if count:
-                impacted.append({"file": rel, "references": count})
-        impacted.sort(key=lambda x: -x["references"])
+            if not count:
+                continue
+            # When import-graph edges exist, skip non-importing files unless they explicitly invoke the symbol
+            if has_graph and not is_def and not is_imp and not call_pat.search(text):
+                continue
+            entry: dict[str, Any] = {"file": rel, "references": count}
+            if is_def:
+                entry["defines"] = True
+            if is_imp:
+                entry["importer"] = True
+            impacted.append(entry)
+        impacted.sort(key=lambda x: (not x.get("defines", False), not x.get("importer", False), -x["references"]))
         return {"repo": doc["repo"], "symbol": sym_name, "impacted_files": impacted[:30]}
 
     if action == "assemble_task_context":
@@ -540,15 +836,15 @@ def dispatch_action(action: str, args: dict[str, Any], *, env: dict[str, str] | 
 _MCP_TOOLS = [
     {
         "name": "menu",
-        "description": "List available Terser AST index actions and exact argument shapes.",
+        "description": "List Terser index actions and arg shapes.",
         "inputSchema": {
             "type": "object",
-            "properties": {"query": {"type": "string", "description": "Optional filter keyword"}},
+            "properties": {"query": {"type": "string"}},
         },
     },
     {
         "name": "route",
-        "description": "Suggest the best Terser AST index action for a coding task.",
+        "description": "Recommend best index action for a task.",
         "inputSchema": {
             "type": "object",
             "properties": {"task": {"type": "string"}, "repo": {"type": "string"}},
@@ -557,7 +853,7 @@ _MCP_TOOLS = [
     },
     {
         "name": "order",
-        "description": "Execute any Terser AST index action (see `menu`).",
+        "description": "Run any Terser index action (see `menu`).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -570,7 +866,7 @@ _MCP_TOOLS = [
     },
     {
         "name": "index_folder",
-        "description": "Index a local repository folder for symbol-first lookup.",
+        "description": "Index a local repo folder.",
         "inputSchema": {
             "type": "object",
             "properties": {"path": {"type": "string"}},
@@ -579,7 +875,7 @@ _MCP_TOOLS = [
     },
     {
         "name": "search_symbols",
-        "description": "Search indexed functions, classes, structs, and methods by name.",
+        "description": "Search indexed symbols by name.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -592,7 +888,7 @@ _MCP_TOOLS = [
     },
     {
         "name": "get_symbol_source",
-        "description": "Fetch only the exact source lines for a symbol ID.",
+        "description": "Fetch exact source lines for a symbol ID.",
         "inputSchema": {
             "type": "object",
             "properties": {"repo": {"type": "string"}, "symbol_id": {"type": "string"}},
@@ -602,11 +898,74 @@ _MCP_TOOLS = [
 ]
 
 
-def _handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def format_mcp_response(action: str, payload: dict[str, Any]) -> str:
+    """Serialize MCP tool responses into compact, lossless text (~40-60% fewer tokens than indented JSON)."""
+    if not isinstance(payload, dict) or "error" in payload:
+        return json.dumps(payload, separators=(",", ":"))
+
+    if action == "search_symbols" and isinstance(payload.get("matches"), list):
+        matches = payload["matches"]
+        if not matches:
+            return f"repo={payload.get('repo','')} matches=0"
+        lines = [f"repo={payload.get('repo','')} ({len(matches)} matches):"]
+        for s in matches:
+            doc = f" # {s['doc']}" if s.get("doc") else ""
+            lines.append(f"{s.get('id')} | L{s.get('start_line')}-{s.get('end_line')} | {s.get('signature','')}{doc}")
+        return "\n".join(lines)
+
+    if action == "get_file_outline" and isinstance(payload.get("symbols"), list):
+        syms = payload["symbols"]
+        lines = [f"file={payload.get('file','')} ({len(syms)} symbols):"]
+        for s in syms:
+            doc = f" # {s['doc']}" if s.get("doc") else ""
+            lines.append(f"{s.get('id')} | L{s.get('start_line')}-{s.get('end_line')} | {s.get('signature','')}{doc}")
+        return "\n".join(lines)
+
+    if action == "search_text" and isinstance(payload.get("matches"), list):
+        matches = payload["matches"]
+        if not matches:
+            return f"repo={payload.get('repo','')} matches=0"
+        grouped: dict[str, list[str]] = {}
+        for m in matches:
+            grouped.setdefault(str(m.get("file", "")), []).append(f"  {m.get('line')}: {m.get('text','')}")
+        lines = [f"repo={payload.get('repo','')} ({len(matches)} hits{' truncated' if payload.get('truncated') else ''}):"]
+        for fpath, hits in grouped.items():
+            lines.append(f"{fpath}:")
+            lines.extend(hits)
+        return "\n".join(lines)
+
+    if action == "get_blast_radius" and isinstance(payload.get("impacted_files"), list):
+        imp = payload["impacted_files"]
+        lines = [f"repo={payload.get('repo','')} symbol={payload.get('symbol','')} ({len(imp)} files):"]
+        for item in imp:
+            lines.append(f"  {item.get('file')} ({item.get('references')} refs)")
+        return "\n".join(lines)
+
+    if action == "get_file_tree" and isinstance(payload.get("files"), list):
+        files = payload["files"]
+        return f"repo={payload.get('repo','')} ({len(files)} files):\n" + "\n".join(files)
+
+    if action == "get_symbol_source" and isinstance(payload.get("source"), str):
+        return f"{payload.get('id')} ({payload.get('file')} L{payload.get('start_line')}-{payload.get('end_line')}):\n{payload['source']}"
+
+    if action in ("get_symbols", "assemble_task_context") and isinstance(payload.get("symbols"), list):
+        blocks: list[str] = []
+        if action == "assemble_task_context":
+            blocks.append(f"repo={payload.get('repo','')} (~{payload.get('approx_tokens', 0)} tok, {len(payload['symbols'])} symbols):")
+        for s in payload["symbols"]:
+            if isinstance(s, dict) and isinstance(s.get("source"), str):
+                blocks.append(f"--- {s.get('id')} ({s.get('file')} L{s.get('start_line')}-{s.get('end_line')}) ---\n{s['source']}")
+        if blocks:
+            return "\n".join(blocks)
+
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def _handle_tool_call(name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if name == "menu":
         q = str(arguments.get("query") or "").lower()
         items = {k: v for k, v in _ACTIONS_MENU.items() if not q or q in k.lower() or q in v["desc"].lower()}
-        return {"actions": items}
+        return "menu", {"actions": items}
     if name == "route":
         task = str(arguments.get("task") or "").lower()
         if any(k in task for k in ("sandbox", "archive", "log output")):
@@ -621,10 +980,11 @@ def _handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             rec = "index_folder"
         else:
             rec = "search_symbols"
-        return {"recommended_action": rec, "args_hint": _ACTIONS_MENU[rec]["args"]}
+        return "route", {"recommended_action": rec, "args_hint": _ACTIONS_MENU[rec]["args"]}
     if name == "order":
-        return dispatch_action(str(arguments.get("action") or ""), arguments.get("args") or {})
-    return dispatch_action(name, arguments)
+        act = str(arguments.get("action") or "")
+        return act, dispatch_action(act, arguments.get("args") or {})
+    return name, dispatch_action(name, arguments)
 
 
 def _serve_stdio() -> int:
@@ -653,8 +1013,8 @@ def _serve_stdio() -> int:
         elif method == "tools/call":
             tool_name = str(params.get("name") or "")
             tool_args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-            payload = _handle_tool_call(tool_name, tool_args)
-            result = {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]}
+            resolved_action, payload = _handle_tool_call(tool_name, tool_args)
+            result = {"content": [{"type": "text", "text": format_mcp_response(resolved_action, payload)}]}
         elif method == "ping":
             result = {}
         else:

@@ -1,6 +1,6 @@
 ---
 name: terser-tune
-description: Configure Terser settings, inspect or forget learned repository micro-skills (EnvFacts), review/apply/restore unused tool pruning, and get token-efficiency coaching.
+description: Configure Terser settings, repo micro-skills (EnvFacts), unused tool pruning, and token coaching.
 ---
 
 # Terser Tune — Micro-Skills, Tool Pruning & Configuration

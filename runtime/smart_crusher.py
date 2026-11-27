@@ -109,38 +109,85 @@ def _factor_and_columnize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     return out
 
 
+def _find_nested_array(obj: dict[str, Any], max_depth: int = 5) -> tuple[list[str], list[dict[str, Any]]] | None:
+    """Locate a uniform array of >=5 dicts up to `max_depth` levels inside an API/GraphQL envelope."""
+    # Prefer well-known envelope keys first at each level
+    for ek in _ENVELOPE_KEYS:
+        val = obj.get(ek)
+        if isinstance(val, list) and len(val) >= 5 and all(isinstance(x, dict) for x in val):
+            return [ek], val
+    if max_depth <= 1:
+        return None
+    for k, v in obj.items():
+        if isinstance(v, dict):
+            hit = _find_nested_array(v, max_depth=max_depth - 1)
+            if hit is not None:
+                return [k, *hit[0]], hit[1]
+    return None
+
+
+def _replace_nested(obj: Any, path: list[str], replacement: Any) -> Any:
+    if not path:
+        return replacement
+    if isinstance(obj, dict):
+        out = {k: v for k, v in obj.items() if k == path[0] or v not in (None, "", [], {})}
+        out[path[0]] = _replace_nested(obj[path[0]], path[1:], replacement)
+        return out
+    return obj
+
+
+def _try_parse_ndjson(stripped: str) -> list[dict[str, Any]] | None:
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    if len(lines) < 5:
+        return None
+    if not all(ln.startswith("{") and ln.endswith("}") for ln in lines[:10]):
+        return None
+    items: list[dict[str, Any]] = []
+    for ln in lines:
+        try:
+            obj = json.loads(ln)
+        except (ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        items.append(obj)
+    return items
+
+
 def crush_json(
     text: str,
     *,
     command: str = "",
     env: dict[str, str] | None = None,
 ) -> str | None:
-    """Apply SmartCrusher columnar/statistical compression to large JSON payloads.
+    """Apply SmartCrusher columnar/statistical compression to large JSON, nested GraphQL, or NDJSON payloads.
 
     Returns compressed JSON string if savings >= 20%, else None.
     """
     stripped = (text or "").strip()
     if len(stripped) < _MIN_CHARS or stripped[:1] not in ("[", "{"):
         return None
+
+    data: Any = None
+    is_ndjson = False
     try:
         data = json.loads(stripped)
     except (ValueError, json.JSONDecodeError):
-        return None
+        nd_items = _try_parse_ndjson(stripped)
+        if nd_items is None:
+            return None
+        data = nd_items
+        is_ndjson = True
 
-    envelope_key: str | None = None
-    envelope_meta: dict[str, Any] = {}
+    envelope_path: list[str] = []
     items: list[Any] | None = None
 
     if isinstance(data, list):
         items = data
     elif isinstance(data, dict):
-        for ek in _ENVELOPE_KEYS:
-            val = data.get(ek)
-            if isinstance(val, list) and len(val) >= 5:
-                envelope_key = ek
-                items = val
-                envelope_meta = {k: v for k, v in data.items() if k != ek and v not in (None, "", [], {})}
-                break
+        found = _find_nested_array(data, max_depth=5)
+        if found is not None:
+            envelope_path, items = found
 
     if not items or len(items) < 5 or not all(isinstance(x, dict) for x in items):
         return None
@@ -150,7 +197,9 @@ def crush_json(
         crushed = _factor_and_columnize(items)
         if crushed is None:
             return None
-        result_obj: Any = {**envelope_meta, envelope_key: crushed} if envelope_key else crushed
+        if is_ndjson:
+            crushed["_source"] = "ndjson"
+        result_obj: Any = _replace_nested(data, envelope_path, crushed) if envelope_path else crushed
     else:
         # SmartCrusher statistical pruning + CCR FTS5 archive
         keep: set[int] = set(range(min(3, total))) | set(range(max(0, total - 3), total))
@@ -167,6 +216,8 @@ def crush_json(
         if crushed is None:
             return None
         aid = context_sandbox.store_output(stripped, command=command or "json_payload", env=env)
+        if is_ndjson:
+            crushed["_source"] = "ndjson"
         crushed["_total_items"] = total
         crushed["_kept_items"] = len(sampled)
         crushed["_kept_indices"] = kept_indices
@@ -174,7 +225,7 @@ def crush_json(
             crushed["_errors_preserved"] = error_count
         if aid:
             crushed["_retrieve"] = f'terse query {aid} "<keywords>"'
-        result_obj = {**envelope_meta, envelope_key: crushed} if envelope_key else crushed
+        result_obj = _replace_nested(data, envelope_path, crushed) if envelope_path else crushed
 
     encoded = json.dumps(result_obj, separators=(",", ":"), default=str)
     if len(encoded) < int(len(stripped) * 0.80):

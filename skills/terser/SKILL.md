@@ -1,6 +1,6 @@
 ---
 name: terser
-description: Unified token-usage status, savings report, session quality audit, local dashboard, archived output expansion, and health doctor across Antigravity 2.0, Claude Code, and Codex.
+description: Terser token status, savings audit, dashboard, FTS5 archive query/expand, repomap, and doctor CLI.
 ---
 
 # Terser — Status, Audit & Dashboard

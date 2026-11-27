@@ -80,6 +80,20 @@ def _cmd_key(command: str) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:20]
 
 
+_VOLATILE_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b"
+    r"|\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b"
+    r"|\b\d+(?:\.\d+)?\s*(?:ms|s|sec|secs|seconds|µs|us|ns)\b"
+    r"|\bpid[=:\s]+\d+\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_for_delta_hash(text: str) -> str:
+    """Normalize volatile durations/timestamps/PIDs for identical-outcome detection only."""
+    return _VOLATILE_RE.sub("<T>", text)
+
+
 def _last_nonempty_line(text: str) -> str:
     for line in reversed(text.splitlines()):
         s = line.strip()
@@ -113,6 +127,9 @@ def apply_command_delta(
     prev = store.get(key)
 
     cur_sha = hashlib.sha256(compressed_output.encode("utf-8", errors="replace")).hexdigest()
+    cur_norm_sha = hashlib.sha256(
+        _normalize_for_delta_hash(compressed_output).encode("utf-8", errors="replace")
+    ).hexdigest()
     cur_lines = compressed_output.splitlines(keepends=True)
 
     result_text = compressed_output
@@ -120,12 +137,13 @@ def apply_command_delta(
 
     if isinstance(prev, dict) and (now - float(prev.get("ts") or 0.0)) <= _TTL_SECONDS:
         prev_sha = prev.get("sha")
+        prev_norm_sha = prev.get("norm_sha") or prev_sha
         prev_rc = prev.get("rc")
         prev_text = prev.get("text")
         elapsed = max(1, int(now - float(prev.get("ts") or now)))
 
-        # Case 1: Byte-identical output and same exit code
-        if prev_sha == cur_sha and prev_rc == returncode:
+        # Case 1: Byte-identical (or timing-only-varying) output and same exit code
+        if (prev_sha == cur_sha or prev_norm_sha == cur_norm_sha) and prev_rc == returncode:
             tail = _last_nonempty_line(compressed_output)
             tail_part = f" Last line: `{tail}`" if tail else ""
             result_text = (
@@ -164,6 +182,7 @@ def apply_command_delta(
     # Always store latest snapshot so the NEXT run diffs against THIS run
     store[key] = {
         "sha": cur_sha,
+        "norm_sha": cur_norm_sha,
         "rc": returncode,
         "ts": now,
         "text": compressed_output[:_MAX_STORED_CHARS],

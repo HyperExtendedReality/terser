@@ -1,6 +1,6 @@
 ---
 name: terser-index
-description: Token-efficient AST code navigation, symbol retrieval, call hierarchy, blast radius, and safe refactoring through Terser's 6-tool Counter front door.
+description: Symbol-first AST navigation, source retrieval, blast radius, and safe refactoring via Terser's 6-tool Counter MCP.
 ---
 
 # Terser Index — Symbol-First Navigation Workflow

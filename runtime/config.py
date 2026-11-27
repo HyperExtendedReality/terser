@@ -56,6 +56,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "microskills": "envfacts",        # "envfacts" (LLM-free, fast) | "on" | "off"
     "continuity_restore": True,
     "context_fill_nudges": True,
+    "subagent_model_routing": True,   # Auto-route clearly low-complexity research subagents to lighter tier
     # Tool pruning (Claude Code & Codex)
     "toolprune": "propose",           # "propose" | "auto" | "off"
     # PostToolUse oversized output archival (Claude Code & Codex)
@@ -113,6 +114,7 @@ def load_config(env: dict[str, str] | None = None) -> dict[str, Any]:
         ("TERSER_AUTO_REINDEX", "index_auto_reindex"),
         ("TERSER_GREP_ANSWER", "index_grep_answer"),
         ("TERSER_SESSION_BRIEF", "session_brief"),
+        ("TERSER_SUBAGENT_ROUTING", "subagent_model_routing"),
     ):
         v = env.get(env_key)
         if v is not None and v.strip():
