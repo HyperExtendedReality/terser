@@ -1560,6 +1560,24 @@ class LosslessParityAndCoordinationTests(unittest.TestCase):
         self.assertIn("Prior session:", brief)
         self.assertLess(brief.index("Code index:"), brief.index("Prior session:"))
 
+    def test_normalize_workspace_resolves_alias_paths(self) -> None:
+        from unittest import mock
+
+        ws = self.root / "real_proj"
+        ws.mkdir()
+        alias = self.root / "alias_proj"
+        try:
+            os.symlink(ws, alias, target_is_directory=True)
+            self.assertEqual(config.normalize_workspace(str(alias)), config.normalize_workspace(str(ws)))
+        except OSError:
+            # Windows without Developer Mode / symlink privilege: verify realpath canonicalization directly.
+            with mock.patch("os.path.exists", return_value=True), mock.patch(
+                "os.path.realpath", return_value=str(ws)
+            ):
+                self.assertEqual(config.normalize_workspace(str(alias)), config.normalize_workspace(str(ws)))
+        # Non-existent synthetic paths remain lexical (no cwd/drive prefixing).
+        self.assertEqual(config.normalize_workspace("/nonexistent/synthetic/path"), "/nonexistent/synthetic/path")
+
     def test_claude_post_tool_use_compresses_stderr(self) -> None:
         cfg = config.load_config(self.env)
         noisy_stderr = "\n".join(

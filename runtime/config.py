@@ -213,6 +213,11 @@ def normalize_workspace(raw: str) -> str:
         text = urllib.parse.unquote(text)
     if len(text) >= 3 and text[0] == "/" and text[2] == ":" and text[1].isalpha():
         text = text[1:]
+    try:
+        if os.path.exists(text):
+            text = os.path.realpath(text)
+    except OSError:
+        pass
     text = text.replace("\\", "/").rstrip("/")
     return text.lower() if (os.name == "nt" or (len(text) >= 2 and text[1] == ":")) else text
 
