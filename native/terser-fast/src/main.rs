@@ -170,6 +170,55 @@ fn delegate_to_python(args: &Args, raw_stdin: &[u8]) -> i32 {
     0 // Always fail-open
 }
 
+fn is_low_complexity_task(prompt: &str) -> bool {
+    let text = prompt.trim();
+    let low = text.to_ascii_lowercase();
+    let mut score: i32 = 40;
+    if text.len() > 500 {
+        score += 15;
+    } else if text.len() < 80 {
+        score -= 10;
+    }
+
+    const HIGH_35: &[&str] = &[
+        "architect", "redesign", "migrate", "refactor across", "multi-file", "multifile",
+        "distributed", "concurren", "race condition", "deadlock", "memory leak",
+        "security audit", "cryptograph", "zero-day", "zeroday", "kernel", "compiler", "optimizer",
+    ];
+    const HIGH_25: &[&str] = &[
+        "root cause", "intermittent", "flaky", "heisenbug",
+        "performance regression", "profiling", "benchmark", "algorithm",
+    ];
+    const HIGH_20: &[&str] = &[
+        "design a", "from scratch", "end-to-end", "endtoend", "system design", "state machine",
+    ];
+    const LOW_25: &[&str] = &[
+        "typo", "rename", "format", "lint", "comment", "docstring", "bump version",
+        "add import", "fix warning", "changelog", "readme", "gitignore", "boilerplate",
+        "simple test", "unit test for",
+    ];
+    const LOW_15: &[&str] = &[
+        "explain", "summarize", "what does", "where is", "find where", "list all", "show me",
+    ];
+
+    if HIGH_35.iter().any(|k| low.contains(k)) {
+        score += 35;
+    }
+    if HIGH_25.iter().any(|k| low.contains(k)) {
+        score += 25;
+    }
+    if HIGH_20.iter().any(|k| low.contains(k)) {
+        score += 20;
+    }
+    if LOW_25.iter().any(|k| low.contains(k)) {
+        score -= 25;
+    }
+    if LOW_15.iter().any(|k| low.contains(k)) {
+        score -= 15;
+    }
+    score.clamp(0, 100) < 30
+}
+
 enum DispatchResult {
     Done(Option<Value>),
     Delegate,
@@ -254,16 +303,21 @@ fn handle_pre_tool_use(host: &str, payload: &Map<String, Value>, cfg: &Config) -
                         .unwrap_or("")
                         .trim()
                         .to_ascii_lowercase();
-                    // Delegate research subagents with unset/inherit Model so Python task_router can route low-complexity lookups
-                    if type_name == "research" && matches!(req_model.as_str(), "" | "inherit") {
-                        return DispatchResult::Delegate;
-                    }
                     if let Some(prompt) = args.get("Prompt").and_then(|v| v.as_str()) {
                         if !prompt.trim().is_empty() && !prompt.contains("[Terser Subagent]") {
                             let updated = format!("{}\n\n{SUBAGENT_BRIEF_AG}", prompt.trim_end());
+                            let mut overwrite = Map::new();
+                            overwrite.insert("Prompt".into(), Value::String(updated));
+                            if cfg.subagent_model_routing
+                                && type_name == "research"
+                                && matches!(req_model.as_str(), "" | "inherit")
+                                && is_low_complexity_task(prompt)
+                            {
+                                overwrite.insert("Model".into(), Value::String("flash".into()));
+                            }
                             return DispatchResult::Done(Some(json!({
                                 "decision": "allow",
-                                "overwrite": {"Prompt": updated},
+                                "overwrite": Value::Object(overwrite),
                             })));
                         }
                     }
@@ -357,7 +411,44 @@ fn handle_pre_tool_use(host: &str, payload: &Map<String, Value>, cfg: &Config) -
         };
     }
 
-    if matches!(tool_name, "Grep" | "Bash" | "bash" | "shell" | "exec_command" | "Agent" | "Task") {
+    if host == "claude"
+        && matches!(tool_name, "Agent" | "Task")
+        && cfg.subagent_model_routing
+        && !cfg.shadow
+    {
+        let req_model = tool_input
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let sub_type = tool_input
+            .get("subagent_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let prompt = tool_input
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if req_model.is_empty()
+            && matches!(sub_type.as_str(), "explore" | "research" | "general-purpose" | "")
+            && !prompt.trim().is_empty()
+            && is_low_complexity_task(prompt)
+        {
+            let mut updated = tool_input.clone();
+            updated.insert("model".into(), Value::String("haiku".into()));
+            return DispatchResult::Done(Some(json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "updatedInput": Value::Object(updated),
+                }
+            })));
+        }
+        return DispatchResult::Done(None);
+    }
+
+    if matches!(tool_name, "Grep" | "Bash" | "bash" | "shell" | "exec_command") {
         return DispatchResult::Delegate;
     }
 
@@ -387,6 +478,49 @@ fn handle_post_tool_use(
             .get("args")
             .and_then(|v| v.as_object())
             .unwrap_or(&empty);
+        if !cfg.shadow && (tool_name == "call_mcp_tool" || tool_name.starts_with("mcp_")) {
+            let srv = args
+                .get("ServerName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let srv_low = srv.to_ascii_lowercase();
+            let tn_low = tool_name.to_ascii_lowercase();
+            if srv_low.contains("terser-index")
+                || srv_low.contains("terser_index")
+                || tn_low.contains("terser")
+            {
+                return DispatchResult::Delegate;
+            }
+            let is_err_mcp = payload
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if !is_err_mcp {
+                let (disp, inner_args) = if tool_name == "call_mcp_tool" {
+                    let inner = args.get("ToolName").and_then(|v| v.as_str()).unwrap_or("");
+                    let d = if srv.is_empty() {
+                        inner.to_string()
+                    } else {
+                        format!("{srv}:{inner}")
+                    };
+                    (d, args.get("Arguments").cloned().unwrap_or(Value::Null))
+                } else {
+                    (tool_name.to_string(), Value::Object(args.clone()))
+                };
+                if let Some(resp_val) = payload
+                    .get("response")
+                    .or_else(|| payload.get("result"))
+                    .or_else(|| payload.get("toolResponse"))
+                {
+                    let resp_len = resp_val
+                        .as_str()
+                        .map(str::len)
+                        .unwrap_or_else(|| resp_val.to_string().len());
+                    read_funnel::record_mcp_response_size(&sid, &disp, &inner_args, resp_len);
+                }
+            }
+        }
         let is_err = payload
             .get("error")
             .and_then(|v| v.as_str())
@@ -415,23 +549,98 @@ fn handle_post_tool_use(
         .unwrap_or(&empty);
     let tool_resp = payload.get("tool_response");
 
-    // Delegate heavy output compression / archival on Claude Code & Codex
+    // Handle Bash/Shell output compression natively in Rust for non-JSON <=16KB outputs (~10ms vs ~140ms Python);
+    // delegate JSON/NDJSON or >16KB outputs (SmartCrusher + SQLite FTS5 archival) to Python.
+    let mut native_updated_resp: Option<Value> = None;
     if matches!(host, "claude" | "codex") && !cfg.shadow {
         if matches!(tool_name, "Bash" | "bash" | "shell" | "exec_command") && cfg.bash_compress {
-            if let Some(stdout) = tool_resp
-                .and_then(|v| v.as_object())
-                .and_then(|o| o.get("stdout"))
-                .and_then(|v| v.as_str())
-            {
-                if stdout.len() > 300 {
+            if let Some(obj) = tool_resp.and_then(|v| v.as_object()) {
+                let stdout_s = obj.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+                let stderr_s = obj.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+                let needs_py = |s: &str| {
+                    let t = s.trim_start();
+                    s.len() > 16384 || t.starts_with('{') || t.starts_with('[')
+                };
+                if (stdout_s.len() > 300 && needs_py(stdout_s))
+                    || (stderr_s.len() > 300 && needs_py(stderr_s))
+                {
                     return DispatchResult::Delegate;
+                }
+                if stdout_s.len() > 300 || stderr_s.len() > 300 {
+                    let cmd = tool_input
+                        .get("command")
+                        .or_else(|| tool_input.get("cmd"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let ws_opt = payload
+                        .get("cwd")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    let rc = if is_failure_event
+                        || payload
+                            .get("error")
+                            .map(|v| !v.is_null() && v.as_str() != Some(""))
+                            .unwrap_or(false)
+                    {
+                        1
+                    } else {
+                        0
+                    };
+                    let mut updated_obj = obj.clone();
+                    let mut changed = false;
+                    if stdout_s.len() > 300 {
+                        let mut comp = if stdout_s.len() > 1500 {
+                            compress::compress_output_with_ws(stdout_s, cmd, ws_opt)
+                        } else {
+                            stdout_s.to_string()
+                        };
+                        if is_delta_eligible_cmd(cmd) {
+                            comp = apply_native_cmd_delta(&sid, cmd, &comp, rc, host);
+                        }
+                        if comp.len() < (stdout_s.len() * 85) / 100 {
+                            record_savings("output_compress", stdout_s.len(), comp.len(), host, &cmd.chars().take(60).collect::<String>());
+                            updated_obj.insert("stdout".into(), Value::String(comp));
+                            changed = true;
+                        }
+                    }
+                    if stderr_s.len() > 300 {
+                        let comp_err = compress::compress_output_with_ws(stderr_s, cmd, ws_opt);
+                        if comp_err.len() < (stderr_s.len() * 85) / 100 {
+                            record_savings("output_compress", stderr_s.len(), comp_err.len(), host, &cmd.chars().take(60).collect::<String>());
+                            updated_obj.insert("stderr".into(), Value::String(comp_err));
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        native_updated_resp = Some(Value::Object(updated_obj));
+                    }
                 }
             }
         }
-        if tool_name.starts_with("mcp__") && cfg.archive_large_outputs {
-            let approx_len = tool_resp.map(|v| v.to_string().len()).unwrap_or(0);
-            if approx_len > cfg.archive_threshold_bytes {
+        if host == "claude" && tool_name == "WebFetch" {
+            let approx_len = tool_resp.and_then(|v| v.as_str()).map(str::len).unwrap_or(0);
+            if approx_len > 800 {
                 return DispatchResult::Delegate;
+            }
+        }
+        if tool_name.starts_with("mcp__") {
+            let tn_low = tool_name.to_ascii_lowercase();
+            if tn_low.contains("terser-index") || tn_low.contains("terser_index") {
+                return DispatchResult::Delegate;
+            }
+            let approx_len = tool_resp
+                .map(|v| v.as_str().map(str::len).unwrap_or_else(|| v.to_string().len()))
+                .unwrap_or(0);
+            if cfg.archive_large_outputs && approx_len > cfg.archive_threshold_bytes {
+                return DispatchResult::Delegate;
+            }
+            if approx_len > 0 && !is_failure_event {
+                read_funnel::record_mcp_response_size(
+                    &sid,
+                    tool_name,
+                    &Value::Object(tool_input.clone()),
+                    approx_len,
+                );
             }
         }
         if matches!(tool_name, "Glob" | "Grep") && cfg.archive_large_outputs {
@@ -448,18 +657,22 @@ fn handle_post_tool_use(
             .map(|v| !v.is_null() && v.as_str() != Some(""))
             .unwrap_or(false);
 
-    if let Some(nudge) = loop_guard::record_tool_event(&sid, tool_name, tool_input, is_err, cfg) {
+    let nudge = loop_guard::record_tool_event(&sid, tool_name, tool_input, is_err, cfg);
+    if native_updated_resp.is_some() || nudge.is_some() {
         let ev_name = if is_failure_event {
             "PostToolUseFailure"
         } else {
             "PostToolUse"
         };
-        return DispatchResult::Done(Some(json!({
-            "hookSpecificOutput": {
-                "hookEventName": ev_name,
-                "additionalContext": nudge,
-            }
-        })));
+        let mut hso = Map::new();
+        hso.insert("hookEventName".into(), Value::String(ev_name.into()));
+        if let Some(upd) = native_updated_resp {
+            hso.insert("updatedToolOutput".into(), upd);
+        }
+        if let Some(msg) = nudge {
+            hso.insert("additionalContext".into(), Value::String(msg));
+        }
+        return DispatchResult::Done(Some(json!({ "hookSpecificOutput": Value::Object(hso) })));
     }
     DispatchResult::Done(None)
 }
@@ -499,10 +712,213 @@ fn sha256_str(text: &str) -> String {
     out
 }
 
-fn normalize_digits_for_delta(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_ascii_digit() { '#' } else { c })
-        .collect()
+fn is_volatile_duration_unit(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    let tail = &rest[i..];
+    for unit in ["seconds", "secs", "sec", "ms", "us", "ns", "µs", "s"] {
+        if tail.len() >= unit.len() && tail[..unit.len()].eq_ignore_ascii_case(unit) {
+            let after = i + unit.len();
+            let boundary_ok = after >= rest.len()
+                || !rest.as_bytes()[after].is_ascii_alphanumeric();
+            if boundary_ok {
+                return Some(after);
+            }
+        }
+    }
+    None
+}
+
+fn normalize_volatile_for_delta(text: &str) -> String {
+    // Normalize ONLY volatile timestamps, durations, and PIDs — never test counts or line numbers!
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0;
+
+    while i < n {
+        // pid=1234 / pid: 1234 / pid 1234
+        if i + 4 < n
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && text[i..i + 3].eq_ignore_ascii_case("pid")
+            && matches!(bytes[i + 3], b'=' | b':' | b' ')
+        {
+            let mut j = i + 4;
+            while j < n && matches!(bytes[j], b'=' | b':' | b' ') {
+                j += 1;
+            }
+            let dstart = j;
+            while j < n && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > dstart && (j == n || !bytes[j].is_ascii_alphanumeric()) {
+                out.push_str("<T>");
+                i = j;
+                continue;
+            }
+        }
+
+        // ISO date-time YYYY-MM-DD[T ]HH:MM:SS(.fff)?Z?
+        if i + 19 <= n
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && bytes[i..i + 4].iter().all(|b| b.is_ascii_digit())
+            && bytes[i + 4] == b'-'
+            && bytes[i + 5..i + 7].iter().all(|b| b.is_ascii_digit())
+            && bytes[i + 7] == b'-'
+            && bytes[i + 8..i + 10].iter().all(|b| b.is_ascii_digit())
+            && matches!(bytes[i + 10], b'T' | b' ')
+            && bytes[i + 11..i + 13].iter().all(|b| b.is_ascii_digit())
+            && bytes[i + 13] == b':'
+            && bytes[i + 14..i + 16].iter().all(|b| b.is_ascii_digit())
+            && bytes[i + 16] == b':'
+            && bytes[i + 17..i + 19].iter().all(|b| b.is_ascii_digit())
+        {
+            let mut j = i + 19;
+            if j < n && bytes[j] == b'.' {
+                j += 1;
+                while j < n && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+            }
+            if j < n && matches!(bytes[j], b'Z' | b'z') {
+                j += 1;
+            }
+            out.push_str("<T>");
+            i = j;
+            continue;
+        }
+
+        // Time HH:MM:SS(.fff)?
+        if i + 8 <= n
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+            && bytes[i..i + 2].iter().all(|b| b.is_ascii_digit())
+            && bytes[i + 2] == b':'
+            && bytes[i + 3..i + 5].iter().all(|b| b.is_ascii_digit())
+            && bytes[i + 5] == b':'
+            && bytes[i + 6..i + 8].iter().all(|b| b.is_ascii_digit())
+        {
+            let mut j = i + 8;
+            if j < n && bytes[j] == b'.' {
+                j += 1;
+                while j < n && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+            }
+            out.push_str("<T>");
+            i = j;
+            continue;
+        }
+
+        // Numeric duration: 12ms, 1.45s, 200 us, 3.2 seconds
+        if bytes[i].is_ascii_digit() && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
+            let mut j = i;
+            while j < n && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < n && bytes[j] == b'.' && j + 1 < n && bytes[j + 1].is_ascii_digit() {
+                j += 1;
+                while j < n && bytes[j].is_ascii_digit() {
+                    j += 1;
+                }
+            }
+            if let Some(unit_len) = is_volatile_duration_unit(&text[j..]) {
+                out.push_str("<T>");
+                i = j + unit_len;
+                continue;
+            }
+        }
+
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn compact_line_diff(prev_text: &str, cur_text: &str) -> Option<String> {
+    let prev_lines: Vec<&str> = prev_text.lines().collect();
+    let cur_lines: Vec<&str> = cur_text.lines().collect();
+    if cur_lines.len() < 10 || prev_lines.len() > 600 || cur_lines.len() > 600 {
+        return None;
+    }
+    // Trim common prefix and suffix for O(changed^2) LCS
+    let mut pref = 0usize;
+    while pref < prev_lines.len() && pref < cur_lines.len() && prev_lines[pref] == cur_lines[pref] {
+        pref += 1;
+    }
+    let mut suff = 0usize;
+    while suff < (prev_lines.len() - pref)
+        && suff < (cur_lines.len() - pref)
+        && prev_lines[prev_lines.len() - 1 - suff] == cur_lines[cur_lines.len() - 1 - suff]
+    {
+        suff += 1;
+    }
+    let a = &prev_lines[pref..prev_lines.len() - suff];
+    let b = &cur_lines[pref..cur_lines.len() - suff];
+    if a.is_empty() && b.is_empty() {
+        return None;
+    }
+    if a.len() + b.len() > 160 {
+        return None;
+    }
+
+    // Standard LCS table on changed middle region
+    let m = a.len();
+    let n = b.len();
+    let mut dp = vec![vec![0u16; n + 1]; m + 1];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    let mut diff_lines: Vec<String> = Vec::new();
+    diff_lines.push("--- prev_run".to_string());
+    diff_lines.push("+++ this_run".to_string());
+    if pref > 0 {
+        diff_lines.push(format!("@@ -{},{} +{},{} @@", pref, a.len() + 1, pref, b.len() + 1));
+        diff_lines.push(format!(" {}", prev_lines[pref - 1]));
+    } else {
+        diff_lines.push(format!("@@ -1,{} +1,{} @@", a.len(), b.len()));
+    }
+    let mut i = 0;
+    let mut j = 0;
+    while i < m && j < n {
+        if a[i] == b[j] {
+            diff_lines.push(format!(" {}", a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            diff_lines.push(format!("-{}", a[i]));
+            i += 1;
+        } else {
+            diff_lines.push(format!("+{}", b[j]));
+            j += 1;
+        }
+    }
+    while i < m {
+        diff_lines.push(format!("-{}", a[i]));
+        i += 1;
+    }
+    while j < n {
+        diff_lines.push(format!("+{}", b[j]));
+        j += 1;
+    }
+    if suff > 0 {
+        diff_lines.push(format!(" {}", cur_lines[cur_lines.len() - suff]));
+    }
+
+    if diff_lines.len() > 45 || (diff_lines.len() as f64 / cur_lines.len() as f64) > 0.45 {
+        return None;
+    }
+    Some(diff_lines.join("\n"))
 }
 
 fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host: &str) -> String {
@@ -512,7 +928,7 @@ fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host:
     let norm_cmd: String = cmd_str.split_whitespace().collect::<Vec<_>>().join(" ");
     let key = sha256_str(&norm_cmd)[..20].to_string();
     let cur_sha = sha256_str(output);
-    let cur_norm_sha = sha256_str(&normalize_digits_for_delta(output));
+    let cur_norm_sha = sha256_str(&normalize_volatile_for_delta(output));
     let now = now_secs();
 
     let path = state_home()
@@ -533,12 +949,8 @@ fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host:
             .get("norm_sha")
             .and_then(|v| v.as_str())
             .unwrap_or(prev_sha);
-        if (now - prev_ts) <= 1800.0
-            && prev_rc == rc
-            && (prev_sha == cur_sha || prev_norm == cur_norm_sha)
-        {
+        if (now - prev_ts) <= 1800.0 {
             let elapsed = ((now - prev_ts) as i64).max(1);
-            let line_count = output.lines().count();
             let tail = output
                 .lines()
                 .rev()
@@ -546,16 +958,34 @@ fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host:
                 .find(|l| !l.is_empty())
                 .unwrap_or("");
             let short_cmd: String = cmd_str.chars().take(50).collect();
-            let tail_part = if tail.is_empty() {
-                String::new()
-            } else {
-                let short_tail: String = tail.chars().take(160).collect();
-                format!(" Last line: `{short_tail}`")
-            };
-            result = format!(
-                "[Terser Delta] Identical output to previous `{short_cmd}` run ({elapsed}s ago, exit={rc}, {line_count} lines).{tail_part}"
-            );
-            record_savings("cmd_delta", output.len(), result.len(), host, &short_cmd);
+
+            if prev_rc == rc && (prev_sha == cur_sha || prev_norm == cur_norm_sha) {
+                let line_count = output.lines().count();
+                let tail_part = if tail.is_empty() {
+                    String::new()
+                } else {
+                    let short_tail: String = tail.chars().take(160).collect();
+                    format!(" Last line: `{short_tail}`")
+                };
+                result = format!(
+                    "[Terser Delta] Identical output to previous `{short_cmd}` run ({elapsed}s ago, exit={rc}, {line_count} lines).{tail_part}"
+                );
+                record_savings("cmd_delta", output.len(), result.len(), host, &short_cmd);
+            } else if let Some(prev_text) = prev.get("text").and_then(|v| v.as_str()) {
+                if let Some(diff_body) = compact_line_diff(prev_text, output) {
+                    let mut candidate = format!(
+                        "[Terser Delta vs prior run ({elapsed}s ago, exit {prev_rc}->{rc})]\n```diff\n{diff_body}\n```"
+                    );
+                    if !tail.is_empty() && !diff_body.contains(tail) {
+                        let short_tail: String = tail.chars().take(160).collect();
+                        candidate.push_str(&format!("\nSummary: {short_tail}"));
+                    }
+                    if candidate.len() < (output.len() * 75) / 100 {
+                        record_savings("cmd_delta", output.len(), candidate.len(), host, &short_cmd);
+                        result = candidate;
+                    }
+                }
+            }
         }
     }
 
@@ -586,6 +1016,103 @@ fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host:
     }
     atomic_write_json(&path, &Value::Object(store));
     result
+}
+
+fn is_delta_eligible_cmd(cmd: &str) -> bool {
+    let low = cmd.trim().to_ascii_lowercase();
+    let toks: Vec<&str> = low.split_whitespace().collect();
+    if toks.is_empty() {
+        return false;
+    }
+    let (head, rest) = if matches!(toks[0], "python" | "python3") && toks.len() >= 3 && toks[1] == "-m" {
+        (toks[2], &toks[3..])
+    } else if toks[0] == "npx" && toks.len() >= 2 {
+        (toks[1], &toks[2..])
+    } else {
+        (toks[0], &toks[1..])
+    };
+    let sub = rest.first().copied().unwrap_or("");
+    let sub2 = rest.get(1).copied().unwrap_or("");
+    matches!(
+        head,
+        "pytest" | "unittest" | "jest" | "vitest" | "mocha" | "tsc" | "mypy" | "pyright" | "ruff" | "eslint" | "flake8"
+    ) || (matches!(head, "npm" | "pnpm" | "yarn")
+        && (matches!(sub, "test" | "lint" | "build" | "check")
+            || (sub == "run" && matches!(sub2, "test" | "lint" | "build" | "check" | "typecheck"))))
+        || (head == "cargo" && matches!(sub, "test" | "check" | "build" | "clippy"))
+        || (head == "go" && sub == "test")
+        || (head == "git" && matches!(sub, "status" | "diff" | "log"))
+        || (head == "dotnet" && matches!(sub, "test" | "build"))
+        || (matches!(head, "gradle" | "gradlew" | "mvn" | "mvnw") && matches!(sub, "test" | "build" | "check"))
+        || (head == "gh" && ((sub == "pr" && sub2 == "checks") || (sub == "run" && sub2 == "view")))
+        || (matches!(head, "terraform" | "tofu") && sub == "plan")
+        || (head == "kubectl" && sub == "get")
+        || (head == "docker" && sub == "ps")
+}
+
+fn redact_basic_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let lower = line.to_ascii_lowercase();
+        let has_secret = line.contains("sk-")
+            || line.contains("ghp_")
+            || line.contains("gho_")
+            || line.contains("ghs_")
+            || line.contains("github_pat_")
+            || line.contains("AKIA")
+            || line.contains("AIza")
+            || line.contains("xoxb-")
+            || line.contains("xoxp-")
+            || lower.contains("-----begin ") && lower.contains("private key-----");
+        if has_secret {
+            out.push_str("[REDACTED LINE]\n");
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn archive_raw_sidecar(raw: &str) -> Option<String> {
+    let safe = redact_basic_secrets(raw);
+    let id = &sha256_str(&safe)[..12];
+    let dir = state_home().join("raw-archives");
+    fs::create_dir_all(&dir).ok()?;
+    // Prune archives older than 7 days or beyond 50 files
+    if let Ok(rd) = fs::read_dir(&dir) {
+        let cutoff = now_secs() - 7.0 * 86400.0;
+        let mut kept: Vec<(f64, std::path::PathBuf)> = Vec::new();
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            if mtime < cutoff {
+                let _ = fs::remove_file(&p);
+            } else {
+                kept.push((mtime, p));
+            }
+        }
+        if kept.len() > 50 {
+            kept.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            let excess = kept.len() - 50;
+            for (_, p) in kept.into_iter().take(excess) {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+    let path = dir.join(format!("{id}.txt"));
+    if !path.is_file() {
+        fs::write(&path, safe.as_bytes()).ok()?;
+    }
+    Some(path.to_string_lossy().into_owned())
 }
 
 fn run_exec_mode(raw_args: &[String]) -> i32 {
@@ -636,20 +1163,40 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
     let code = output.status.code().unwrap_or(1);
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let cwd_str = env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let ws_opt = cwd_str.as_deref();
 
     // On non-zero exit: preserve 100% of errors, warnings, tracebacks, diffs, and exit code,
-    // while still stripping strictly lossless ANSI/spinner/build-progress noise.
+    // while still stripping strictly lossless ANSI/spinner/build-progress/note/framework-frame noise.
     if code != 0 {
         if stdout_str.len() > 300 {
             let cleaned = compress::strip_ansi_and_progress(&stdout_str);
             let cleaned = compress::elide_lockfile_diffs(&cleaned);
+            let cleaned = compress::compact_diff_headers(&cleaned);
+            let cleaned = compress::fold_framework_stack_frames(&cleaned, 3);
+            let cleaned = compress::dedup_compiler_notes(&cleaned);
             let cleaned = compress::apply_stream_filters(&cleaned, &cmd_str);
-            let served = if cleaned.len() < (stdout_str.len() * 90) / 100 {
-                record_savings("bash_compress", stdout_str.len(), cleaned.len(), &host, prog);
+            let cleaned = compress::elide_workspace_paths(&cleaned, ws_opt);
+            let mut served = if cleaned.len() < (stdout_str.len() * 90) / 100 {
                 cleaned
             } else {
-                stdout_str.into_owned()
+                stdout_str.to_string()
             };
+            if served.len() > 16384 {
+                let raw_path = archive_raw_sidecar(&stdout_str);
+                served = compress::error_pinned_window(&served, 16384);
+                if let Some(rp) = raw_path {
+                    served.push_str(&format!("\n[Terser] Full raw output saved: {rp}"));
+                }
+            }
+            if !sid.is_empty() {
+                served = apply_native_cmd_delta(&sid, &cmd_str, &served, code, &host);
+            }
+            if served.len() < output.stdout.len() {
+                record_savings("bash_compress", output.stdout.len(), served.len(), &host, prog);
+            }
             let _ = io::stdout().write_all(served.as_bytes());
             if !served.ends_with('\n') {
                 let _ = io::stdout().write_all(b"\n");
@@ -659,12 +1206,18 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
         }
         if stderr_str.len() > 300 {
             let cleaned_err = compress::strip_ansi_and_progress(&stderr_str);
+            let cleaned_err = compress::fold_framework_stack_frames(&cleaned_err, 3);
+            let cleaned_err = compress::dedup_compiler_notes(&cleaned_err);
             let cleaned_err = compress::apply_stream_filters(&cleaned_err, &cmd_str);
-            let served_err = if cleaned_err.len() < (stderr_str.len() * 90) / 100 {
+            let cleaned_err = compress::elide_workspace_paths(&cleaned_err, ws_opt);
+            let mut served_err = if cleaned_err.len() < (stderr_str.len() * 90) / 100 {
                 cleaned_err
             } else {
                 stderr_str.into_owned()
             };
+            if served_err.len() > 16384 {
+                served_err = compress::error_pinned_window(&served_err, 16384);
+            }
             let _ = io::stderr().write_all(served_err.as_bytes());
             if !served_err.ends_with('\n') {
                 let _ = io::stderr().write_all(b"\n");
@@ -676,11 +1229,18 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
     }
 
     if stdout_str.len() > 300 {
-        let mut compressed = compress::compress_output(&stdout_str, &cmd_str);
+        let mut compressed = compress::compress_output_with_ws(&stdout_str, &cmd_str, ws_opt);
         if compressed.len() < (stdout_str.len() * 85) / 100 {
             record_savings("bash_compress", stdout_str.len(), compressed.len(), &host, prog);
         } else {
-            compressed = stdout_str.into_owned();
+            compressed = stdout_str.to_string();
+        }
+        if compressed.len() > 12000 {
+            let raw_path = archive_raw_sidecar(&stdout_str);
+            compressed = compress::error_pinned_window(&compressed, 12000);
+            if let Some(rp) = raw_path {
+                compressed.push_str(&format!("\n[Terser] Full raw output saved: {rp}"));
+            }
         }
         if !sid.is_empty() {
             compressed = apply_native_cmd_delta(&sid, &cmd_str, &compressed, 0, &host);
@@ -693,7 +1253,18 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
         let _ = io::stdout().write_all(&output.stdout);
     }
 
-    if !stderr_str.is_empty() {
+    if stderr_str.len() > 300 {
+        let cleaned_err = compress::compress_output_with_ws(&stderr_str, &cmd_str, ws_opt);
+        let served_err = if cleaned_err.len() < (stderr_str.len() * 85) / 100 {
+            cleaned_err
+        } else {
+            stderr_str.into_owned()
+        };
+        let _ = io::stderr().write_all(served_err.as_bytes());
+        if !served_err.ends_with('\n') {
+            let _ = io::stderr().write_all(b"\n");
+        }
+    } else if !stderr_str.is_empty() {
         let _ = io::stderr().write_all(&output.stderr);
     }
     0
@@ -785,5 +1356,49 @@ fn main() {
         DispatchResult::Delegate => {
             std::process::exit(delegate_to_python(&args, &raw_stdin));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn volatile_norm_preserves_counts_and_line_numbers() {
+        let a = "2026-11-27 10:00:01 line 42: 1 failed, 9 passed in 1.23s (pid=1001)";
+        let b = "2026-11-27 10:00:09 line 42: 1 failed, 9 passed in 2.45s (pid=2002)";
+        let c = "2026-11-27 10:00:09 line 99: 9 failed, 1 passed in 2.45s (pid=2002)";
+        assert_eq!(normalize_volatile_for_delta(a), normalize_volatile_for_delta(b));
+        assert_ne!(normalize_volatile_for_delta(a), normalize_volatile_for_delta(c));
+    }
+
+    #[test]
+    fn compact_line_diff_handles_small_test_change() {
+        let prev = (1..=20).map(|i| format!("test_{i} ok")).collect::<Vec<_>>().join("\n");
+        let cur = (1..=20)
+            .map(|i| if i == 10 { "test_10 FAILED".to_string() } else { format!("test_{i} ok") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let diff = compact_line_diff(&prev, &cur).expect("expected small diff");
+        assert!(diff.contains("-test_10 ok"));
+        assert!(diff.contains("+test_10 FAILED"));
+    }
+
+    #[test]
+    fn task_complexity_routing_matches_python() {
+        assert!(is_low_complexity_task("find where foo is defined"));
+        assert!(!is_low_complexity_task("architect a distributed lock manager with deadlock detection"));
+    }
+
+    #[test]
+    fn delta_eligible_cmds_and_redaction_match_python() {
+        assert!(is_delta_eligible_cmd("npm run lint"));
+        assert!(is_delta_eligible_cmd("gh pr checks 42"));
+        assert!(is_delta_eligible_cmd("dotnet test"));
+        assert!(is_delta_eligible_cmd("python -m unittest"));
+        assert!(!is_delta_eligible_cmd("rm -rf build"));
+        let scrubbed = redact_basic_secrets("ok\ntoken=sk-1234567890abcdefghij\nend\n");
+        assert!(scrubbed.contains("[REDACTED LINE]"));
+        assert!(!scrubbed.contains("sk-1234567890"));
     }
 }

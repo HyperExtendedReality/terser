@@ -122,28 +122,17 @@ def build_session_brief(
     sections: list[str] = []
     notice_parts: list[str] = []
 
-    # 1. Confirmed repo micro-skills (EnvFacts)
+    # Emit static sections FIRST (Repo facts -> Code index / Repo map) and volatile
+    # Prior session LAST so the longest possible prompt prefix stays KV-cache warm!
+
+    # 1. Confirmed repo micro-skills (EnvFacts — static)
     if cfg.get("microskills", "envfacts") != "off":
         facts = _load_microskills(workspace, env)
         if facts:
             sections.append("Repo facts:\n" + "\n".join(facts))
             notice_parts.append(f"{len(facts)} repo fact(s)")
 
-    # 2. Workspace-scoped continuity checkpoint (file-based or live sandbox.db event log)
-    if cfg.get("continuity_restore", True):
-        cont = _load_continuity(workspace, host, env)
-        if not cont:
-            try:
-                from runtime import context_sandbox
-
-                cont = context_sandbox.build_continuity_snapshot(workspace, max_chars=450, env=env)
-            except Exception:
-                cont = []
-        if cont:
-            sections.append("Prior session:\n" + "\n".join(cont))
-            notice_parts.append("continuity restored")
-
-    # 3. Compact 1-line AST index status — OR byte-stable PageRank Repo Map if unindexed
+    # 2. Compact 1-line AST index status — OR byte-stable PageRank Repo Map if unindexed (static)
     idx = workspace_index_summary(workspace, env)
     if idx:
         surface = cfg.get("index_surface", "counter")
@@ -165,6 +154,20 @@ def build_session_brief(
                 notice_parts.append("PageRank repo map")
         except Exception:
             pass
+
+    # 3. Workspace-scoped continuity checkpoint (volatile — placed last for KV prefix stability)
+    if cfg.get("continuity_restore", True):
+        cont = _load_continuity(workspace, host, env)
+        if not cont:
+            try:
+                from runtime import context_sandbox
+
+                cont = context_sandbox.build_continuity_snapshot(workspace, max_chars=450, env=env)
+            except Exception:
+                cont = []
+        if cont:
+            sections.append("Prior session:\n" + "\n".join(cont))
+            notice_parts.append("continuity restored")
 
     if not sections:
         return None, None

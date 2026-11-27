@@ -1451,5 +1451,302 @@ class TokenEfficiencyUpgradesTests(unittest.TestCase):
             self.assertNotIn("\x1b[", r.stdout)
 
 
+class LosslessParityAndCoordinationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.env = {**os.environ, "TERSER_HOME": str(self.root / "home")}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_dedup_identical_tracebacks(self) -> None:
+        tb = (
+            "Traceback (most recent call last):\n"
+            '  File "app.py", line 10, in handle\n'
+            "    return parse(x)\n"
+            '  File "parser.py", line 42, in parse\n'
+            "    raise ValueError('bad token')\n"
+            "ValueError: bad token\n"
+        )
+        raw = f"FAILED test_a[1]\n{tb}FAILED test_a[2]\n{tb}FAILED test_a[3]\n{tb}"
+        out = output_compressor.dedup_identical_tracebacks(raw)
+        self.assertEqual(out.count("Traceback (most recent call last):"), 1)
+        self.assertEqual(out.count("identical traceback to #1 omitted"), 2)
+        self.assertIn("ValueError: bad token", out)
+
+    def test_mixed_ndjson_crusher_preserves_banners(self) -> None:
+        from runtime import smart_crusher
+
+        banner = "INFO: Server listening on 0.0.0.0:8080\n"
+        ndjson_lines = [
+            json.dumps({
+                "service": "auth-api",
+                "env": "prod",
+                "level": "INFO",
+                "request_id": f"req-{i:04d}",
+                "latency_ms": 10 + i,
+                "message": f"handled login request for user_{i} cleanly",
+            })
+            for i in range(15)
+        ]
+        raw = banner + "\n".join(ndjson_lines) + "\nINFO: Shutdown complete"
+        crushed = smart_crusher.crush_mixed_ndjson(raw, env=self.env)
+        self.assertIsNotNone(crushed)
+        assert crushed is not None
+        self.assertIn("Server listening on 0.0.0.0:8080", crushed)
+        self.assertIn("Shutdown complete", crushed)
+        self.assertIn('"_format":"columnar"', crushed)
+        self.assertLess(len(crushed), int(len(raw) * 0.80))
+
+    def test_sandbox_content_addressed_dedup_and_chunk_overlap(self) -> None:
+        from runtime import context_sandbox
+
+        lines = [f"line {i:03d}: routine status output" for i in range(1, 65)]
+        lines[29] = "line 030: TriggerEventAlpha"
+        lines[30] = "line 031: RootCauseBeta details"
+        text = "\n".join(lines)
+
+        aid1 = context_sandbox.store_output(text, command="cmd1", env=self.env)
+        aid2 = context_sandbox.store_output(text, command="cmd2", env=self.env)
+        self.assertIsNotNone(aid1)
+        self.assertEqual(aid1, aid2)
+
+        # Boundary overlap ensures searching for line 30 also captures line 31 in the same/adjacent chunk
+        res = context_sandbox.query_output(aid1 or "", "RootCauseBeta", env=self.env)
+        self.assertIsNotNone(res)
+        assert res is not None
+        self.assertIn("TriggerEventAlpha", res)
+        self.assertIn("RootCauseBeta", res)
+
+    def test_session_brief_static_first_ordering(self) -> None:
+        from runtime import context_sandbox, index_mcp, session_brief
+
+        ws = self.root / "proj"
+        ws.mkdir()
+        (ws / "main.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
+        index_mcp.index_folder(str(ws), env=self.env)
+        context_sandbox.record_session_event("s1", str(ws), "edit", "main.py", env=self.env)
+
+        brief, _ = session_brief.build_session_brief(
+            str(ws), host="antigravity", cfg=config.load_config(self.env), env=self.env
+        )
+        self.assertIsNotNone(brief)
+        assert brief is not None
+        self.assertIn("Code index:", brief)
+        self.assertIn("Prior session:", brief)
+        self.assertLess(brief.index("Code index:"), brief.index("Prior session:"))
+
+    def test_claude_post_tool_use_compresses_stderr(self) -> None:
+        cfg = config.load_config(self.env)
+        noisy_stderr = "\n".join(
+            [f"   Compiling crate_{i} v0.1.0" for i in range(30)]
+            + ["error[E0308]: mismatched types"]
+        )
+        payload = {
+            "session_id": "s-stderr",
+            "cwd": str(self.root),
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo build"},
+            "tool_response": {"stdout": "", "stderr": noisy_stderr},
+            "error": "exit 101",
+        }
+        res = unified_hook.handle_post_tool_use("claude", payload, cfg, self.env, is_failure_event=True)
+        updated = (res.get("hookSpecificOutput") or {}).get("updatedToolOutput") or {}
+        self.assertIn("stderr", updated)
+        self.assertIn("error[E0308]: mismatched types", updated["stderr"])
+        self.assertLess(len(updated["stderr"]), len(noisy_stderr))
+
+    def test_outline_cache_and_index_read_seeding_and_partial_edit_seed(self) -> None:
+        cfg = config.load_config(self.env)
+        big = self.root / "big_mod.py"
+        body = "\n".join(
+            f'def func_{i}(x):\n    """Compute transformed value for index {i}."""\n    val = x + {i}\n    return val * 2\n'
+            for i in range(180)
+        )
+        big.write_text(body, encoding="utf-8")
+
+        # 1. Tier 2 writes outline-cache/{sha[:24]}.txt
+        r1 = read_funnel.check_read("sess-a", str(big), cfg=cfg, host="antigravity", env=self.env)
+        self.assertIsNotNone(r1)
+        cache_dir = Path(self.env["TERSER_HOME"]) / "outline-cache"
+        self.assertTrue(any(cache_dir.glob("*.txt")))
+
+        # 2. Seeding interval from terser-index output causes overlapping read_file to hit T0
+        read_funnel.seed_read_interval("sess-b", str(big), 10, 40, env=self.env)
+        r_hit = read_funnel.check_read(
+            "sess-b", str(big), start_line=15, end_line=35, cfg=cfg, host="antigravity", env=self.env
+        )
+        self.assertIsNotNone(r_hit)
+        assert r_hit is not None
+        self.assertEqual(r_hit["action"], "deny")
+        self.assertIn("unchanged", r_hit["reason"])
+
+        # 3. Line-preserving edit inside covered interval keeps cache seeded (T0 hit on re-read)
+        old_line = "def func_5(x):"
+        new_line = "def func_5(y):"
+        big.write_text(body.replace(old_line, new_line, 1), encoding="utf-8")
+        read_funnel.seed_after_edit(
+            "sess-b", str(big), old_text=old_line, new_text=new_line, env=self.env
+        )
+        r_after = read_funnel.check_read(
+            "sess-b", str(big), start_line=15, end_line=35, cfg=cfg, host="antigravity", env=self.env
+        )
+        self.assertIsNotNone(r_after)
+        assert r_after is not None
+        self.assertIn("unchanged", r_after["reason"])
+
+    def test_sqlite_first_index_actions_without_json(self) -> None:
+        from runtime import index_mcp
+
+        ws = self.root / "sqlrepo"
+        ws.mkdir()
+        (ws / "alpha.py").write_text("def target_fn(x):\n    return x + 1\n", encoding="utf-8")
+        (ws / "beta.py").write_text("from alpha import target_fn\n\ndef caller():\n    return target_fn(2)\n", encoding="utf-8")
+
+        res = index_mcp.index_folder(str(ws), env=self.env)
+        slug = res["repo"]
+        # Remove the monolithic JSON file to prove all actions run purely from SQLite + .meta.json
+        json_file = index_mcp.index_dir(self.env) / f"{slug}.json"
+        if json_file.is_file():
+            json_file.unlink()
+
+        outline = index_mcp.dispatch_action("get_repo_outline", {"repo": slug}, env=self.env)
+        self.assertIn("outline", outline)
+        self.assertTrue(any("target_fn" in ln for ln in outline["outline"]))
+
+        batch = index_mcp.dispatch_action(
+            "get_symbols", {"repo": slug, "symbol_ids": ["alpha.py::target_fn"]}, env=self.env
+        )
+        self.assertEqual(len(batch.get("symbols") or []), 1)
+        self.assertIn("return x + 1", batch["symbols"][0]["source"])
+
+        ctx = index_mcp.dispatch_action(
+            "assemble_task_context", {"repo": slug, "task": "target_fn", "token_budget": 2000}, env=self.env
+        )
+        self.assertTrue(ctx.get("symbols"))
+
+        blast = index_mcp.dispatch_action(
+            "get_blast_radius", {"repo": slug, "symbol": "target_fn"}, env=self.env
+        )
+        files = [item["file"] for item in blast.get("impacted_files") or []]
+        self.assertIn("alpha.py", files)
+        self.assertIn("beta.py", files)
+
+    def test_zero_quality_loss_upgrades_suite(self) -> None:
+        from runtime import cmd_delta, index_mcp, smart_crusher
+
+        cfg = config.load_config(self.env)
+
+        # 1. Cross-tool terser-index -> read_funnel seeding regex matches single-L `L10-50` format
+        ws = self.root / "seed_ws"
+        ws.mkdir()
+        mod = ws / "app.py"
+        mod.write_text("\n".join(f"line_{i} = {i}" for i in range(1, 80)), encoding="utf-8")
+        mcp_out = "app.py::fn (app.py L10-40):\nline_10 = 10\n"
+        unified_hook._seed_reads_from_index_output("sess-seed", str(ws), mcp_out, self.env)
+        r_seeded = read_funnel.check_read(
+            "sess-seed", str(mod), start_line=12, end_line=35, cfg=cfg, host="antigravity", env=self.env
+        )
+        self.assertIsNotNone(r_seeded)
+        assert r_seeded is not None
+        self.assertIn("unchanged", r_seeded["reason"])
+
+        # 2. Non-Python T2 outline includes exact Lstart-Lend spans
+        rs_file = ws / "lib.rs"
+        rs_body = "\n".join(
+            f"pub fn handler_{i}(x: i32) -> i32 {{\n    let y = x + {i};\n    y * 2\n}}\n"
+            for i in range(4)
+        )
+        rs_file.write_text(rs_body, encoding="utf-8")
+        outline = read_funnel.build_code_outline(str(rs_file), rs_body, env=self.env)
+        self.assertIsNotNone(outline)
+        assert outline is not None
+        self.assertRegex(outline, r"L1-4:.*pub fn handler_0")
+
+        # 3. Edit invalidates terser-index MCP dedup entries so fresh symbol lookup isn't soft-denied
+        first_mcp = read_funnel.check_mcp_refetch(
+            "sess-mcp", "terser_terser-index:get_symbol_source", {"repo": "r", "symbol_id": "a"},
+            cfg=cfg, host="antigravity", env=self.env,
+        )
+        self.assertIsNone(first_mcp)
+        read_funnel.record_mcp_response_size(
+            "sess-mcp", "terser_terser-index:get_symbol_source", {"repo": "r", "symbol_id": "a"},
+            4321, env=self.env,
+        )
+        read_funnel.invalidate_on_edit("sess-mcp", str(mod), env=self.env)
+        after_edit_mcp = read_funnel.check_mcp_refetch(
+            "sess-mcp", "terser_terser-index:get_symbol_source", {"repo": "r", "symbol_id": "a"},
+            cfg=cfg, host="antigravity", env=self.env,
+        )
+        self.assertIsNone(after_edit_mcp)
+
+        # 4. Lossless git diff header compaction preserves hunks & lines verbatim
+        raw_diff = (
+            "diff --git a/src/foo.py b/src/foo.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/src/foo.py\n"
+            "+++ b/src/foo.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            "-old = 1\n"
+            "+new = 2\n"
+        )
+        comp_diff = output_compressor.compact_diff_headers(raw_diff)
+        self.assertIn("=== src/foo.py", comp_diff)
+        self.assertNotIn("index 1111111", comp_diff)
+        self.assertIn("@@ -1,3 +1,3 @@", comp_diff)
+        self.assertIn("+new = 2", comp_diff)
+
+        # 5. SmartCrusher wide API payload (>30 raw keys, mostly const/null) + multi-array + lossless medium (50 items)
+        wide_items = [
+            {
+                **{f"const_{k}": "same" for k in range(25)},
+                **{f"null_{k}": None for k in range(10)},
+                "id": i,
+                "name": f"item_{i}",
+            }
+            for i in range(50)
+        ]
+        wide_payload = json.dumps({"added": wide_items, "removed": wide_items[:8]})
+        crushed_wide = smart_crusher.crush_json(wide_payload, env=self.env)
+        self.assertIsNotNone(crushed_wide)
+        assert crushed_wide is not None
+        parsed = json.loads(crushed_wide)
+        self.assertEqual(parsed["added"]["_format"], "columnar")
+        self.assertEqual(len(parsed["added"]["rows"]), 50)  # Lossless for 50 short items
+        self.assertEqual(parsed["removed"]["_format"], "columnar")
+
+        # 6. Broadened cmd_delta eligibility & WebFetch PostToolUse compression
+        self.assertTrue(cmd_delta._DELTA_ELIGIBLE_RE.match("npm run lint"))
+        self.assertTrue(cmd_delta._DELTA_ELIGIBLE_RE.match("gh pr checks 42"))
+        self.assertTrue(cmd_delta._DELTA_ELIGIBLE_RE.match("dotnet test"))
+        raw_web = (
+            "<html><head><script>var analytics = 'x' * 500; console.log('tracking');</script>"
+            "<style>.nav { display: flex; padding: 12px; color: #fff; }</style></head>"
+            "<body><nav>Home | Docs | Pricing | Blog | Login | Sign Up</nav>"
+            "<main><h1>API Reference</h1><p>Useful documentation line.</p></main>"
+            "<footer>Copyright 2026 Example Corp. Privacy Policy. Terms of Service.</footer></body></html>\n"
+            + ("| Column One          | Column Two          | Column Three        |\n"
+               "| ------------------- | ------------------- | ------------------- |\n"
+               + "| alpha_value         | beta_value          | gamma_value         |\n" * 15)
+        )
+        web_res = unified_hook.handle_post_tool_use(
+            "claude",
+            {"session_id": "s-web", "tool_name": "WebFetch", "tool_input": {"url": "https://example.com"}, "tool_response": raw_web},
+            cfg, self.env,
+        )
+        web_out = (web_res.get("hookSpecificOutput") or {}).get("updatedToolOutput") or ""
+        self.assertTrue(web_out)
+        self.assertIn("Useful documentation line.", web_out)
+        self.assertNotIn("console.log", web_out)
+        self.assertLess(len(web_out), len(raw_web))
+
+        # 7. Single-pass Python AST extractor returns both symbols and imports
+        py_src = "import os\nfrom pathlib import Path\n\ndef work():\n    import json\n    return json.dumps({})\n"
+        syms, imps = index_mcp._extract_python_symbols_and_imports("work.py", py_src)
+        self.assertEqual([s["name"] for s in syms], ["work"])
+        self.assertTrue({"os", "pathlib", "Path", "json"}.issubset(imps))
+
+
 if __name__ == "__main__":
     unittest.main()

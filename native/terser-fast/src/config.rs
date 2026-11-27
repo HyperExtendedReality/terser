@@ -25,6 +25,7 @@ pub struct Config {
     pub bash_compress: bool,
     pub archive_large_outputs: bool,
     pub archive_threshold_bytes: usize,
+    pub subagent_model_routing: bool,
 }
 
 impl Default for Config {
@@ -47,6 +48,7 @@ impl Default for Config {
             bash_compress: true,
             archive_large_outputs: true,
             archive_threshold_bytes: 16384,
+            subagent_model_routing: true,
         }
     }
 }
@@ -148,6 +150,9 @@ pub fn load_config() -> Config {
             if let Some(n) = map.get("thrash_streak").and_then(|v| v.as_i64()) {
                 cfg.thrash_streak = n;
             }
+            if let Some(b) = map.get("subagent_model_routing").and_then(|v| v.as_bool()) {
+                cfg.subagent_model_routing = b;
+            }
             if let Some(n) = map.get("fail_streak").and_then(|v| v.as_i64()) {
                 cfg.fail_streak = n;
             }
@@ -215,6 +220,38 @@ pub fn atomic_write_json(path: &Path, data: &Value) {
     }
 }
 
+const SAVINGS_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const SAVINGS_KEEP_LINES: usize = 10_000;
+
+fn maybe_rotate_savings(log: &Path) {
+    let Ok(meta) = fs::metadata(log) else { return };
+    if meta.len() <= SAVINGS_MAX_BYTES {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(log) else { return };
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= SAVINGS_KEEP_LINES {
+        return;
+    }
+    let mut tail = lines[lines.len() - SAVINGS_KEEP_LINES..].join("\n");
+    tail.push('\n');
+    if let Some(parent) = log.parent() {
+        let pid = std::process::id();
+        let ts = (now_secs() * 1_000_000.0) as u64;
+        let tmp = parent.join(format!(".sav.{pid}.{ts}.tmp"));
+        if fs::write(&tmp, tail.as_bytes()).is_ok() {
+            if fs::rename(&tmp, log).is_err() {
+                let _ = fs::remove_file(log);
+                if fs::rename(&tmp, log).is_err() {
+                    let _ = fs::remove_file(&tmp);
+                }
+            }
+        } else {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+}
+
 pub fn record_savings(category: &str, raw_chars: usize, served_chars: usize, host: &str, detail: &str) {
     let saved_chars = raw_chars.saturating_sub(served_chars);
     if saved_chars == 0 {
@@ -224,6 +261,7 @@ pub fn record_savings(category: &str, raw_chars: usize, served_chars: usize, hos
     if let Some(parent) = log.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    maybe_rotate_savings(&log);
     let trunc_detail: String = detail.chars().take(100).collect();
     let ts = (now_secs() * 10.0).round() / 10.0;
     let entry = json!({

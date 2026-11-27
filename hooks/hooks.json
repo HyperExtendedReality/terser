@@ -59,7 +59,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|PowerShell|Read|Glob|Grep|Edit|Write|MultiEdit|NotebookEdit|mcp__.*",
+        "matcher": "Bash|PowerShell|Read|Glob|Grep|WebFetch|Edit|Write|MultiEdit|NotebookEdit|mcp__.*",
         "hooks": [
           {
             "type": "command",

@@ -32,8 +32,11 @@ _MIN_CHARS_FOR_DELTA = 300
 
 # Commands whose repeated runs benefit hugely from delta-diffing
 _DELTA_ELIGIBLE_RE = re.compile(
-    r"^\s*(?:python3?\s+-m\s+)?(?:pytest|unittest|jest|vitest|mocha|npm\s+test|"
-    r"pnpm\s+test|yarn\s+test|cargo\s+(?:test|check|build|clippy)|go\s+test|"
+    r"^\s*(?:python3?\s+-m\s+)?(?:pytest|unittest|jest|vitest|mocha|"
+    r"(?:npm|pnpm|yarn)\s+(?:test|lint|build|check|run\s+(?:test|lint|build|check|typecheck))|"
+    r"cargo\s+(?:test|check|build|clippy)|go\s+test|"
+    r"dotnet\s+(?:test|build)|(?:gradle|gradlew|mvn|mvnw)\s+(?:test|build|check)|"
+    r"gh\s+(?:pr\s+checks|run\s+view)|(?:terraform|tofu)\s+plan|kubectl\s+get|docker\s+ps|"
     r"npx\s+tsc|tsc|mypy|pyright|ruff|eslint|flake8|git\s+(?:status|diff|log))\b",
     re.I,
 )

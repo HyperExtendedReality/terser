@@ -300,9 +300,10 @@ def group_grep_output(text: str) -> str:
 _LOCKFILE_OR_GEN_RE = re.compile(
     r"(?i)(?:^|/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|cargo\.lock|"
     r"poetry\.lock|uv\.lock|pipfile\.lock|composer\.lock|gemfile\.lock|go\.sum|"
-    r".*\.(?:min\.js|min\.css|map|pb\.go|generated\.[a-z0-9]+|snap))$"
+    r"dist/.*|.*_pb2\.py|.*\.(?:min\.js|min\.css|map|pb\.go|generated\.[a-z0-9]+|snap|svg))$"
 )
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)$")
+_DIFF_INDEX_RE = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+(?: \d+)?$")
 _FRAMEWORK_FRAME_RE = re.compile(
     r"(?:site-packages[\\/]|dist-packages[\\/]|node_modules[\\/]|node:internal/|"
     r"Lib[\\/](?:unittest|asyncio|importlib|runpy|threading|concurrent)[\\/]|"
@@ -341,6 +342,49 @@ def elide_lockfile_diffs(text: str) -> str:
     return "\n".join(out)
 
 
+def compact_diff_headers(text: str) -> str:
+    """Losslessly collapse 4-line per-file git diff boilerplate into `=== path` while keeping every hunk verbatim."""
+    if "diff --git " not in text:
+        return text
+    lines = text.splitlines()
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        m = _DIFF_HEADER_RE.match(lines[i])
+        if m and "[elided lockfile/generated diff:" not in lines[i]:
+            path_a, path_b = m.group(1), m.group(2)
+            j = i + 1
+            mode_tag = ""
+            while j < n:
+                ln = lines[j]
+                if _DIFF_INDEX_RE.match(ln):
+                    j += 1
+                elif ln.startswith("new file mode "):
+                    mode_tag = " (new)"
+                    j += 1
+                elif ln.startswith("deleted file mode "):
+                    mode_tag = " (deleted)"
+                    j += 1
+                elif ln.startswith("--- ") and (ln == f"--- a/{path_a}" or ln == "--- /dev/null"):
+                    if ln == "--- /dev/null":
+                        mode_tag = " (new)"
+                    j += 1
+                elif ln.startswith("+++ ") and (ln == f"+++ b/{path_b}" or ln == "+++ /dev/null"):
+                    if ln == "+++ /dev/null":
+                        mode_tag = " (deleted)"
+                    j += 1
+                else:
+                    break
+            if j > i + 1:
+                header = f"=== {path_b}{mode_tag}" if path_a == path_b else f"=== {path_a} -> {path_b}{mode_tag}"
+                out.append(header)
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def fold_framework_stack_frames(text: str, min_run: int = 3) -> str:
     """Collapse consecutive third-party/stdlib stack frames while keeping 100% of user-code frames & errors."""
     if "Traceback" not in text and "    at " not in text:
@@ -376,6 +420,46 @@ def fold_framework_stack_frames(text: str, min_run: int = 3) -> str:
             out.append(ln)
             i += 1
     return "\n".join(out)
+
+
+def dedup_identical_tracebacks(text: str) -> str:
+    """Deduplicate identical repeated Python tracebacks (e.g. parametrized test failures)."""
+    if not text or text.count("Traceback (most recent call last):") < 2:
+        return text
+    lines = text.splitlines()
+    out: list[str] = []
+    seen: dict[str, int] = {}
+    i, n = 0, len(lines)
+    changed = False
+    while i < n:
+        if lines[i].lstrip().startswith("Traceback (most recent call last):"):
+            start = i
+            j = i + 1
+            while j < n:
+                ln = lines[j]
+                if not ln.strip():
+                    break
+                if ln.startswith((" ", "\t")):
+                    j += 1
+                    continue
+                # Exception summary line ends the traceback
+                j += 1
+                break
+            block = lines[start:j]
+            key = "\n".join(block)
+            if key in seen:
+                exc_line = block[-1].strip()[:120] if block else ""
+                out.append(f"[Terser: identical traceback to #{seen[key]} omitted — {exc_line}]")
+                changed = True
+            else:
+                idx_num = len(seen) + 1
+                seen[key] = idx_num
+                out.extend(block)
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out) if changed else text
 
 
 _COMPILER_NOTE_RE = re.compile(r"^\s*(?:=\s*)?(?:note|help):\s+(.+)$")
@@ -723,7 +807,9 @@ def compress_output(
     archive_id: str | None = None
     if enhanced:
         cur = elide_lockfile_diffs(cur)
+        cur = compact_diff_headers(cur)
         cur = fold_framework_stack_frames(cur)
+        cur = dedup_identical_tracebacks(cur)
         cur = dedup_compiler_notes(cur)
         cur, b64_aid = fold_base64_blobs(cur, command=command, env=env)
         if b64_aid:

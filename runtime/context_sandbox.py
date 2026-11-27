@@ -26,6 +26,7 @@ from runtime.config import ensure_vendor_paths, normalize_workspace, state_home
 _TTL_SECONDS = 7 * 86400
 _MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MB total archive cap
 _CHUNK_LINES = 30
+_CHUNK_OVERLAP = 2
 _MAX_BLOCK_LINES = 80
 _MAX_SESSION_EVENTS = 200
 _ID_RE = re.compile(r"^[0-9a-f]{6,32}$")
@@ -109,8 +110,17 @@ def _chunk_lines(lines: list[str]) -> list[tuple[int, int, str]]:
 
         limit = _MAX_BLOCK_LINES if in_fence else _CHUNK_LINES
         if len(cur) >= limit:
+            overlap = (
+                cur[-_CHUNK_OVERLAP:]
+                if (not in_fence and _CHUNK_OVERLAP > 0 and len(cur) > _CHUNK_OVERLAP and idx < len(lines))
+                else []
+            )
             flush(idx)
-            cur_start = idx + 1
+            if overlap:
+                cur = list(overlap)
+                cur_start = idx - len(overlap) + 1
+            else:
+                cur_start = idx + 1
 
     flush(len(lines))
     return chunks
@@ -278,13 +288,21 @@ def store_output(
     safe_text = redact_text(raw_text, is_command=False)
     safe_cmd = redact_text(command[:200], is_command=True) if command else ""
     now = time.time()
-    aid = hashlib.sha256(f"{now}:{safe_cmd}:{len(safe_text)}".encode("utf-8")).hexdigest()[:10]
+    # Content-addressed ID: identical archived outputs reuse the existing row & FTS5 chunks
+    aid = hashlib.sha256(safe_text.encode("utf-8", errors="replace")).hexdigest()[:12]
     lines = safe_text.splitlines()
-    chunks = _chunk_lines(lines)
     try:
         with closing(_connect(env)) as conn:
             with conn:
                 _prune_old(conn, now)
+                existing = conn.execute("SELECT 1 FROM blobs WHERE id = ?", (aid,)).fetchone()
+                if existing is not None:
+                    conn.execute(
+                        "UPDATE blobs SET created_at = ?, command = ? WHERE id = ?",
+                        (now, safe_cmd, aid),
+                    )
+                    return aid
+                chunks = _chunk_lines(lines)
                 conn.execute(
                     "INSERT OR REPLACE INTO blobs (id, command, created_at, total_lines, total_bytes, content) "
                     "VALUES (?, ?, ?, ?, ?, ?)",

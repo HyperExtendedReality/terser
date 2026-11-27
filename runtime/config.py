@@ -192,6 +192,32 @@ def atomic_write_json(path: Path, data: Any) -> None:
         pass
 
 
+_SAVINGS_MAX_BYTES = 5 * 1024 * 1024  # 5 MB rotation cap
+_SAVINGS_KEEP_LINES = 10000
+
+
+def _maybe_rotate_savings(log: Path) -> None:
+    try:
+        if not log.is_file() or log.stat().st_size <= _SAVINGS_MAX_BYTES:
+            return
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) <= _SAVINGS_KEEP_LINES:
+            return
+        tail = "\n".join(lines[-_SAVINGS_KEEP_LINES:]) + "\n"
+        fd, tmp = tempfile.mkstemp(prefix=".sav.", suffix=".tmp", dir=str(log.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(tail)
+            os.replace(tmp, str(log))
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def record_savings(
     category: str,
     raw_chars: int,
@@ -209,6 +235,7 @@ def record_savings(
         import time
         log = state_home(env) / "savings.jsonl"
         log.parent.mkdir(parents=True, exist_ok=True)
+        _maybe_rotate_savings(log)
         entry = {
             "ts": round(time.time(), 1),
             "host": host,

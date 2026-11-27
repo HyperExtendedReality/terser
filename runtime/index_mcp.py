@@ -90,12 +90,14 @@ def _repo_slug(root: Path) -> str:
     return f"{base}-{short_hash}"
 
 
-def _extract_python_symbols(rel_path: str, text: str) -> list[dict[str, Any]]:
+def _extract_python_symbols_and_imports(rel_path: str, text: str) -> tuple[list[dict[str, Any]], set[str]]:
+    """Single-pass Python AST extractor for both symbols and imported module/symbol tokens."""
     syms: list[dict[str, Any]] = []
+    tokens: set[str] = set()
     try:
         tree = ast.parse(text)
     except SyntaxError:
-        return _extract_generic_symbols(rel_path, text)
+        return _extract_generic_symbols(rel_path, text), _extract_imports(rel_path, text)
 
     lines = text.splitlines()
 
@@ -107,7 +109,8 @@ def _extract_python_symbols(rel_path: str, text: str) -> list[dict[str, Any]]:
                 start = getattr(child, "lineno", 1)
                 end = getattr(child, "end_lineno", start) or start
                 sig = lines[start - 1].strip() if 0 <= start - 1 < len(lines) else child.name
-                doc = (ast.get_docstring(child) or "").splitlines()[0][:120] if ast.get_docstring(child) else ""
+                doc_raw = ast.get_docstring(child)
+                doc = doc_raw.splitlines()[0][:120] if doc_raw else ""
                 syms.append({
                     "id": f"{rel_path}::{qual}",
                     "name": child.name,
@@ -121,8 +124,57 @@ def _extract_python_symbols(rel_path: str, text: str) -> list[dict[str, Any]]:
                 })
                 if isinstance(child, ast.ClassDef):
                     _visit(child, qual)
+                else:
+                    # Collect any local imports inside functions/methods in the same pass
+                    for sub in ast.walk(child):
+                        if isinstance(sub, ast.Import):
+                            for alias in sub.names:
+                                for part in alias.name.split("."):
+                                    if len(part) >= 2:
+                                        tokens.add(part)
+                        elif isinstance(sub, ast.ImportFrom):
+                            if sub.module:
+                                for part in sub.module.split("."):
+                                    if len(part) >= 2:
+                                        tokens.add(part)
+                            for alias in sub.names:
+                                if alias.name != "*" and len(alias.name) >= 2:
+                                    tokens.add(alias.name)
+            elif isinstance(child, ast.Import):
+                for alias in child.names:
+                    for part in alias.name.split("."):
+                        if len(part) >= 2:
+                            tokens.add(part)
+            elif isinstance(child, ast.ImportFrom):
+                if child.module:
+                    for part in child.module.split("."):
+                        if len(part) >= 2:
+                            tokens.add(part)
+                for alias in child.names:
+                    if alias.name != "*" and len(alias.name) >= 2:
+                        tokens.add(alias.name)
+            else:
+                for sub in ast.walk(child):
+                    if isinstance(sub, ast.Import):
+                        for alias in sub.names:
+                            for part in alias.name.split("."):
+                                if len(part) >= 2:
+                                    tokens.add(part)
+                    elif isinstance(sub, ast.ImportFrom):
+                        if sub.module:
+                            for part in sub.module.split("."):
+                                if len(part) >= 2:
+                                    tokens.add(part)
+                        for alias in sub.names:
+                            if alias.name != "*" and len(alias.name) >= 2:
+                                tokens.add(alias.name)
 
     _visit(tree)
+    return syms, tokens
+
+
+def _extract_python_symbols(rel_path: str, text: str) -> list[dict[str, Any]]:
+    syms, _ = _extract_python_symbols_and_imports(rel_path, text)
     return syms
 
 
@@ -396,6 +448,57 @@ def _db_query_files(slug: str, *, env: dict[str, str] | None = None) -> list[str
         return None
 
 
+def _db_query_symbols_by_ids(slug: str, ids: list[str], *, env: dict[str, str] | None = None) -> list[dict[str, Any]] | None:
+    dbp = _db_path(slug, env)
+    if not dbp.is_file():
+        return None
+    if not ids:
+        return []
+    try:
+        with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+            conn.row_factory = sqlite3.Row
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT id, name, qualified_name, kind, file, start_line, end_line, signature, doc "
+                f"FROM symbols WHERE id IN ({placeholders}) ORDER BY file ASC, start_line ASC",
+                ids,
+            ).fetchall()
+            return [dict(r) for r in rows]
+    except sqlite3.Error:
+        return None
+
+
+def _db_query_repo_outline(slug: str, *, env: dict[str, str] | None = None) -> list[str] | None:
+    dbp = _db_path(slug, env)
+    if not dbp.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+            rows = conn.execute(
+                "SELECT file, name FROM symbols ORDER BY file ASC, start_line ASC"
+            ).fetchall()
+            by_file: dict[str, list[str]] = {}
+            for fp, name in rows:
+                lst = by_file.setdefault(str(fp), [])
+                if len(lst) < 8:
+                    lst.append(str(name))
+            return [f"{f}: {', '.join(names)}" for f, names in sorted(by_file.items())[:80]]
+    except sqlite3.Error:
+        return None
+
+
+def _db_query_def_files(slug: str, sym_name: str, *, env: dict[str, str] | None = None) -> set[str] | None:
+    dbp = _db_path(slug, env)
+    if not dbp.is_file():
+        return None
+    try:
+        with closing(sqlite3.connect(str(dbp), timeout=3.0)) as conn:
+            rows = conn.execute("SELECT DISTINCT file FROM symbols WHERE name = ?", (sym_name,)).fetchall()
+            return {str(r[0]) for r in rows}
+    except sqlite3.Error:
+        return None
+
+
 def _init_index_db(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -527,8 +630,9 @@ def _index_single_file_with_imports(root: Path, file_path: Path) -> tuple[list[d
     except OSError:
         return [], set()
     rel = file_path.relative_to(root).as_posix()
-    syms = _extract_python_symbols(rel, text) if file_path.suffix.lower() == ".py" else _extract_generic_symbols(rel, text)
-    return syms, _extract_imports(rel, text)
+    if file_path.suffix.lower() == ".py":
+        return _extract_python_symbols_and_imports(rel, text)
+    return _extract_generic_symbols(rel, text), _extract_imports(rel, text)
 
 
 def _index_single_file(root: Path, file_path: Path) -> list[dict[str, Any]]:
@@ -929,6 +1033,76 @@ def dispatch_action(action: str, args: dict[str, Any], *, env: dict[str, str] | 
                 return _read_symbol_code({"source_root": r_meta.get("source_root", "")}, db_sym)
             if _db_path(r_slug, env).is_file():
                 return {"error": f"Symbol `{sid}` not found in `{r_slug}`."}
+        if action == "get_symbols":
+            ids = [str(x) for x in (args.get("symbol_ids") or []) if x]
+            db_syms = _db_query_symbols_by_ids(r_slug, ids, env=env)
+            if db_syms is not None:
+                src_doc = {"source_root": r_meta.get("source_root", "")}
+                return {"symbols": [_read_symbol_code(src_doc, s) for s in db_syms]}
+        if action == "get_repo_outline":
+            db_outline = _db_query_repo_outline(r_slug, env=env)
+            if db_outline is not None:
+                return {
+                    "repo": r_slug,
+                    "files": r_meta.get("file_count", 0),
+                    "symbols": r_meta.get("symbol_count", 0),
+                    "outline": db_outline,
+                }
+        if action == "assemble_task_context":
+            task = str(args.get("task") or "").strip().lower()
+            terms = [t for t in re.split(r"\s+", task) if t]
+            budget = int(args.get("token_budget") or 4000)
+            db_matches = _db_query_search_symbols(r_slug, terms, 12, env=env)
+            if db_matches is not None:
+                src_doc = {"source_root": r_meta.get("source_root", "")}
+                chunks = []
+                used = 0
+                for s in db_matches:
+                    code = _read_symbol_code(src_doc, s)
+                    toks = max(1, len(str(code.get("source") or "")) // 4)
+                    if used + toks > budget and chunks:
+                        break
+                    chunks.append(code)
+                    used += toks
+                return {"repo": r_slug, "approx_tokens": used, "symbols": chunks}
+        if action == "get_blast_radius":
+            sym_name = str(args.get("symbol") or args.get("query") or "").strip()
+            if not sym_name:
+                return {"error": "Provide `symbol` name."}
+            db_files = _db_query_files(r_slug, env=env)
+            db_defs = _db_query_def_files(r_slug, sym_name, env=env)
+            if db_files is not None and db_defs is not None:
+                pat = re.compile(rf"\b{re.escape(sym_name)}\b")
+                call_pat = re.compile(rf"(?:\.|::|\b){re.escape(sym_name)}\s*\(")
+                root = Path(r_meta.get("source_root", ""))
+                imp_tokens: set[str] = {sym_name}
+                for df in db_defs:
+                    stem = Path(df).stem
+                    if stem not in ("__init__", "index", "mod", "main"):
+                        imp_tokens.add(stem)
+                importers = _query_db_importers(r_slug, imp_tokens, env=env)
+                has_graph = bool(importers)
+                impacted: list[dict[str, Any]] = []
+                for rel in db_files:
+                    is_def = rel in db_defs
+                    is_imp = rel in importers
+                    try:
+                        text = (root / rel).read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    count = len(pat.findall(text))
+                    if not count:
+                        continue
+                    if has_graph and not is_def and not is_imp and not call_pat.search(text):
+                        continue
+                    entry: dict[str, Any] = {"file": rel, "references": count}
+                    if is_def:
+                        entry["defines"] = True
+                    if is_imp:
+                        entry["importer"] = True
+                    impacted.append(entry)
+                impacted.sort(key=lambda x: (not x.get("defines", False), not x.get("importer", False), -x["references"]))
+                return {"repo": r_slug, "symbol": sym_name, "impacted_files": impacted[:30]}
 
     doc = _load_repo(repo_name, env=env)
     if doc is None:
@@ -1170,7 +1344,13 @@ def format_mcp_response(action: str, payload: dict[str, Any]) -> str:
         imp = payload["impacted_files"]
         lines = [f"repo={payload.get('repo','')} symbol={payload.get('symbol','')} ({len(imp)} files):"]
         for item in imp:
-            lines.append(f"  {item.get('file')} ({item.get('references')} refs)")
+            tags = []
+            if item.get("defines"):
+                tags.append("def")
+            if item.get("importer"):
+                tags.append("imp")
+            tag_s = f" [{','.join(tags)}]" if tags else ""
+            lines.append(f"  {item.get('file')} ({item.get('references')} refs){tag_s}")
         return "\n".join(lines)
 
     if action == "get_file_tree" and isinstance(payload.get("files"), list):

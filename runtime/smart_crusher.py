@@ -86,10 +86,11 @@ def _factor_and_columnize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
             if k not in seen:
                 seen.add(k)
                 keys.append(k)
-    if not keys or len(keys) > 30:
+    if not keys:
         return None
 
-    # Factor out keys whose value is identical across ALL items (and drop all-None keys)
+    # Factor out keys whose value is identical across ALL items (and drop all-None/empty keys)
+    # BEFORE checking column width cap so wide API payloads with many constant/null fields still fold.
     consts: dict[str, Any] = {}
     var_keys: list[str] = []
     for k in keys:
@@ -100,6 +101,9 @@ def _factor_and_columnize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
         else:
             var_keys.append(k)
 
+    if len(var_keys) > 30:
+        return None
+
     rows = [[it.get(k) for k in var_keys] for it in items]
     out: dict[str, Any] = {"_format": "columnar"}
     if consts:
@@ -109,21 +113,102 @@ def _factor_and_columnize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     return out
 
 
-def _find_nested_array(obj: dict[str, Any], max_depth: int = 5) -> tuple[list[str], list[dict[str, Any]]] | None:
-    """Locate a uniform array of >=5 dicts up to `max_depth` levels inside an API/GraphQL envelope."""
-    # Prefer well-known envelope keys first at each level
+def _find_all_nested_arrays(
+    obj: dict[str, Any],
+    max_depth: int = 5,
+    max_arrays: int = 4,
+) -> list[tuple[list[str], list[dict[str, Any]]]]:
+    """Locate up to `max_arrays` uniform arrays of >=5 dicts inside an API/GraphQL envelope."""
+    found: list[tuple[list[str], list[dict[str, Any]]]] = []
+    seen_keys: set[str] = set()
+
+    # Prefer well-known envelope keys first at this level
     for ek in _ENVELOPE_KEYS:
         val = obj.get(ek)
         if isinstance(val, list) and len(val) >= 5 and all(isinstance(x, dict) for x in val):
-            return [ek], val
-    if max_depth <= 1:
-        return None
+            found.append(([ek], val))
+            seen_keys.add(ek)
+            if len(found) >= max_arrays:
+                return found
+
     for k, v in obj.items():
-        if isinstance(v, dict):
-            hit = _find_nested_array(v, max_depth=max_depth - 1)
-            if hit is not None:
-                return [k, *hit[0]], hit[1]
-    return None
+        if k in seen_keys:
+            continue
+        if isinstance(v, list) and len(v) >= 5 and all(isinstance(x, dict) for x in v):
+            found.append(([k], v))
+            if len(found) >= max_arrays:
+                return found
+        elif max_depth > 1 and isinstance(v, dict):
+            sub = _find_all_nested_arrays(v, max_depth=max_depth - 1, max_arrays=max_arrays - len(found))
+            for path, arr in sub:
+                found.append(([k, *path], arr))
+                if len(found) >= max_arrays:
+                    return found
+    return found
+
+
+def _find_nested_array(obj: dict[str, Any], max_depth: int = 5) -> tuple[list[str], list[dict[str, Any]]] | None:
+    """Locate the first uniform array of >=5 dicts up to `max_depth` levels inside an API/GraphQL envelope."""
+    hits = _find_all_nested_arrays(obj, max_depth=max_depth, max_arrays=1)
+    return hits[0] if hits else None
+
+
+_LOSSLESS_MEDIUM_MAX_ITEMS = 80
+_LOSSLESS_MEDIUM_MAX_CHARS = 6144
+
+
+def _crush_item_list(
+    items: list[dict[str, Any]],
+    *,
+    is_ndjson: bool,
+    raw_for_archive: str,
+    command: str,
+    env: dict[str, str] | None,
+) -> dict[str, Any] | None:
+    total = len(items)
+    if total <= _SAMPLE_THRESHOLD:
+        crushed = _factor_and_columnize(items)
+        if crushed is None:
+            return None
+        if is_ndjson:
+            crushed["_source"] = "ndjson"
+        return crushed
+
+    # Lossless medium-array path: if 41..80 short items fit compactly in columnar form,
+    # keep 100% of items losslessly instead of sampling (zero follow-up query turns).
+    if total <= _LOSSLESS_MEDIUM_MAX_ITEMS:
+        lossless = _factor_and_columnize(items)
+        if lossless is not None:
+            if is_ndjson:
+                lossless["_source"] = "ndjson"
+            if len(json.dumps(lossless, separators=(",", ":"), default=str)) <= _LOSSLESS_MEDIUM_MAX_CHARS:
+                return lossless
+
+    # SmartCrusher statistical pruning + CCR FTS5 archive
+    keep: set[int] = set(range(min(3, total))) | set(range(max(0, total - 3), total))
+    error_count = 0
+    for idx, it in enumerate(items):
+        if _is_error_item(it):
+            keep.add(idx)
+            error_count += 1
+    keep |= _outlier_indices(items)
+
+    kept_indices = sorted(keep)
+    sampled = [items[i] for i in kept_indices]
+    crushed = _factor_and_columnize(sampled)
+    if crushed is None:
+        return None
+    aid = context_sandbox.store_output(raw_for_archive, command=command or "json_payload", env=env)
+    if is_ndjson:
+        crushed["_source"] = "ndjson"
+    crushed["_total_items"] = total
+    crushed["_kept_items"] = len(sampled)
+    crushed["_kept_indices"] = kept_indices
+    if error_count:
+        crushed["_errors_preserved"] = error_count
+    if aid:
+        crushed["_retrieve"] = f'terse query {aid} "<keywords>"'
+    return crushed
 
 
 def _replace_nested(obj: Any, path: list[str], replacement: Any) -> Any:
@@ -179,17 +264,13 @@ def crush_json(
         data = nd_items
         is_ndjson = True
 
-    envelope_path: list[str] = []
-    items: list[Any] | None = None
-
-    if isinstance(data, list):
-        items = data
+    targets: list[tuple[list[str], list[dict[str, Any]]]] = []
+    if isinstance(data, list) and len(data) >= 5 and all(isinstance(x, dict) for x in data):
+        targets = [([], data)]
     elif isinstance(data, dict):
-        found = _find_nested_array(data, max_depth=5)
-        if found is not None:
-            envelope_path, items = found
+        targets = _find_all_nested_arrays(data, max_depth=5, max_arrays=4)
 
-    if not items or len(items) < 5 or not all(isinstance(x, dict) for x in items):
+    if not targets:
         # Lossless minification fallback for large pretty-printed single JSON objects/arrays
         if not is_ndjson and len(stripped) >= 1500:
             minified = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
@@ -197,42 +278,78 @@ def crush_json(
                 return minified
         return None
 
-    total = len(items)
-    if total <= _SAMPLE_THRESHOLD:
-        crushed = _factor_and_columnize(items)
+    result_obj: Any = data
+    any_crushed = False
+    for path, items in targets:
+        crushed = _crush_item_list(
+            items,
+            is_ndjson=is_ndjson,
+            raw_for_archive=stripped,
+            command=command,
+            env=env,
+        )
         if crushed is None:
-            return None
-        if is_ndjson:
-            crushed["_source"] = "ndjson"
-        result_obj: Any = _replace_nested(data, envelope_path, crushed) if envelope_path else crushed
-    else:
-        # SmartCrusher statistical pruning + CCR FTS5 archive
-        keep: set[int] = set(range(min(3, total))) | set(range(max(0, total - 3), total))
-        error_count = 0
-        for idx, it in enumerate(items):
-            if _is_error_item(it):
-                keep.add(idx)
-                error_count += 1
-        keep |= _outlier_indices(items)
+            continue
+        any_crushed = True
+        result_obj = _replace_nested(result_obj, path, crushed) if path else crushed
 
-        kept_indices = sorted(keep)
-        sampled = [items[i] for i in kept_indices]
-        crushed = _factor_and_columnize(sampled)
-        if crushed is None:
-            return None
-        aid = context_sandbox.store_output(stripped, command=command or "json_payload", env=env)
-        if is_ndjson:
-            crushed["_source"] = "ndjson"
-        crushed["_total_items"] = total
-        crushed["_kept_items"] = len(sampled)
-        crushed["_kept_indices"] = kept_indices
-        if error_count:
-            crushed["_errors_preserved"] = error_count
-        if aid:
-            crushed["_retrieve"] = f'terse query {aid} "<keywords>"'
-        result_obj = _replace_nested(data, envelope_path, crushed) if envelope_path else crushed
+    if not any_crushed:
+        return None
 
     encoded = json.dumps(result_obj, separators=(",", ":"), default=str)
     if len(encoded) < int(len(stripped) * 0.80):
         return encoded
     return None
+
+
+def crush_mixed_ndjson(
+    text: str,
+    *,
+    command: str = "",
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """Fold contiguous runs of >=5 JSON-object lines inside mixed stdout (e.g. server logs with banners)."""
+    if not text or len(text) < _MIN_CHARS or "{" not in text:
+        return None
+    lines = text.splitlines()
+    if len(lines) < 5:
+        return None
+
+    out: list[str] = []
+    i, n = 0, len(lines)
+    changed = False
+    while i < n:
+        s = lines[i].strip()
+        if s.startswith("{") and s.endswith("}"):
+            j = i
+            items: list[dict[str, Any]] = []
+            while j < n:
+                cur_s = lines[j].strip()
+                if not (cur_s.startswith("{") and cur_s.endswith("}")):
+                    break
+                try:
+                    obj = json.loads(cur_s)
+                except (ValueError, json.JSONDecodeError):
+                    break
+                if not isinstance(obj, dict):
+                    break
+                items.append(obj)
+                j += 1
+            if len(items) >= 5:
+                raw_block = "\n".join(lines[i:j])
+                crushed = crush_json(raw_block, command=command, env=env)
+                if crushed is not None and len(crushed) < int(len(raw_block) * 0.85):
+                    out.append(crushed)
+                    changed = True
+                    i = j
+                    continue
+            out.extend(lines[i : max(j, i + 1)])
+            i = max(j, i + 1)
+        else:
+            out.append(lines[i])
+            i += 1
+
+    if not changed:
+        return None
+    rendered = "\n".join(out)
+    return rendered if len(rendered) < int(len(text) * 0.85) else None

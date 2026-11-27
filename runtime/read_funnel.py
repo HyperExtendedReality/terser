@@ -78,6 +78,34 @@ def _cache_dir(env: dict[str, str] | None = None) -> Path:
     return state_home(env) / "read-cache"
 
 
+def _outline_cache_path(sha: str, env: dict[str, str] | None = None) -> Path:
+    return state_home(env) / "outline-cache" / f"{sha[:24]}.txt"
+
+
+def _load_cached_outline(sha: str, env: dict[str, str] | None = None) -> str | None:
+    p = _outline_cache_path(sha, env)
+    try:
+        if p.is_file() and p.stat().st_size <= 65536:
+            text = p.read_text(encoding="utf-8", errors="replace").strip()
+            return text or None
+    except OSError:
+        pass
+    return None
+
+
+def _save_cached_outline(sha: str, outline: str, env: dict[str, str] | None = None) -> None:
+    if not sha or not outline:
+        return
+    p = _outline_cache_path(sha, env)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text(outline, encoding="utf-8", errors="replace")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
 def _cache_path(session_id: str, env: dict[str, str] | None = None) -> Path:
     safe_sid = re.sub(r"[^0-9a-zA-Z_.-]", "_", session_id)[:80]
     return _cache_dir(env) / f"{safe_sid}.json"
@@ -496,11 +524,19 @@ def build_code_outline(file_path: str, text: str, *, env: dict[str, str] | None 
         except SyntaxError:
             pass
 
-    # 3. Generic multi-language regex outline
+    # 3. Generic multi-language regex outline with exact block end lines
+    try:
+        from runtime.index_mcp import _find_block_end_line
+    except Exception:
+        _find_block_end_line = None  # type: ignore
+
+    lines = text.splitlines()
     rows = []
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    for lineno, line in enumerate(lines, start=1):
         if _GENERIC_SYM_RE.match(line):
-            rows.append(f"L{lineno}: {line.strip()[:100]}")
+            end_ln = _find_block_end_line(lines, lineno - 1, ext) if _find_block_end_line else lineno
+            span = f"L{lineno}-{end_ln}" if end_ln > lineno else f"L{lineno}"
+            rows.append(f"{span}: {line.strip()[:100]}")
             if len(rows) >= _MAX_OUTLINE_LINES:
                 rows.append("... (more symbols follow)")
                 break
@@ -543,6 +579,40 @@ def check_read(
     if not target.is_file() or st.st_size > _MAX_FILE_BYTES or st.st_size == 0:
         return None
 
+    now = time.time() if now is None else float(now)
+    key = _norm_path(file_path)
+    basename = target.name
+    store = _load_store(session_id, env)
+    reads = store["reads"]
+    prev = reads.get(key)
+
+    # Stat fastpath: if (mtime_ns, size) matches a previously cached non-outline read
+    # covering the requested span, serve T0 immediately without reading or hashing the file.
+    if (
+        isinstance(prev, dict)
+        and not prev.get("outline_only")
+        and prev.get("sha")
+        and prev.get("mtime_ns") == st.st_mtime_ns
+        and prev.get("size") == st.st_size
+        and _intervals_cover(prev, start_line, end_line)
+    ):
+        soft_denies = int(prev.get("soft_denies") or 0)
+        if soft_denies < _SOFT_DENY_CAP and not cfg.get("shadow"):
+            prev["soft_denies"] = soft_denies + 1
+            prev["ts"] = now
+            _save_store(session_id, store, now, env)
+            rng = _format_range(start_line, end_line)
+            reason = (
+                f"[Terser] `{basename}` ({rng}) is unchanged since your earlier read. "
+                "Reuse the content already in context, or retry to refresh (e.g. after /compact)."
+            )
+            record_savings("read_dedup", st.st_size, len(reason), host=host, detail=basename, env=env)
+            return {"action": "deny", "reason": reason}
+        prev["soft_denies"] = 0
+        prev["ts"] = now
+        _save_store(session_id, store, now, env)
+        return None
+
     try:
         raw_bytes = target.read_bytes()
     except OSError:
@@ -550,13 +620,7 @@ def check_read(
     if b"\x00" in raw_bytes[:4096]:
         return None
 
-    now = time.time() if now is None else float(now)
     sha = hashlib.sha256(raw_bytes).hexdigest()
-    key = _norm_path(file_path)
-    basename = target.name
-    store = _load_store(session_id, env)
-    reads = store["reads"]
-    prev = reads.get(key)
 
     text_snapshot: str | None = (
         raw_bytes.decode("utf-8", errors="replace")
@@ -578,6 +642,8 @@ def check_read(
         if outline_only:
             prev["outline_only"] = False
             prev["sha"] = sha
+            prev["mtime_ns"] = st.st_mtime_ns
+            prev["size"] = st.st_size
             prev["start"] = start_line
             prev["end"] = end_line
             prev["intervals"] = _merge_intervals(None, start_line, end_line)
@@ -688,7 +754,11 @@ def check_read(
             or (not is_unranged and req_span_t2 >= _LARGE_SLICE_MIN_LINES and total_lines >= min_lines)
         )
         if qualifies_t2:
-            outline = build_code_outline(file_path, text_for_outline, env=env)
+            outline = _load_cached_outline(sha, env=env)
+            if not outline:
+                outline = build_code_outline(file_path, text_for_outline, env=env)
+                if outline:
+                    _save_cached_outline(sha, outline, env=env)
             if outline:
                 reads[key] = {
                     "sha": sha,
@@ -727,6 +797,8 @@ def check_read(
 
     entry: dict[str, Any] = {
         "sha": sha,
+        "mtime_ns": st.st_mtime_ns,
+        "size": st.st_size,
         "start": legacy_start,
         "end": legacy_end,
         "intervals": merged_ivs,
@@ -770,9 +842,63 @@ def seed_after_write(
     store = _load_store(session_id, env)
     entry: dict[str, Any] = {
         "sha": sha,
+        "mtime_ns": st.st_mtime_ns,
+        "size": st.st_size,
         "start": None,
         "end": None,
         "intervals": [[1, None]],
+        "soft_denies": 0,
+        "outline_only": False,
+        "ts": now,
+    }
+    if len(raw_bytes) <= _MAX_SNAPSHOT_BYTES:
+        entry["snapshot"] = raw_bytes.decode("utf-8", errors="replace")
+    store["reads"][key] = entry
+    _save_store(session_id, store, now, env)
+
+
+def seed_read_interval(
+    session_id: str,
+    file_path: str,
+    start_line: int,
+    end_line: int,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Seed an already-loaded line interval into read-cache (e.g. from terser-index `get_symbol_source`)."""
+    if not session_id or not file_path or not _SID_RE.match(session_id):
+        return
+    if start_line < 1 or end_line < start_line:
+        return
+    target = Path(file_path)
+    try:
+        st = target.stat()
+        if not target.is_file() or st.st_size == 0 or st.st_size > _MAX_FILE_BYTES:
+            return
+        raw_bytes = target.read_bytes()
+    except OSError:
+        return
+    if b"\x00" in raw_bytes[:4096]:
+        return
+    now = time.time()
+    sha = hashlib.sha256(raw_bytes).hexdigest()
+    key = _norm_path(file_path)
+    store = _load_store(session_id, env)
+    prev = store["reads"].get(key)
+    existing_ivs = None
+    if isinstance(prev, dict) and prev.get("sha") == sha and not prev.get("outline_only"):
+        if isinstance(prev.get("intervals"), list) and prev["intervals"]:
+            existing_ivs = prev["intervals"]
+        else:
+            existing_ivs = [[prev.get("start") or 1, prev.get("end")]]
+    merged_ivs = _merge_intervals(existing_ivs, start_line, end_line)
+    entry: dict[str, Any] = {
+        "sha": sha,
+        "mtime_ns": st.st_mtime_ns,
+        "size": st.st_size,
+        "start": merged_ivs[0][0] if len(merged_ivs) == 1 else start_line,
+        "end": merged_ivs[0][1] if len(merged_ivs) == 1 else end_line,
+        "intervals": merged_ivs,
         "soft_denies": 0,
         "outline_only": False,
         "ts": now,
@@ -787,13 +913,16 @@ def seed_after_edit(
     session_id: str,
     file_path: str,
     *,
+    old_text: str | None = None,
+    new_text: str | None = None,
     env: dict[str, str] | None = None,
 ) -> None:
     """Update the editing session's cached sha/snapshot after a successful partial Edit.
 
-    Only updates if the editing session already loaded the FULL file (so line shifts from
-    deletions can never mask previously-unread lines), letting immediate verification
-    re-reads hit T0 instead of echoing back the agent's own edit as a T1 diff.
+    Seeds when either:
+      1. The session already loaded the FULL file, OR
+      2. The edit is line-count-preserving (`delta_lines == 0`) inside an already-covered
+         interval (so line numbers elsewhere never shift and unread lines are never masked).
     Sibling/parent subagents are always invalidated.
     """
     if not session_id or not file_path or not _SID_RE.match(session_id):
@@ -804,9 +933,28 @@ def seed_after_edit(
     prev = store["reads"].get(key)
     if not isinstance(prev, dict) or prev.get("outline_only"):
         return
-    # Safety: only seed on full-file coverage so line shifts cannot hide unread lines
-    if not _intervals_cover(prev, None, None):
-        return
+
+    full_covered = _intervals_cover(prev, None, None)
+    if not full_covered:
+        # Check safe line-count-preserving partial-interval edit
+        if (
+            not isinstance(old_text, str)
+            or not isinstance(new_text, str)
+            or not old_text
+            or old_text.count("\n") != new_text.count("\n")
+        ):
+            return
+        snap = prev.get("snapshot")
+        if not isinstance(snap, str) or snap.count(old_text) != 1:
+            return
+        pos = snap.find(old_text)
+        if pos < 0:
+            return
+        edit_start = snap.count("\n", 0, pos) + 1
+        edit_end = edit_start + old_text.count("\n")
+        if not _intervals_cover(prev, edit_start, edit_end):
+            return
+
     target = Path(file_path)
     try:
         st = target.stat()
@@ -819,6 +967,8 @@ def seed_after_edit(
         return
     now = time.time()
     prev["sha"] = hashlib.sha256(raw_bytes).hexdigest()
+    prev["mtime_ns"] = st.st_mtime_ns
+    prev["size"] = st.st_size
     prev["soft_denies"] = 0
     prev["outline_only"] = False
     prev["ts"] = now
@@ -863,10 +1013,24 @@ def invalidate_on_edit(
 
     for sid in target_sids:
         store = _load_store(sid, env)
+        changed = False
         entry = store["reads"].get(key)
         if isinstance(entry, dict):
             entry["soft_denies"] = 0
             entry["outline_only"] = False
+            entry.pop("mtime_ns", None)
+            changed = True
+        mcp_map = store.get("mcp")
+        if isinstance(mcp_map, dict):
+            stale_mcp = [
+                k for k, v in mcp_map.items()
+                if isinstance(v, dict)
+                and any(tok in str(v.get("tool") or "").lower() for tok in ("terser-index", "terser_index"))
+            ]
+            for k in stale_mcp:
+                mcp_map.pop(k, None)
+                changed = True
+        if changed:
             _save_store(sid, store, now, env)
 
 
@@ -919,9 +1083,33 @@ def check_mcp_refetch(
                 f"[Terser] Identical read-only MCP call `{display_name}` ran {max(1, int(elapsed))}s ago. "
                 "Reuse the earlier result, or retry if live state changed."
             )
-            record_savings("mcp_dedup", 2000, len(reason), host=host, detail=display_name, env=env)
+            raw_est = max(len(reason) + 1, int(prev.get("resp_bytes") or 2000))
+            record_savings("mcp_dedup", raw_est, len(reason), host=host, detail=display_name, env=env)
             return {"action": "deny", "reason": reason}
 
     mcp[fp] = {"tool": display_name, "ts": now, "soft_denies": 0}
     _save_store(session_id, store, now, env)
     return None
+
+
+def record_mcp_response_size(
+    session_id: str,
+    display_name: str,
+    inner_args: Any,
+    resp_bytes: int,
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Record actual MCP response byte length for accurate mcp_dedup savings telemetry."""
+    if not session_id or not _SID_RE.match(session_id) or not display_name or resp_bytes <= 0:
+        return
+    try:
+        canonical = json.dumps({"tool": display_name, "args": inner_args}, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return
+    fp = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    store = _load_store(session_id, env)
+    prev = store["mcp"].get(fp)
+    if isinstance(prev, dict):
+        prev["resp_bytes"] = int(resp_bytes)
+        _save_store(session_id, store, time.time(), env)

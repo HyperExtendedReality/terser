@@ -125,6 +125,13 @@ fn is_lockfile_path(diff_header: &str) -> bool {
         "go.sum",
         ".min.js",
         ".min.css",
+        ".map",
+        ".pb.go",
+        "_pb2.py",
+        ".snap",
+        ".svg",
+        "/dist/",
+        "a/dist/",
     ] {
         if low.contains(name) {
             return true;
@@ -157,6 +164,61 @@ pub fn elide_lockfile_diffs(text: &str) -> String {
     }
     if in_lockfile && elided_count > 0 {
         out.push(format!("  [... elided lockfile/generated diff ({elided_count} lines) ...]"));
+    }
+    out.join("\n")
+}
+
+pub fn compact_diff_headers(text: &str) -> String {
+    if !text.contains("diff --git ") {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some((path_a, path_b)) = rest.split_once(" b/") {
+                let mut j = i + 1;
+                let mut mode_tag = "";
+                while j < lines.len() {
+                    let ln = lines[j];
+                    if ln.starts_with("index ") && ln.contains("..") {
+                        j += 1;
+                    } else if ln.starts_with("new file mode ") {
+                        mode_tag = " (new)";
+                        j += 1;
+                    } else if ln.starts_with("deleted file mode ") {
+                        mode_tag = " (deleted)";
+                        j += 1;
+                    } else if ln == format!("--- a/{path_a}") || ln == "--- /dev/null" {
+                        if ln == "--- /dev/null" {
+                            mode_tag = " (new)";
+                        }
+                        j += 1;
+                    } else if ln == format!("+++ b/{path_b}") || ln == "+++ /dev/null" {
+                        if ln == "+++ /dev/null" {
+                            mode_tag = " (deleted)";
+                        }
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if j > i + 1 {
+                    let hdr = if path_a == path_b {
+                        format!("=== {path_b}{mode_tag}")
+                    } else {
+                        format!("=== {path_a} -> {path_b}{mode_tag}")
+                    };
+                    out.push(hdr);
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+        i += 1;
     }
     out.join("\n")
 }
@@ -298,11 +360,328 @@ pub fn collapse_duplicate_lines(text: &str, min_run: usize) -> String {
     out.join("\n")
 }
 
-pub fn compress_output(text: &str, command: &str) -> String {
+pub fn dedup_compiler_notes(text: &str) -> String {
+    if text.is_empty() || (!text.contains("note:") && !text.contains("help:")) {
+        return text.to_string();
+    }
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Vec<&str> = Vec::new();
+    let mut omitted: usize = 0;
+
+    for ln in text.lines() {
+        let mut s = ln.trim_start();
+        if let Some(rest) = s.strip_prefix('=') {
+            s = rest.trim_start();
+        }
+        let payload = s
+            .strip_prefix("note:")
+            .or_else(|| s.strip_prefix("help:"))
+            .map(str::trim);
+        if let Some(p) = payload {
+            let norm: String = p.split_whitespace().collect::<Vec<_>>().join(" ");
+            if norm.len() >= 24 {
+                let cnt = seen.entry(norm).or_insert(0);
+                *cnt += 1;
+                if *cnt >= 2 {
+                    omitted += 1;
+                    continue;
+                }
+            }
+        }
+        out.push(ln);
+    }
+
+    if omitted >= 2 {
+        let mut joined = out.join("\n");
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        joined.push_str(&format!(
+            "[Terser: {omitted} repeated compiler note/help lines deduplicated]"
+        ));
+        return joined;
+    }
+    text.to_string()
+}
+
+fn is_framework_frame(line: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "site-packages/",
+        "site-packages\\",
+        "dist-packages/",
+        "dist-packages\\",
+        "node_modules/",
+        "node_modules\\",
+        "node:internal/",
+        "Lib/unittest/",
+        "Lib\\unittest\\",
+        "Lib/asyncio/",
+        "Lib\\asyncio\\",
+        "Lib/importlib/",
+        "Lib\\importlib\\",
+        "Lib/runpy/",
+        "Lib\\runpy\\",
+        "Lib/threading/",
+        "Lib\\threading\\",
+        "Lib/concurrent/",
+        "Lib\\concurrent\\",
+        "/usr/lib/python",
+        "/Library/Frameworks/Python",
+    ];
+    MARKERS.iter().any(|m| line.contains(m))
+}
+
+pub fn fold_framework_stack_frames(text: &str, min_run: usize) -> String {
+    if !text.contains("Traceback") && !text.contains("    at ") {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let n = lines.len();
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    let mut i = 0;
+
+    while i < n {
+        let ln = lines[i];
+        let trim = ln.trim_start();
+        let is_py_fw = trim.starts_with("File \"") && is_framework_frame(ln);
+        let is_js_fw = trim.starts_with("at ") && is_framework_frame(ln);
+        if is_py_fw || is_js_fw {
+            let start = i;
+            let mut frames = 0;
+            while i < n {
+                let cur = lines[i];
+                let ct = cur.trim_start();
+                if ct.starts_with("File \"") && is_framework_frame(cur) {
+                    frames += 1;
+                    i += 1;
+                    if i < n
+                        && lines[i].starts_with("    ")
+                        && !lines[i].trim_start().starts_with("File \"")
+                    {
+                        i += 1;
+                    }
+                } else if ct.starts_with("at ") && is_framework_frame(cur) {
+                    frames += 1;
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if frames >= min_run {
+                out.push(format!(
+                    "  [... {frames} framework/stdlib stack frames omitted ...]"
+                ));
+            } else {
+                for k in start..i {
+                    out.push(lines[k].to_string());
+                }
+            }
+        } else {
+            out.push(ln.to_string());
+            i += 1;
+        }
+    }
+    out.join("\n")
+}
+
+pub fn elide_workspace_paths(text: &str, workspace: Option<&str>) -> String {
+    if text.len() < 400 {
+        return text.to_string();
+    }
+    let ws_raw = match workspace {
+        Some(w) => w.trim_end_matches(['/', '\\']),
+        None => return text.to_string(),
+    };
+    if ws_raw.len() < 12 {
+        return text.to_string();
+    }
+    let slash = format!("{}/", ws_raw.replace('\\', "/"));
+    let bslash = format!("{}\\", ws_raw.replace('/', "\\"));
+    let mut count = text.matches(&slash).count();
+    if bslash != slash {
+        count += text.matches(&bslash).count();
+    }
+    if count < 4 {
+        return text.to_string();
+    }
+    let mut replaced = text.replace(&slash, "./");
+    if bslash != slash {
+        replaced = replaced.replace(&bslash, "./");
+    }
+    if replaced.len() + ws_raw.len() + 12 < text.len() {
+        format!("[root: {ws_raw}]\n{replaced}")
+    } else {
+        text.to_string()
+    }
+}
+
+fn is_aligned_table_row(line: &str) -> bool {
+    let s = line.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if matches!(s.as_bytes()[0], b'{' | b'[' | b'}' | b']' | b'#' | b'<') {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut runs = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b' ' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            if i - start >= 2 {
+                runs += 1;
+                if runs >= 2 {
+                    return true;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+fn collapse_multi_spaces_to_tab(s: &str) -> String {
+    let trimmed = s.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut space_run = 0usize;
+    for ch in trimmed.chars() {
+        if ch == ' ' {
+            space_run += 1;
+        } else {
+            if space_run >= 2 {
+                out.push('\t');
+            } else if space_run == 1 {
+                out.push(' ');
+            }
+            space_run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn compact_aligned_tables(text: &str) -> String {
+    if text.len() < 300 || text.contains("diff --git ") || text.contains("Traceback ") {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 4 {
+        return text.to_string();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    let n = lines.len();
+    let mut changed = false;
+
+    while i < n {
+        if is_aligned_table_row(lines[i]) {
+            let mut j = i + 1;
+            while j < n && is_aligned_table_row(lines[j]) {
+                j += 1;
+            }
+            if j - i >= 4 {
+                let raw_len: usize = lines[i..j].iter().map(|l| l.len() + 1).sum();
+                let tsv_rows: Vec<String> = lines[i..j]
+                    .iter()
+                    .map(|l| collapse_multi_spaces_to_tab(l))
+                    .collect();
+                let tsv_len: usize = tsv_rows.iter().map(|l| l.len() + 1).sum();
+                if tsv_len < (raw_len * 85) / 100 {
+                    out.extend(tsv_rows);
+                    changed = true;
+                    i = j;
+                    continue;
+                }
+            }
+            for k in i..j {
+                out.push(lines[k].to_string());
+            }
+            i = j;
+        } else {
+            out.push(lines[i].to_string());
+            i += 1;
+        }
+    }
+    if changed {
+        out.join("\n")
+    } else {
+        text.to_string()
+    }
+}
+
+pub fn error_pinned_window(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let head_n = 30.min(lines.len());
+    let tail_n = 40.min(lines.len().saturating_sub(head_n));
+    let head = &lines[..head_n];
+    let mid_end = lines.len() - tail_n;
+    let mid = &lines[head_n..mid_end];
+    let tail = &lines[mid_end..];
+
+    let mut pinned: Vec<String> = Vec::new();
+    let pinned_budget = (max_chars / 2).max(2000);
+    let mut used = 0usize;
+    for (offset, ln) in mid.iter().enumerate() {
+        if is_signal_line(ln) {
+            let entry = format!("L{}: {ln}", head_n + offset + 1);
+            if used + entry.len() + 1 <= pinned_budget {
+                used += entry.len() + 1;
+                pinned.push(entry);
+            }
+        }
+    }
+    let omitted = mid.len().saturating_sub(pinned.len());
+    let mut parts: Vec<String> = head.iter().map(|s| (*s).to_string()).collect();
+    if omitted > 0 {
+        parts.push(format!(
+            "... [{omitted} routine middle lines omitted; {} signal lines preserved] ...",
+            pinned.len()
+        ));
+    }
+    parts.extend(pinned);
+    if !tail.is_empty() {
+        parts.push("--- tail ---".to_string());
+        parts.extend(tail.iter().map(|s| (*s).to_string()));
+    }
+    let res = parts.join("\n");
+    if res.len() > max_chars {
+        let half = ((max_chars.saturating_sub(80)) / 2).max(500);
+        let prefix: String = res.chars().take(half).collect();
+        let suffix: String = res
+            .chars()
+            .rev()
+            .take(half)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        return format!("{prefix}\n... [truncated] ...\n{suffix}");
+    }
+    res
+}
+
+pub fn compress_output_with_ws(text: &str, command: &str, workspace: Option<&str>) -> String {
     let s1 = strip_ansi_and_progress(text);
     let s2 = elide_lockfile_diffs(&s1);
-    let s3 = apply_stream_filters(&s2, command);
-    collapse_duplicate_lines(&s3, 3)
+    let s2 = compact_diff_headers(&s2);
+    let s3 = fold_framework_stack_frames(&s2, 3);
+    let s4 = dedup_compiler_notes(&s3);
+    let s5 = compact_aligned_tables(&s4);
+    let s6 = apply_stream_filters(&s5, command);
+    let s7 = elide_workspace_paths(&s6, workspace);
+    collapse_duplicate_lines(&s7, 3)
+}
+
+pub fn compress_output(text: &str, command: &str) -> String {
+    compress_output_with_ws(text, command, None)
 }
 
 #[cfg(test)]
@@ -340,5 +719,50 @@ mod tests {
         let out = collapse_duplicate_lines(raw, 3);
         assert!(out.contains("repeated 3x more"));
         assert!(out.contains("ERROR: keep me"));
+    }
+
+    #[test]
+    fn dedups_compiler_notes_and_folds_framework_frames() {
+        let notes = "error: foo\n  = note: required by a bound in `std::convert::From`\nerror: bar\n  = note: required by a bound in `std::convert::From`\nerror: baz\n  = note: required by a bound in `std::convert::From`";
+        let out = dedup_compiler_notes(notes);
+        assert!(out.contains("2 repeated compiler note/help lines deduplicated"));
+        assert!(out.contains("error: baz"));
+
+        let tb = "Traceback (most recent call last):\n  File \"/app/main.py\", line 10, in run\n    go()\n  File \"/venv/site-packages/a.py\", line 1, in f1\n    x()\n  File \"/venv/site-packages/b.py\", line 2, in f2\n    y()\n  File \"/venv/site-packages/c.py\", line 3, in f3\n    z()\nValueError: bad";
+        let folded = fold_framework_stack_frames(tb, 3);
+        assert!(folded.contains("3 framework/stdlib stack frames omitted"));
+        assert!(folded.contains("/app/main.py"));
+        assert!(folded.contains("ValueError: bad"));
+    }
+
+    #[test]
+    fn compacts_aligned_tables_and_elides_workspace() {
+        let table = "CONTAINER ID        IMAGE               COMMAND             STATUS\n\
+                     a1b2c3d4e5f6        postgres:16         \"docker-entry\"      Up 2 hours\n\
+                     b2c3d4e5f6a1        redis:7             \"redis-server\"      Up 2 hours\n\
+                     c3d4e5f6a1b2        nginx:latest        \"nginx -g\"          Up 2 hours\n\
+                     d4e5f6a1b2c3        worker:dev          \"python app.py\"     Up 2 hours";
+        let tsv = compact_aligned_tables(table);
+        assert!(tsv.contains('\t'));
+        assert!(tsv.len() < table.len());
+
+        let ws = "/Users/dev/my-long-workspace-root";
+        let paths = format!(
+            "{ws}/src/a.rs:10: fn a\n{ws}/src/b.rs:20: fn b\n{ws}/src/c.rs:30: fn c\n{ws}/src/d.rs:40: fn d\n{}",
+            "x".repeat(300)
+        );
+        let elided = elide_workspace_paths(&paths, Some(ws));
+        assert!(elided.starts_with("[root: /Users/dev/my-long-workspace-root]\n"));
+        assert!(elided.contains("./src/a.rs:10"));
+    }
+
+    #[test]
+    fn compacts_git_diff_headers_losslessly() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\nindex 111111..222222 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,2 @@\n-let x = 1;\n+let x = 2;\n";
+        let out = compact_diff_headers(diff);
+        assert!(out.contains("=== src/a.rs"));
+        assert!(!out.contains("index 111111"));
+        assert!(out.contains("@@ -1,2 +1,2 @@"));
+        assert!(out.contains("+let x = 2;"));
     }
 }

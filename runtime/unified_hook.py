@@ -40,6 +40,7 @@ from runtime.config import (
     atomic_write_json,
     ensure_vendor_paths,
     load_config,
+    record_savings,
     state_home,
 )
 
@@ -273,11 +274,18 @@ def _wrap_command_for_compression(
             return False
         head = Path(toks[0]).stem.lower()
         sub = toks[1].lower() if len(toks) > 1 else ""
-        # Use ~3ms native Rust exec for build/test/pkg/infra/diff commands (no Python startup overhead)
-        return head in (
+        # Use ~3ms native Rust exec for build/test/lint/pkg/infra/git commands (no Python startup overhead)
+        if head in (
             "cargo", "go", "npm", "pnpm", "yarn", "pip", "uv", "tsc",
             "pytest", "jest", "vitest", "docker", "gradle", "gradlew", "dotnet",
-        ) or (head == "git" and sub == "diff")
+            "ruff", "eslint", "mypy", "pyright", "flake8",
+        ):
+            return True
+        if head == "git" and sub in ("diff", "status", "log"):
+            return True
+        if head in ("python", "python3") and len(toks) >= 3 and sub == "-m":
+            return toks[2].lower() in ("unittest", "pytest", "mypy", "ruff")
+        return False
 
     if os.name == "nt":
         tokens = _split_powershell_command(command)
@@ -831,6 +839,30 @@ def handle_pre_tool_use(host: str, payload: dict[str, Any], cfg: dict[str, Any],
     return None
 
 
+def _seed_reads_from_index_output(sid: str, ws: str, raw_text: str, env: dict[str, str]) -> None:
+    """Seed read-cache intervals when terser-index returns symbol source spans (`(path Lstart-Lend)`)."""
+    if not sid or not ws or not raw_text:
+        return
+    import re as _re
+
+    root = Path(ws)
+    seeded = 0
+    for m in _re.finditer(r"\(([^()\r\n]+?)\s+L(\d+)-L?(\d+)\)", raw_text):
+        rel = m.group(1).strip()
+        try:
+            s_ln = int(m.group(2))
+            e_ln = int(m.group(3))
+        except ValueError:
+            continue
+        p = Path(rel)
+        target = p if p.is_absolute() else (root / rel)
+        if target.is_file():
+            read_funnel.seed_read_interval(sid, str(target), s_ln, e_ln, env=env)
+            seeded += 1
+            if seeded >= 12:
+                break
+
+
 def handle_post_tool_use(
     host: str,
     payload: dict[str, Any],
@@ -855,7 +887,13 @@ def handle_post_tool_use(
                 if tool_name == "write_file" and not is_err and not args.get("Append"):
                     read_funnel.seed_after_write(sid, fp, env=env)
                 elif tool_name == "edit_file" and not is_err:
-                    read_funnel.seed_after_edit(sid, fp, env=env)
+                    read_funnel.seed_after_edit(
+                        sid,
+                        fp,
+                        old_text=args.get("Target") if isinstance(args.get("Target"), str) else None,
+                        new_text=args.get("Replacement") if isinstance(args.get("Replacement"), str) else None,
+                        env=env,
+                    )
                 else:
                     read_funnel.invalidate_on_edit(sid, fp, env=env)
                 if cfg.get("index_auto_reindex", True):
@@ -864,6 +902,23 @@ def handle_post_tool_use(
                     from runtime import context_sandbox
 
                     context_sandbox.record_session_event(sid, ws, "edit", Path(fp).name, env=env)
+
+        if (tool_name == "call_mcp_tool" or tool_name.startswith("mcp_")) and not is_err and not cfg.get("shadow"):
+            srv = str(args.get("ServerName") or "")
+            if tool_name == "call_mcp_tool":
+                inner = str(args.get("ToolName") or "")
+                disp = f"{srv}:{inner}" if srv else inner
+                inner_args = args.get("Arguments")
+            else:
+                disp = tool_name
+                inner_args = args
+            resp_val = payload.get("response") or payload.get("result") or payload.get("toolResponse")
+            resp_txt = resp_val if isinstance(resp_val, str) else json.dumps(resp_val, default=str) if resp_val is not None else ""
+            if resp_txt:
+                read_funnel.record_mcp_response_size(sid, disp, inner_args, len(resp_txt.encode("utf-8", errors="replace")), env=env)
+                srv_low = srv.lower()
+                if "terser-index" in srv_low or "terser_index" in srv_low or "terser" in tool_name.lower():
+                    _seed_reads_from_index_output(sid, ws, resp_txt, env)
 
         if is_err and ws and not cfg.get("shadow"):
             from runtime import context_sandbox
@@ -902,7 +957,13 @@ def handle_post_tool_use(
             if tool_name == "Write" and not is_err:
                 read_funnel.seed_after_write(sid, fp, env=env)
             elif tool_name in ("Edit", "MultiEdit") and not is_err:
-                read_funnel.seed_after_edit(sid, fp, env=env)
+                read_funnel.seed_after_edit(
+                    sid,
+                    fp,
+                    old_text=tool_input.get("old_string") if isinstance(tool_input.get("old_string"), str) else None,
+                    new_text=tool_input.get("new_string") if isinstance(tool_input.get("new_string"), str) else None,
+                    env=env,
+                )
             else:
                 read_funnel.invalidate_on_edit(sid, fp, env=env)
             if cfg.get("index_auto_reindex", True):
@@ -914,7 +975,7 @@ def handle_post_tool_use(
 
     hso: dict[str, Any] = {}
 
-    # 2. Invisible PostToolUse Bash/Shell output compression + cross-run Command Delta (Claude Code & Codex)
+    # 2. Invisible PostToolUse Bash/Shell output compression (stdout + stderr) + Command Delta (Claude Code & Codex)
     if (
         host in ("claude", "codex")
         and tool_name in ("Bash", "bash", "shell", "exec_command")
@@ -922,15 +983,19 @@ def handle_post_tool_use(
         and not cfg.get("shadow")
         and isinstance(tool_resp, dict)
     ):
+        cmd = str(tool_input.get("command") or tool_input.get("cmd") or "")
+        ws_post = _workspace(payload, env)
+        enhanced = bool(cfg.get("enhanced_compression", True))
+        updated_resp: dict[str, Any] | None = None
+
         stdout = tool_resp.get("stdout")
         if isinstance(stdout, str) and len(stdout) > 300:
-            cmd = str(tool_input.get("command") or tool_input.get("cmd") or "")
             comp = stdout
             stats = {"raw_chars": len(stdout), "served_chars": len(stdout)}
             if len(stdout) > 1500:
                 comp, stats = output_compressor.compress_output(
-                    stdout, command=cmd, enhanced=bool(cfg.get("enhanced_compression", True)),
-                    host=host, workspace=_workspace(payload, env), env=env,
+                    stdout, command=cmd, enhanced=enhanced,
+                    host=host, workspace=ws_post, env=env,
                 )
             if cfg.get("cmd_delta", True):
                 comp, delta_used = cmd_delta.apply_command_delta(
@@ -940,19 +1005,33 @@ def handle_post_tool_use(
                     stats["served_chars"] = len(comp)
             if stats["served_chars"] < int(stats["raw_chars"] * 0.85):
                 updated_resp = dict(tool_resp, stdout=comp)
-                hso["hookEventName"] = "PostToolUse"
-                hso["updatedToolOutput"] = updated_resp
 
-    # 3. Oversized MCP output compression + archival (Claude Code & Codex)
+        stderr = tool_resp.get("stderr")
+        if isinstance(stderr, str) and len(stderr) > 300:
+            comp_err, err_stats = output_compressor.compress_output(
+                stderr, command=cmd, returncode=1 if is_err else 0, enhanced=enhanced,
+                host=host, workspace=ws_post, env=env,
+            )
+            if err_stats["served_chars"] < int(err_stats["raw_chars"] * 0.85):
+                updated_resp = dict(updated_resp if updated_resp is not None else tool_resp, stderr=comp_err)
+
+        if updated_resp is not None:
+            hso["hookEventName"] = "PostToolUse"
+            hso["updatedToolOutput"] = updated_resp
+
+    # 3. Oversized MCP output compression + archival + terser-index read-cache seeding + real size telemetry (Claude Code & Codex)
     if (
         host in ("claude", "codex")
         and tool_name.startswith("mcp__")
-        and cfg.get("archive_large_outputs", True)
         and not cfg.get("shadow")
     ):
         raw_text = tool_resp if isinstance(tool_resp, str) else json.dumps(tool_resp, default=str) if tool_resp is not None else ""
+        if raw_text and not is_err:
+            read_funnel.record_mcp_response_size(sid, tool_name, tool_input, len(raw_text.encode("utf-8", errors="replace")), env=env)
+        if "terser-index" in tool_name.lower() or "terser_index" in tool_name.lower():
+            _seed_reads_from_index_output(sid, _workspace(payload, env), raw_text, env)
         threshold = int(cfg.get("archive_threshold_bytes", 16384))
-        if len(raw_text) > threshold:
+        if cfg.get("archive_large_outputs", True) and len(raw_text) > threshold:
             comp, stats = output_compressor.compress_output(
                 raw_text, command=tool_name, max_chars=threshold // 2,
                 enhanced=bool(cfg.get("enhanced_compression", True)),
@@ -961,6 +1040,22 @@ def handle_post_tool_use(
             if stats["served_chars"] < int(stats["raw_chars"] * 0.85):
                 hso["hookEventName"] = "PostToolUse"
                 hso["updatedMCPToolOutput"] = comp
+
+    # 3a. WebFetch lossless HTML/Markdown boilerplate compaction (Claude Code)
+    if (
+        host == "claude"
+        and tool_name == "WebFetch"
+        and cfg.get("enhanced_compression", True)
+        and not cfg.get("shadow")
+    ):
+        raw_web = tool_resp if isinstance(tool_resp, str) else ""
+        if len(raw_web) > 800:
+            comp_web = output_compressor.compact_web_and_markdown(raw_web)
+            comp_web = output_compressor.compact_aligned_tables(comp_web)
+            if len(comp_web) < int(len(raw_web) * 0.85):
+                record_savings("web_compact", len(raw_web), len(comp_web), host=host, detail="WebFetch", env=env)
+                hso["hookEventName"] = "PostToolUse"
+                hso["updatedToolOutput"] = comp_web
 
     # 3b. Runaway Glob / Grep output guard (Claude Code & Codex): group by file/dir + cap huge scans + FTS5 archive
     if (
