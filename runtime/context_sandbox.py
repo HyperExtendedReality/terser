@@ -238,20 +238,29 @@ def _ensure_fts_table(conn: sqlite3.Connection) -> bool:
 def _connect(env: dict[str, str] | None = None) -> sqlite3.Connection:
     p = _db_path(env)
     p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(p), timeout=3.0)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS blobs (
-            id TEXT PRIMARY KEY,
-            command TEXT,
-            created_at REAL,
-            total_lines INTEGER,
-            total_bytes INTEGER,
-            content TEXT
+
+    def _open_and_init() -> sqlite3.Connection:
+        c = sqlite3.connect(str(p), timeout=3.0)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS blobs (
+                id TEXT PRIMARY KEY,
+                command TEXT,
+                created_at REAL,
+                total_lines INTEGER,
+                total_bytes INTEGER,
+                content TEXT
+            )
+            """
         )
-        """
-    )
+        return c
+
+    try:
+        conn = _open_and_init()
+    except sqlite3.DatabaseError:
+        heal_sqlite_db(p)
+        conn = _open_and_init()
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS session_events (

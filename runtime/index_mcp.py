@@ -2935,8 +2935,18 @@ def _handle_hud_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             elif k in _HUD_CONFIG_STR_KEYS:
                 if not isinstance(v, str):
                     raise ValueError(f"{k} must be a string")
-                cfg[k] = v.strip()[:64]
-                changed[k] = cfg[k]
+                sv_val = v.strip()[:64]
+                allowed = {
+                    "subagent_cheap_model_antigravity": ("flash_lite", "flash", "pro"),
+                    "subagent_cheap_effort_antigravity": ("", "low", "medium", "high", "max"),
+                    "subagent_cheap_effort": ("", "low", "medium", "high", "xhigh", "max"),
+                    "toolprune": ("propose", "auto", "off"),
+                    "code_discipline": ("minimal", "off"),
+                }.get(k)
+                if allowed is not None and sv_val not in allowed:
+                    raise ValueError(f"{k} must be one of {allowed}")
+                cfg[k] = sv_val
+                changed[k] = sv_val
             elif k in _HUD_CONFIG_FLOAT_KEYS:
                 try:
                     fv = float(v)

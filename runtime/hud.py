@@ -93,7 +93,17 @@ def snapshot(transcript: str = "", session_id: str = "", cwd: str = "", host: st
     effective_host = (host or os.environ.get("TERSER_CLIENT_ID") or "").strip().lower()
 
     if not transcript and effective_host == "antigravity":
-        found = analytics.latest_antigravity_transcript()
+        found = None
+        if session_id:
+            ag_home = (os.environ.get("TOKEN_OPTIMIZER_ANTIGRAVITY_HOME") or "").strip()
+            base = Path(os.path.expanduser(ag_home)) if ag_home else (Path.home() / ".gemini")
+            for surf in ("antigravity", "antigravity-cli", "antigravity-ide"):
+                logs_dir = base / surf / "brain" / session_id / ".system_generated" / "logs"
+                found = analytics._preferred_ag_transcript(logs_dir)
+                if found is not None:
+                    break
+        if found is None:
+            found = analytics.latest_antigravity_transcript()
         if found is not None:
             transcript = str(found)
 

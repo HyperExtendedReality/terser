@@ -479,20 +479,26 @@ def _drain_ag_subagent_checks(sid: str, payload: dict[str, Any], ws: str, env: d
 
     replies: list[tuple[str, str]] = []
     for line in raw.splitlines():
-        if "sender=" not in line and "SYSTEM_MESSAGE" not in line and "subagent" not in line.lower():
+        if '"SYSTEM_MESSAGE"' not in line or "sender=" not in line or "content=" not in line:
             continue
         try:
             rec = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(rec, dict):
+        if not isinstance(rec, dict) or rec.get("type") != "SYSTEM_MESSAGE":
             continue
         txt = sv.response_text(rec)
         if not txt or "sender=" not in txt or "content=" not in txt:
             continue
+        # Skip background shell task notifications (`sender=<conv>/task-<n>`) and system notices
+        sender_seg = txt.split("sender=", 1)[1].split(None, 1)[0]
+        if "/task-" in sender_seg or sender_seg == "system":
+            continue
         idx = txt.find("content=")
         body = txt[idx + len("content="):].strip()
-        if len(body) < 15:
+        if body.endswith("</SYSTEM_MESSAGE>"):
+            body = body[: -len("</SYSTEM_MESSAGE>")].rstrip()
+        if len(body) < 15 or body.startswith("Task id "):
             continue
         h = _hl.sha256(body[:400].encode("utf-8", errors="ignore")).hexdigest()[:16]
         if h not in seen_hashes:

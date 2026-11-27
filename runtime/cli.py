@@ -384,6 +384,12 @@ def _cmd_doctor(host: str, cwd: str) -> int:
             print(f"  [FAIL] {label:<20}: {exc}")
             ok = False
     print(f"  [INFO] Config file     : {config_path()} ({'exists' if config_path().is_file() else 'defaults'})")
+    sb_db = state_home() / "sandbox.db"
+    if sb_db.is_file():
+        hres = context_sandbox.heal_sqlite_db(sb_db)
+        st_lbl = str(hres.get("status") or "unknown").upper()
+        tag = "PASS" if st_lbl in ("OK", "HEALED") else "WARN"
+        print(f"  [{tag}] Sandbox SQLite  : {st_lbl} ({sb_db})")
     idx = index_bridge.workspace_index_summary(cwd)
     print(f"  [INFO] CWD code index  : {idx['repo'] if idx else 'not indexed'}")
     return 0 if ok else 1

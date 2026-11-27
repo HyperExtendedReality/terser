@@ -9,13 +9,13 @@
 [![Version](https://img.shields.io/badge/version-1.2.0-0F766E?style=flat-square)](plugin.json)
 [![Token Savings](https://img.shields.io/badge/measured%20savings-94.5%25-14B8A6?style=flat-square)](#measured-benchmarks)
 [![Hook Latency](https://img.shields.io/badge/Rust%20hot--path-~10ms%20(14.1%C3%97)-F97316?style=flat-square)](#native-rust-hot-path-terser-fast)
-[![Python](https://img.shields.io/badge/python-3.10%2B%20stdlib-3776AB?style=flat-square&logo=python&logoColor=white)](#requirements)
+[![Python](https://img.shields.io/badge/python-3.10%2B%20stdlib-3776AB?style=flat-square&logo=python&logoColor=white)](#quick-start)
 [![Hosts](https://img.shields.io/badge/hosts-Antigravity%20%7C%20Claude%20Code%20%7C%20Codex%20%7C%20opencode%20%7C%20Cursor-6366F1?style=flat-square)](#quick-start)
 [![License](https://img.shields.io/badge/license-GPL--3.0-0EA5E9?style=flat-square)](LICENSE)
 
 <h3>Lossless context compression, AST code indexing, and ~10 ms Rust hooks<br />for Antigravity 2.0, Claude Code, Codex, opencode, and Cursor.</h3>
 
-[Why Terser](#why-terser) · [Quick Start](#quick-start) · [Benchmarks](#measured-benchmarks) · [How It Works](#how-it-works) · [Capabilities](#capabilities--extensions) · [Rust Hot-Path](#native-rust-hot-path-terser-fast) · [CLI](#cli--slash-commands) · [Configuration](#configuration)
+[Quick Start](#quick-start) · [Benchmarks](#measured-benchmarks) · [Architecture](#architecture) · [Capabilities](#capabilities--extensions) · [CLI & Autopilot](#cli-slash-commands--autopilot) · [Configuration](#configuration)
 
 </div>
 
@@ -23,42 +23,43 @@
 
 ## Why Terser?
 
-AI coding agents spend most of their context window on noise: bloated MCP schemas, repeated full-file reads, verbose build and test logs, repetitive JSON/NDJSON payloads, lockfile diffs, and retry loops.
+AI coding agents burn most of their context window on noise: bloated MCP tool schemas, repeated full-file reads, verbose build and test logs, repetitive JSON/NDJSON payloads, lockfile diffs, and retry loops.
 
-**Terser** intercepts that waste across the entire tool and subagent lifecycle—**without sacrificing code quality, error fidelity, or KV prompt-cache hits**:
+**Terser** intercepts that waste across the entire tool and subagent lifecycle—cutting token usage by **94.5%** while preserving **100% of errors, tracebacks, diffs, and exit codes** and keeping KV prompt-cache prefixes warm.
 
-| Guarantee | What Terser Delivers |
-| :--- | :--- |
-| **94.5% Token Reduction** | Measured across 8 optimization layers on realistic developer workloads (`58,940` → `3,216` tokens). |
-| **Zero Quality Compromise** | Errors, tracebacks, diffs, and exit codes are preserved **100% verbatim**. Full raw outputs are secret-redacted and archived locally in SQLite FTS5 for instant drill-down. |
-| **KV Prompt-Cache Safe** | Static-first, byte-stable session briefs and deterministic PageRank repo maps keep prompt prefix caches warm. |
-| **~10 ms Native Hot-Path** | Default-on Rust accelerator (`terser-fast`) runs `PreToolUse` and `PostToolUse` hooks **14.1× faster** (`~147 ms` → `~10 ms`), with lazy pure-Python stdlib fallback. |
-| **Subagent-Native** | Full `SubagentStart` / `SubagentStop` lifecycle hooks, economy briefs, and opt-in low-cost subagent routing with zero-token citation verification. |
-| **100% Local & Fail-Open** | Zero runtime dependencies, zero telemetry. Every hook exits `0` on error so your workflow is never blocked. |
+### Before vs. After
 
-### At a Glance
+| Everyday Agent Action | Without Terser | With Terser |
+| :--- | :--- | :--- |
+| **MCP AST server schemas** | Loads 90+ tool schemas (~25,800 tok) | 6-tool Counter front door (**~1,050 tok**, **−95.9%**) |
+| **Re-reading an unchanged 300L file** | Full file re-sent (~3,603 tok) | T0 hash dedup / edit-seeded hit (**~38 tok**, **−98.9%**) |
+| **Re-reading after a 2-line edit** | Full file re-sent (~3,603 tok) | T1 exact unified delta diff (**~93 tok**, **−97.4%**) |
+| **Opening a large code / doc file** | Entire 300L+ file (~3.6k–5.7k tok) | T2/T2b/T2c outline-first + range trim (**~333–692 tok**) |
+| **Running `cargo build` / `pytest`** | Full verbose log (~447–505 tok) | Stream filter + delta-diff (**~34–122 tok**, errors 100%) |
+| **Oversized 50 KB tool output** | Dumped raw into context | Redacted & archived to SQLite FTS5 → `terse query --last` |
 
-```text
-Without Terser                                    With Terser
-───────────────────────────────────────────────   ──────────────────────────────────────────────────────
-• MCP AST server loads 90+ schemas (~25,800 tok)  • 6-tool Counter front door (~1,050 tok, 95.9% cut)
-• Re-reading unchanged 300L file (~3,603 tok)     • T0 hash dedup / edit-seeded hit (~38 tok, 98.9% cut)
-• Re-reading after 2-line edit (~3,603 tok)       • T1 exact unified delta diff (~93 tok, 97.4% cut)
-• Reading 300L code/docs/data file (~3.6k–5.7k)   • T2/T2b/T2c outline-first + range trim (~333–692 tok)
-• Running cargo build / pytest (~447–505 tok)     • Stream filter + delta-diff (~34–122 tok, errors 100%)
-• Oversized 50 KB log dumped into context         • Archived to SQLite FTS5 → terse query --last "ERR"
-```
+### Core Guarantees
+
+- **Zero Quality Compromise:** Errors, stack traces, diffs, and exit codes pass through verbatim. Oversized outputs are secret-redacted and archived locally in SQLite FTS5 for instant drill-down.
+- **KV Prompt-Cache Safe:** Static-first, byte-stable session briefs and deterministic PageRank repo maps never bust prompt prefix caches.
+- **~10 ms Native Hot-Path:** Default-on Rust accelerator (`terser-fast`) runs `PreToolUse` / `PostToolUse` hooks **14.1× faster** (`~147 ms` → `~10 ms`), with lazy pure-Python stdlib fallback.
+- **Subagent-Native:** Full `SubagentStart` / `SubagentStop` hooks, compact economy briefs, and opt-in low-cost subagent routing with zero-token citation verification.
+- **100% Local & Fail-Open:** Zero runtime dependencies, zero telemetry. Every hook exits `0` on error so your workflow is never blocked.
 
 ---
 
 ## Quick Start
 
-### Requirements
+> **Requirements:** **Python 3.10+** (pure stdlib — zero `pip install` or external MCP packages required; Python 3.11+ for the Codex marketplace builder). **Rust (`cargo`)** is optional — prebuilt `terser-fast` binaries are fetched automatically from [GitHub Releases](https://github.com/HyperExtendedReality/terser/releases) or compiled locally if `cargo` is present.
 
-- **Python 3.10+** — pure standard library; zero `pip install` or external MCP packages required (`terser-index` is built in). *(Python 3.11+ for the Codex marketplace builder.)*
-- **Rust (`cargo`)** *(optional)* — prebuilt `terser-fast` binaries are fetched automatically from [GitHub Releases](https://github.com/HyperExtendedReality/terser/releases), or compiled locally if `cargo` is present.
+### 1. Clone the repository
 
-### Supported Hosts
+```bash
+git clone https://github.com/HyperExtendedReality/terser.git
+cd terser
+```
+
+### 2. Install for your host
 
 | Host | Install Command | What Gets Installed |
 | :--- | :--- | :--- |
@@ -68,14 +69,7 @@ Without Terser                                    With Terser
 | **opencode** | `python scripts/install.py --opencode` | Plugin in `~/.config/opencode/plugins/terser.js` + prints `terser-index` entry for `opencode.json` |
 | **Cursor** | `python scripts/install.py --cursor` | Merges hooks into `~/.cursor/hooks.json` and `terser-index` into `~/.cursor/mcp.json` |
 
-### Install
-
-```bash
-git clone https://github.com/HyperExtendedReality/terser.git
-cd terser
-```
-
-Then run the command for your host from the table above, or use the all-in-one flags:
+Or configure multiple hosts at once:
 
 ```bash
 python scripts/install.py --all            # Configure Antigravity, Codex & print Claude commands
@@ -83,11 +77,17 @@ python scripts/install.py --all --dry-run  # Preview changes without modifying f
 python scripts/install.py --all --uninstall
 ```
 
+### 3. Verify your installation
+
+```bash
+python runtime/cli.py doctor   # Checks Python, Rust hot-path, manifests, MCP, and SQLite sandbox health
+```
+
 > [!TIP]
 > If you previously installed standalone token-optimization or code-indexing plugins, disable them in your host's plugin manager to avoid duplicate hooks and tool schemas.
 
 <details>
-<summary><strong>Host-specific setup notes (Claude Code, Codex, opencode &amp; Cursor)</strong></summary>
+<summary><strong>Host-specific setup notes (Antigravity, Claude Code, Codex, opencode &amp; Cursor)</strong></summary>
 
 #### Antigravity 2.0 / IDE / `agy`
 Safe to re-run in place on Windows even while Antigravity is running. Installs OS-native launchers with no console window flash.
@@ -138,33 +138,45 @@ Reproduce these numbers offline anytime with `scripts/terse benchmark` (or `pyth
 
 ---
 
-## How It Works
+## Architecture
 
 ```mermaid
 flowchart LR
-    S["SessionStart / SubagentStart"] --> B["Static-First Brief & PageRank RepoMap"]
-    P["PreToolUse (~10ms Rust)"] --> RF["4-Tier Read Funnel & MCP Dedup"]
-    P --> FR["FormRepair, Chain Wrap & Index Grep"]
-    O["PostToolUse"] --> OC["5-Stage Compression & Cmd Delta"]
-    OC --> DB["SQLite FTS5 Sandbox (~/.terser/sandbox.db)"]
-    O --> LG["Edit-Seed, Auto-Reindex & Loop Guard"]
+    subgraph Session["Session & Subagent Lifecycle"]
+        S["SessionStart / SubagentStart"] --> B["Static-First Brief & PageRank RepoMap"]
+    end
+
+    subgraph Pre["PreToolUse (~10 ms Rust)"]
+        P["Tool Intercept"] --> RF["4-Tier Read Funnel & MCP Dedup"]
+        P --> FR["FormRepair, Chain Wrap & Index Grep"]
+    end
+
+    subgraph Post["PostToolUse & Archive"]
+        O["Tool Output"] --> OC["5-Stage Compression & Cmd Delta"]
+        OC --> DB["SQLite FTS5 Sandbox (~/.terser/sandbox.db)"]
+        O --> LG["Edit-Seed, Auto-Reindex & Loop Guard"]
+    end
+
+    B -.-> P
+    RF -.-> O
+    FR -.-> O
 ```
 
 ### The 8-Layer Optimization Stack
 
-| # | Layer | What It Does |
-| :---: | :--- | :--- |
-| **1** | **6-Tool AST Front Door (`terser-index`)** | Replaces 90+ verbose MCP schemas (~25.8k tok) with 6 Counter tools (~1,050 tok, **95.9% cut**) backed by an incremental SQLite + FTS5 trigram index (~0.6s warm re-index on 1.5k files, `.gitignore`-aware, optional `tree-sitter-language-pack` exact spans, `TERSER_INDEX_WORKERS=N` parallel parsing). |
-| **2** | **4-Tier Read Funnel + Verified Seeding** | **T0** unchanged re-read dedup · **T1** exact unified delta-diff · **T1b** whole-symbol delta · **T2/T2b/T2c** outline-first for large code, Markdown, and config/log files (`>=10 KB`, `>=250L`) · **T3** ranged passthrough with disjoint interval tracking & overlap trimming. Includes **edit-miss recovery**, **content-addressed blob snapshots**, and **7-day retry-rate auto-backoff** (`~/.terser/funnel-backoff.json`). |
-| **3** | **FormRepair → 5-Stage Compression → Cmd Delta** | Repairs shell/PowerShell commands & wraps `&&` chains, then strips ANSI/spinners, applies native tool handlers (git, cargo, pytest, go, jest/vitest, dotnet, npm/pnpm/uv, gradle/maven, docker, terraform), compacts tables/diffs/paths/tracebacks, archives base64 blobs, collapses duplicates, and diffs repeated commands. Errors & exit codes stay 100% verbatim. |
-| **4** | **SmartCrusher JSON & NDJSON Pruner** | Factors constant fields and columnizes repetitive JSON arrays, GraphQL payloads, and mixed NDJSON streams (keeping headers and error/outlier items) while archiving the full raw payload. |
-| **5** | **SQLite FTS5 Context Sandbox** | Oversized shell, MCP, `Glob`, `Grep`, and web outputs are secret-redacted, content-addressed, and chunk-indexed with Porter stemming + BM25 into `~/.terser/sandbox.db` (auto-pruned at 7 days / 50 MB). Seamlessly lazy-ingests Rust raw sidecars (`~/.terser/raw-archives/`). |
-| **6** | **Static-First Brief & PageRank RepoMap** | Emits a byte-stable, budget-capped (`<=1600` chars) `SessionStart` brief plus a `<150 ms` AST import-graph PageRank map (~300 tok) only when a repo is not yet indexed—keeping KV prompt caches 100% warm. |
-| **7** | **Subagent Lifecycle & Verified Routing** | Ships a `<220`-token `rules/AGENTS.md` policy, 4 focused skills, `SubagentStart`/`SubagentStop` hooks, and opt-in low-cost routing (`terse routing on`) that routes only read-only lookup subagents to the cheap tier (`haiku`/`flash`) under a `[Terser Verify]` citation contract with zero-token verification and automatic 7-day pause if >35% fail. |
-| **8** | **Unified Loop Guard & Smart Auto-Reindex** | Per-session cooldown (45s), content-hashed edit signatures (no false positives on multi-region edits), and index-gated incremental AST re-indexing on file edits. |
+| # | Layer | Mechanism | Key Result |
+| :---: | :--- | :--- | :--- |
+| **1** | **6-Tool AST Front Door (`terser-index`)** | Replaces 90+ verbose MCP schemas with 6 Counter tools backed by an incremental SQLite + FTS5 trigram index (`.gitignore`-aware, optional `tree-sitter-language-pack`, `TERSER_INDEX_WORKERS=N`). | **95.9%** schema cut (~0.6s warm re-index on 1.5k files) |
+| **2** | **4-Tier Read Funnel** | **T0** hash dedup · **T1** unified delta · **T1b** whole-symbol delta · **T2/T2b/T2c** outline-first (`>=10 KB`, `>=250L`) · **T3** ranged overlap trim, plus edit-miss recovery and 7-day retry backoff. | **80–99%** cut on file reads |
+| **3** | **FormRepair & 5-Stage Compression** | Repairs shell/PowerShell commands & wraps `&&` chains; strips ANSI, runs native tool handlers (`git`, `cargo`, `pytest`, `go`, `jest`/`vitest`, `dotnet`, `npm`/`pnpm`/`uv`, `gradle`/`maven`, `docker`, `terraform`), compacts diffs/tables/tracebacks, and diffs repeated commands. | **75–98%** cut; errors & exit codes 100% verbatim |
+| **4** | **SmartCrusher JSON & NDJSON** | Factors constant fields and columnizes repetitive JSON arrays, GraphQL payloads, and mixed NDJSON streams while keeping headers and error/outlier items. | **88–97%** cut; raw payload archived |
+| **5** | **SQLite FTS5 Context Sandbox** | Secret-redacts, content-addresses, and chunk-indexes oversized shell, MCP, `Glob`, `Grep`, and web outputs with Porter stemming + BM25 (`~/.terser/sandbox.db`, auto-pruned at 7d / 50 MB). Lazy-ingests Rust raw sidecars. | **91.9%** cut with instant full-text drill-down |
+| **6** | **Static-First Brief & PageRank RepoMap** | Emits a byte-stable `SessionStart` brief (`<=1600` chars) plus a `<150 ms` AST import-graph PageRank map (~300 tok) only when unindexed. | Keeps KV prompt prefix caches 100% warm |
+| **7** | **Subagent Lifecycle & Verified Routing** | `<220`-token `rules/AGENTS.md` policy, 4 skills, `SubagentStart`/`SubagentStop` hooks, and opt-in cheap-tier routing (`terse routing on`) with `[Terser Verify]` zero-token citation checks (auto-pauses 7d if >35% fail). | Lower subagent cost with verified accuracy |
+| **8** | **Unified Loop Guard & Auto-Reindex** | Per-session 45s cooldown, content-hashed edit signatures (no false positives on multi-region edits), and index-gated incremental AST re-indexing on file edits. | Stops thrash loops & keeps AST index fresh |
 
 <details>
-<summary><strong>Deep dive: Read Funnel safety &amp; Edit-Miss Recovery details</strong></summary>
+<summary><strong>Deep dive: Read Funnel safety, verified seeding &amp; Edit-Miss Recovery</strong></summary>
 
 - **Verified edit/write seeding:** The read cache only advances after `Edit`, `MultiEdit`, or `Write` when the file on disk matches the cached text with edits applied (CRLF-aware). If a formatter or external writer modified the file, the next read returns an exact diff instead of `"unchanged"`.
 - **T1b symbol delta:** When changes exceed the 60-line unified diff cap but sit inside a few functions or classes, Terser returns only those whole symbols bounded by unchanged anchor lines (with old/new line ranges). Retrying loads the full file.
@@ -180,81 +192,83 @@ flowchart LR
 
 ### Code Mode (Local Script & Batch Actions)
 
-Instead of pulling large files into context, the agent can run targeted local operations through `terser-index`'s `order` tool and receive only the printed result:
+Run targeted local operations through `terser-index`'s `order` tool and return only the printed result—never pulling large files into context:
 
-| Action | Use Case |
+| Action | What It Does |
 | :--- | :--- |
-| `run_script` | Run local Python, Node, Bash, or PowerShell. Python gets a built-in `t` helper (`t.files`, `t.grep`, `t.count`, `t.symbols`, `t.source`, `t.refs`, `t.read`, `t.json`/`toml`/`csv`/`ini`/`py_ast`, plus staged edits `t.replace`, `t.sub`, `t.write`, `t.edit_symbol`). |
+| `run_script` | Execute local Python, Node, Bash, or PowerShell. Python gets a built-in `t` helper (`t.files`, `t.grep`, `t.count`, `t.symbols`, `t.source`, `t.refs`, `t.read`, `t.json`/`toml`/`csv`/`ini`/`py_ast`, plus staged edits `t.replace`, `t.sub`, `t.write`, `t.edit_symbol`). |
 | `code_search` | Find files matching ALL / ANY / NONE of multiple regexes (`"uses X but not Y"`), returned as files, counts, or hits. |
 | `code_edit` | Batch exact, regex, or whole-symbol edits across files—validated together and written all-or-nothing. |
 | `code_query` | Extract values from JSON, JSONL, TOML, CSV, or INI by dotted path (`dependencies.*`, `items[0].name`), or return a key outline. |
 | `fetch_and_index` | Fetch a URL once, archive it to FTS5, and return its outline plus sections matching `query`. |
 
-> Edits default to dry-run diffs unless `apply: true`. Failed scripts write nothing, writes are confined to the repo root, and modified files are automatically re-indexed and evicted from the read cache. Disable anytime with `terse config set code_mode=false`.
+> Edits default to dry-run diffs unless `apply: true`. Failed scripts write nothing, writes stay confined to the repo root, and modified files are automatically re-indexed and evicted from the read cache. Disable anytime with `terse config set code_mode=false`.
 
 ### Compress Any MCP Server (`terse mcp-proxy`)
 
-Wrap any stdio MCP server to shrink both tool definitions and tool responses without modifying the server:
+Wrap any stdio MCP server to shrink both tool definitions and responses without touching the server code:
 
 ```bash
 terse mcp-proxy -- npx -y <server>
 terse mcp-proxy --lazy-tools -- npx -y <server>   # 1-sentence descriptions + on-demand terser_tool_help
 ```
 
-- Trims `tools/list` descriptions (preserving names, types, `required`, and enums); `--no-desc` leaves schemas untouched.
+- Trims `tools/list` descriptions while preserving names, types, `required`, and enums (`--no-desc` leaves schemas untouched).
 - Compresses `tools/call` text responses losslessly up to 8 KB and archives larger payloads with an FTS5 retrieval hint. Error responses are never altered.
 
 ### Live HUD, Status Line & Analytics
 
-- **Interactive HUD MCP App (`terser_hud`):** Built-in MCP App (`assets/hud_app.html`) rendering live session savings, per-engine breakdown, context fill, and quality metrics right inside MCP App-capable hosts.
-- **Claude Code Desktop Status Band (`mods/terser-hud/`):** Adds a live status band above the prompt showing session savings & dollar value, estimated API cost, context fill (`green` → `amber` at 70% → `red` at 85%), cache hit rate, session grade, all-time savings, and a **Router** dropdown (Off / Haiku / Sonnet / Fable). Click **Details** (or `/terser-hud`) for the full breakdown pane. Load with `claude --plugin-dir mods/terser-hud` (or add to `CLAUDE_CODE_PLUGIN_DIRS`; set `TERSER_ROOT` if installed elsewhere).
-- **Claude Code Status Line:** `python scripts/install.py --statusline` wires `runtime/statusline.py` into Claude Code's `statusLine` setting.
-- **Local HTML Dashboard:** `terse dashboard` generates and opens a standalone local analytics dashboard.
+| Surface | How to Enable / Open | What It Shows |
+| :--- | :--- | :--- |
+| **Interactive HUD MCP App (`terser_hud`)** | Built-in (`assets/hud_app.html`) in MCP App-capable hosts | Live session savings, per-engine breakdown, context fill, quality grade, and live config controls |
+| **Claude Code Desktop Status Band** | `claude --plugin-dir mods/terser-hud` *(or `CLAUDE_CODE_PLUGIN_DIRS`; set `TERSER_ROOT` if relocated)* | Live bar above the prompt: session savings & `$` value, est. API cost, context fill (`green` / `amber` 70% / `red` 85%), cache hit rate, grade, all-time savings, **Router** dropdown (Off / Haiku / Sonnet / Fable), and **Details** pane (`/terser-hud`) |
+| **Claude Code Status Line** | `python scripts/install.py --statusline` | Wires `runtime/statusline.py` into Claude Code's `statusLine` setting |
+| **Local HTML Dashboard** | `terse dashboard` | Generates and opens a standalone local analytics dashboard in your browser |
 
-### Repository Analysis & SCIP
+### Repository Intelligence & SCIP
 
-Available through `terser-index` (`order`), all scoped with `path_prefix` for monorepos:
+Available via `terser-index` (`order`), all monorepo-scoped with `path_prefix`:
 
-- **Code intelligence:** `get_hotspots`, `get_symbol_history`, `get_untested_symbols`, `get_class_hierarchy`, `find_implementations`, `find_similar_symbols`, `get_symbol_diff`, `get_pr_risk_profile`, `get_layer_violations`, `list_workspaces`, and `import_scip` (enables compiler-precise `find_references`).
-- **Broad language coverage:** Structural indexing covers 60+ additional extensions including Elixir, Haskell, OCaml, F#, Clojure, R, Julia, Nim, Solidity, Protobuf, GraphQL, Terraform, Shell, PowerShell, Perl, Pascal, Fortran, Vue/Svelte, VB, CUDA/shaders, Verilog, and VHDL.
-- **Repo config:** Customize via `<repo>/.terser/config.toml` (`[index] skip` / `extensions`, `[analysis] test_globs`, `[[layers]]`).
+- **Code intelligence actions:** `get_hotspots`, `get_symbol_history`, `get_untested_symbols`, `get_class_hierarchy`, `find_implementations`, `find_similar_symbols`, `get_symbol_diff`, `get_pr_risk_profile`, `get_layer_violations`, `list_workspaces`, and `import_scip` (enables compiler-precise `find_references`).
+- **60+ language extensions:** Structural indexing covers Elixir, Haskell, OCaml, F#, Clojure, R, Julia, Nim, Solidity, Protobuf, GraphQL, Terraform, Shell, PowerShell, Perl, Pascal, Fortran, Vue/Svelte, VB, CUDA/shaders, Verilog, VHDL, and more.
+- **Per-repo config:** Customize indexing and architecture rules in `<repo>/.terser/config.toml` (`[index] skip` / `extensions`, `[analysis] test_globs`, `[[layers]]`).
 
 ### Custom Filters, `.contextignore`, Compaction & YouTube
 
 - **`command-filters.toml`** (`~/.terser/` and `<repo>/.terser/`): Define `[[filter]]` rules (`match`, `drop`/`keep` regexes, optional built-in `handler`) and `[exclude] commands = [globs]`. Error/warning lines are never dropped. Test rules with `terse filters test "<cmd>"`.
-- **`.contextignore`** (repo root and `~/.terser/`): Gitignore-style patterns (`!pattern` to re-include) for files excluded from context reads and indexing.
-- **Activity-aware compaction & lean resume:** `PreCompact` guidance identifies the active mode (`code`, `debug`, `review`, `infra`, `research`), lists up to 10 verbatim session decisions, and `terse resume-lean` builds a token-free restart brief from the last checkpoint, events, and `git status`.
-- **YouTube transcript compaction:** When an agent fetches a YouTube URL (Claude `WebFetch` or `terse youtube`), Terser uses your local `yt-dlp` to extract and compact captions (every word preserved), caches by video ID, and indexes the transcript into FTS5 for search.
+- **`.contextignore`** (repo root and `~/.terser/`): Gitignore-style patterns (`!pattern` to re-include) excluding files from context reads and indexing.
+- **Activity-aware compaction & lean resume:** `PreCompact` detects the active mode (`code`, `debug`, `review`, `infra`, `research`) and preserves up to 10 verbatim session decisions. `terse resume-lean` builds a token-free restart brief from the last checkpoint, events, and `git status`.
+- **YouTube transcript compaction:** Fetching a YouTube URL (Claude `WebFetch` or `terse youtube`) uses local `yt-dlp` to extract and compact captions with every word preserved, caches by video ID, and indexes into FTS5.
 
----
+### Native Rust Hot-Path (`terser-fast`)
 
-## Native Rust Hot-Path (`terser-fast`)
-
-`scripts/install.py` enables the ~390 KB native Rust binary (`native/terser-fast/` → `bin/terser-fast`) **by default**—reusing an existing build, compiling with `cargo` if available, or downloading the matching prebuilt binary from [GitHub Releases](https://github.com/HyperExtendedReality/terser/releases).
+`scripts/install.py` enables the ~390 KB native Rust binary (`native/terser-fast/` → `bin/terser-fast`) **by default**—reusing an existing build, compiling with `cargo` if present, or downloading the matching binary from [GitHub Releases](https://github.com/HyperExtendedReality/terser/releases). Pass `--no-native` for pure Python stdlib.
 
 - **14.1× faster hooks:** Cuts `PreToolUse` latency from **~147 ms → ~10 ms** with lazy Python discovery on native fast paths.
-- **Broad native parity:** Handles Read Funnel T0/T1/T3 (byte-exact port of CPython `difflib.unified_diff`), MCP refetch dedup, Loop Guard, `SubagentStart`/`SubagentStop`, complexity routing, `terser-fast compress` (ANSI strip, lockfile elision, diff header compaction, table-to-TSV, workspace path elision, compiler-note dedup, stack-frame folding, stream filters, duplicate collapse), and `terser-fast exec`.
+- **Broad native parity:** Runs Read Funnel T0/T1/T3 (byte-exact port of CPython `difflib.unified_diff`), MCP refetch dedup, Loop Guard, `SubagentStart`/`SubagentStop`, complexity routing, `terser-fast compress` (ANSI strip, lockfile elision, diff header compaction, table-to-TSV, path elision, compiler-note dedup, stack-frame folding, stream filters, duplicate collapse), and `terser-fast exec`.
 - **PowerShell parity:** Claude Code's `PowerShell` tool receives the same FormRepair (plain executable swaps only—no POSIX syntax) and stdout/stderr compression as `Bash`.
-- **Exact no-op gates & warm Python worker:** `Bash`/`PowerShell`/`Grep` `PreToolUse`, `UserPromptSubmit`, and `Stop`/`SessionEnd` skip Python when provably a no-op. Delegated events route to a single warm `unified_hook.py --serve-worker` per checkout (token/length/deadline/code-change verified, 15-min idle exit; disable with `TERSER_PYTHON_WORKER=0` or `"python_worker": false`). Pass `--no-native` to run pure Python stdlib.
+- **No-op gates & warm Python worker:** `Bash`/`PowerShell`/`Grep` `PreToolUse`, `UserPromptSubmit`, and `Stop`/`SessionEnd` skip Python when provably a no-op. Delegated events route to a single warm `unified_hook.py --serve-worker` per checkout (token/length/deadline/code-change verified, 15-min idle exit; disable via `TERSER_PYTHON_WORKER=0` or `"python_worker": false`).
 
 ---
 
-## CLI & Slash Commands
+## CLI, Slash Commands & Autopilot
+
+### Zero-Touch Autopilot
+
+Everyday workflows run automatically without memorizing slash commands (each toggleable via config or `TERSER_*` env vars):
+
+- **Archived output pointers** reference the built-in MCP call (`order(action="search_sandbox"|"expand_sandbox", ...)`), never requiring `terse` on `PATH`.
+- **Background first-time indexing** (`index_auto_init`, default up to 5,000 source files) indexes unindexed git repos at session start.
+- **Stat-only health checks** (`health_check`) surface a user-only `Terser degraded: ...` notice with the exact `doctor` command only when something is broken.
+- **Plain-language intent hints** (`intent_hints`) inject exact commands for prompts like *"how much has terser saved?"* or *"show me the full output"*.
+- **Context-fill nudges & savings summary** (`context_fill_nudges`, `session_summary`) alert at 70% / 85% context fill (Claude Code & Codex) and show a concise end-of-turn savings line starting at 5k tokens (then each doubling).
 
 ### Slash Commands & Agent Skills
 
-- **Claude Code slash commands:** `/terser:status`, `/terser:audit`, `/terser:dashboard`, `/terser:doctor`, `/terser:tune`, `/terser:routing`
-- **Agent skills (Antigravity, Claude Code & Codex):** `terser` (status/audit/dashboard), `terser-index` (AST symbol-first navigation), `terser-tune` (settings, micro-skills, tool pruning), `terser-routing` (low-cost subagent model routing & verification)
-
-### Zero-Touch Autopilot (No Slash Commands Required)
-
-Terser handles everyday workflows automatically—each toggleable via config or `TERSER_*` env vars:
-
-- **Archived output pointers** reference the built-in MCP call (`order(action="search_sandbox"|"expand_sandbox", ...)`), never requiring `terse` on `PATH`.
-- **Background first-time indexing** (`index_auto_init`, default up to 5,000 source files) indexes unindexed git repos in the background at session start.
-- **Stat-only health checks** (`health_check`) surface a user-only `Terser degraded: ...` notice with the exact `doctor` command only when something is broken.
-- **Plain-language intent hints** (`intent_hints`) inject exact commands for prompts like *"how much has terser saved?"* or *"show me the full output"*.
-- **Context-fill nudges & savings summary** (`context_fill_nudges`, `session_summary`) alert at 70% / 85% context fill (Claude Code & Codex) and display a concise end-of-turn savings line starting at 5k tokens (then each doubling).
+| Interface | Hosts | Available Entries |
+| :--- | :--- | :--- |
+| **Slash Commands** | Claude Code | `/terser:status`, `/terser:audit`, `/terser:dashboard`, `/terser:doctor`, `/terser:tune`, `/terser:routing` |
+| **Agent Skills** | Antigravity, Claude Code, Codex | `terser` *(status/audit/dashboard)*, `terser-index` *(AST symbol-first navigation)*, `terser-tune` *(settings, micro-skills, tool pruning)*, `terser-routing` *(low-cost subagent routing & verification)* |
 
 ### `terse` CLI Quick Reference
 
@@ -262,8 +276,8 @@ Invoke via `scripts/terse` (macOS/Linux), `scripts/terse.cmd` (Windows), or `pyt
 
 | Category | Command | Purpose |
 | :--- | :--- | :--- |
-| **Monitor** | `terse status` | Live status, per-layer % savings, funnel retry ratios & session regret signals |
-| | `terse savings` | Breakdown of cumulative tokens saved by optimization layer |
+| **Monitor & Audit** | `terse status` | Live status, per-layer % savings, funnel retry ratios & session regret signals |
+| | `terse savings` | Cumulative tokens saved broken down by optimization layer |
 | | `terse grade` | Session quality grade (`0–100`) with reasons & regret signals |
 | | `terse hud --json` | Single JSON snapshot backing `mods/terser-hud` and `terser_hud` |
 | | `terse benchmark` | Reproducible 8-layer local token-savings benchmark |
@@ -271,15 +285,15 @@ Invoke via `scripts/terse` (macOS/Linux), `scripts/terse.cmd` (Windows), or `pyt
 | | `terse discover --replay [--days N] [--json]` | Read-only counterfactual replay of Claude Code / Codex transcripts |
 | | `terse audit-config` / `terse security-report` | Static context bloat & secret-leak workspace audit |
 | | `terse dashboard` | Generate & open the local HTML analytics dashboard |
-| | `terse doctor` | Verify Python, Rust hot-path, engines, manifests & MCP |
-| **Navigate** | `terse query <id\|--last> "<terms>"` | SQLite FTS5 search over an archived output (incl. Rust raw sidecars) |
+| | `terse doctor` | Verify Python, Rust hot-path, engines, manifests, MCP & SQLite sandbox |
+| **Navigate & Route** | `terse query <id\|--last> "<terms>"` | SQLite FTS5 search over an archived output (incl. Rust raw sidecars) |
 | | `terse expand <id\|--last> [start end]` | Expand a line range (or `--raw` full text) of an archive |
 | | `terse repomap [--budget 400]` | Generate a byte-stable PageRank structural repo map |
 | | `terse route "<task>"` | Zero-cost task complexity router (tier + score) |
 | | `terse routing [status\|on\|off\|verify\|model\|check]` | Configure low-cost subagent routing + zero-token verification |
 | **Run & Wrap** | `terse exec --sid <id> -- <cmd...>` | Bounded argv runner with cross-run command delta-diff & raw archive |
 | | `terse mcp-proxy [--lazy-tools] -- <cmd...>` | Compress any stdio MCP server's schemas and tool responses |
-| **Tune** | `terse config show \| set <k>=<v> \| reset` | Inspect, modify, or reset persistent settings |
+| **Tune & Maintain** | `terse config show \| set <k>=<v> \| reset` | Inspect, modify, or reset persistent settings |
 | | `terse microskills [forget\|unforget]` | Manage learned repo EnvFacts micro-skills |
 | | `terse toolprune [status\|apply\|restore]` | Review, apply, or restore unused tool pruning |
 | | `terse coach` | Project-level token-efficiency coaching |
@@ -293,7 +307,7 @@ Invoke via `scripts/terse` (macOS/Linux), `scripts/terse.cmd` (Windows), or `pyt
 
 ## Configuration
 
-All local state and settings live in `~/.terser/` (override with `TERSER_HOME`). Change settings persistently with `terse config set <key>=<value>` or reset with `terse config reset`.
+All local state and settings live in `~/.terser/` (override with `TERSER_HOME`). Persist changes with `terse config set <key>=<value>` or reset with `terse config reset`.
 
 | Environment Variable | Effect |
 | :--- | :--- |
@@ -337,10 +351,10 @@ Additional config keys (`terse config set <key>=false` to disable):
 
 ---
 
-## Safety & Privacy
+## Safety, Privacy & Reliability
 
-- **100% Local:** Zero telemetry and zero background network calls. Outbound requests happen only when the agent explicitly invokes `fetch_and_index` with a URL, or fetches a YouTube transcript via your local `yt-dlp`.
-- **Fail-Open Architecture:** Every lifecycle hook is wrapped in defensive error handling and exits `0` so an unexpected edge case never blocks your agent.
+- **100% Local:** Zero telemetry and zero background network calls. Outbound requests happen only when explicitly invoking `fetch_and_index` with a URL or extracting a YouTube transcript via your local `yt-dlp`.
+- **Fail-Open & Self-Healing:** Every lifecycle hook is wrapped in defensive error handling and exits `0` so an edge case never blocks your agent. Corrupted SQLite sandbox databases auto-heal on connect and via `terse doctor`.
 - **Secret-Safe & Reversible:** Oversized outputs are redacted for secrets/PII before indexing and remain searchable in `~/.terser/sandbox.db` via `terse query --last` or `terse expand --last`. Shadow mode (`terse config set shadow=true`) lets you audit decisions with zero mutation.
 
 ---
@@ -370,10 +384,8 @@ python scripts/install.py --bump patch --build-dist
 
 ---
 
-## Third-Party Code
+## Third-Party Code & License
 
 `vendor/tokeneconomizer/` is TokenEconomizer (MIT, © Microsoft), bundled with its `LICENSE`. All other code—including analytics, command handlers, code outlines, shell safety gates, and redaction—is Terser's own. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## License
-
-[GNU General Public License v3.0 (GPL-3.0)](LICENSE) © 2026 HyperExtendedReality
+Licensed under the [GNU General Public License v3.0 (GPL-3.0)](LICENSE) © 2026 HyperExtendedReality.

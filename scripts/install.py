@@ -238,11 +238,11 @@ def _build_antigravity_hooks(plugin_dir: Path, python_exe: str) -> dict[str, Any
             "SessionStart": [{"type": "command", "command": cmd("SessionStart"), "timeout": 10}],
             "PreInvocation": [{"type": "command", "command": cmd("PreInvocation"), "timeout": 10}],
             "PreToolUse": [{
-                "matcher": "run_command|read_file|view_file|call_mcp_tool|mcp_.*|invoke_subagent|swarm|define_subagent",
+                "matcher": "run_command|read_file|view_file|grep_search|find_by_name|call_mcp_tool|mcp_.*|invoke_subagent|swarm|define_subagent",
                 "hooks": [{"type": "command", "command": cmd("PreToolUse"), "timeout": 10}],
             }],
             "PostToolUse": [{
-                "matcher": "run_command|read_file|view_file|edit_file|write_file|call_mcp_tool|mcp_.*",
+                "matcher": "run_command|read_file|view_file|edit_file|write_file|replace_file_content|multi_replace_file_content|grep_search|find_by_name|call_mcp_tool|mcp_.*|invoke_subagent|swarm",
                 "hooks": [{"type": "command", "command": cmd("PostToolUse"), "timeout": 10}],
             }],
             "Stop": [{"type": "command", "command": cmd("Stop"), "timeout": 15}],
