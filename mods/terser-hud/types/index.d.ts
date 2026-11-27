@@ -66,6 +66,7 @@ declare module 'claude-code' {
       hud: Shaped<Hud | null>
       fetchError: string | null
       isHidden: boolean
+      autoOpened: boolean
     }
   }
 }

@@ -9,6 +9,8 @@ const DEFAULT_ROOT = 'C:/Dev/Game Dev/plugins/terser'
 const hud = atom({ plugin: 'terser-hud', key: 'hud' } as const, null, { shape: 'hud-1' })
 const fetchError = atom({ plugin: 'terser-hud', key: 'fetchError' } as const, null)
 const isHidden = atom({ plugin: 'terser-hud', key: 'isHidden' } as const, false)
+// Session-scoped: set once the pane auto-opened, so a hot reload doesn't reopen a pane the person closed.
+const autoOpened = atom({ plugin: 'terser-hud', key: 'autoOpened' } as const, false)
 
 // ---------------------------------------------------------------- formatting
 
@@ -186,6 +188,12 @@ export const register: Register = on => {
       description: 'Open the Terser details pane (savings, usage, cost, router, engines)',
     })
     void refresh($)
+    // Show the details pane on every new session. Not awaited: with no surface attached
+    // yet, the open waits for one.
+    if (!(await read($, autoOpened))) {
+      await update($, autoOpened, () => true)
+      void openPane($).catch(() => {})
+    }
     // Keep the band current between turns (savings land from hooks outside turns too).
     if (!ticking) {
       ticking = true
