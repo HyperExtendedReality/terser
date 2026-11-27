@@ -43,7 +43,7 @@ from runtime.config import (
 )
 
 _MAX_FILE_BYTES = 1024 * 1024       # 1 MB safety cap
-_MAX_SNAPSHOT_BYTES = 128 * 1024    # 128 KB delta-diff snapshot cap
+_MAX_SNAPSHOT_BYTES = 256 * 1024    # 256 KB delta-diff snapshot cap
 _MAX_STORE_ENTRIES = 160
 _STORE_TTL_SECONDS = 7 * 86400
 _SOFT_DENY_CAP = 1                  # Always allow on immediate retry!
@@ -430,8 +430,9 @@ _DATA_EXTS = frozenset({".json", ".yaml", ".yml", ".toml"})
 _LOG_EXTS = frozenset({".log", ".ndjson", ".jsonl", ".csv", ".tsv"})
 _LOCKFILE_NAME_RE = re.compile(
     r"(?i)(?:^(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|cargo\.lock|"
-    r"poetry\.lock|uv\.lock|pipfile\.lock|composer\.lock|gemfile\.lock|go\.sum)$|"
-    r"\.(?:min\.js|min\.css|map|snap)$)"
+    r"poetry\.lock|uv\.lock|pipfile\.lock|composer\.lock|gemfile\.lock|"
+    r"bun\.lockb?|flake\.lock|mix\.lock|podfile\.lock|packages\.lock\.json|go\.sum)$|"
+    r"\.(?:min\.js|min\.css|map|snap|g\.dart)$|\.generated\.)"
 )
 _MD_HEADING_RE = re.compile(r"^(#{1,4})\s+(.+?)\s*#*$")
 _YAML_TOP_RE = re.compile(r"^([A-Za-z0-9_.-]+)\s*:\s*(.*)$")

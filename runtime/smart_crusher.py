@@ -27,7 +27,7 @@ from runtime import context_sandbox
 
 _ENVELOPE_KEYS = ("items", "results", "data", "entries", "records", "files", "issues", "nodes", "events", "hits")
 _ERROR_RE = re.compile(r"(?i)\b(?:error|err|fail|failed|failure|exception|critical|fatal|panic|timeout|warn|warning)\b")
-_MIN_CHARS = 1200
+_MIN_CHARS = 500
 _SAMPLE_THRESHOLD = 40
 
 
@@ -77,9 +77,53 @@ def _outlier_indices(items: list[dict[str, Any]], max_outliers: int = 8) -> set[
     return out
 
 
+def _common_str_prefix(values: list[str], min_len: int = 10) -> str:
+    if not values or len(values[0]) < min_len:
+        return ""
+    pfx = values[0]
+    for v in values[1:]:
+        limit = min(len(pfx), len(v))
+        i = 0
+        while i < limit and pfx[i] == v[i]:
+            i += 1
+        pfx = pfx[:i]
+        if len(pfx) < min_len:
+            return ""
+    return pfx
+
+
+def _flatten_uniform_nested(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Losslessly flatten one level of uniform nested dicts (<=12 keys) into dotted keys."""
+    if len(items) < 5:
+        return items
+    nested_keys: list[str] = []
+    for k in items[0].keys():
+        if "." in str(k):
+            continue
+        if all(isinstance(it.get(k), dict) and 1 <= len(it[k]) <= 12 for it in items):
+            # Avoid key collisions with existing top-level keys
+            sub_keys = {f"{k}.{sk}" for it in items for sk in it[k].keys()}
+            if not any(sk in it for it in items for sk in sub_keys):
+                nested_keys.append(k)
+    if not nested_keys:
+        return items
+    flat: list[dict[str, Any]] = []
+    for it in items:
+        row: dict[str, Any] = {}
+        for k, v in it.items():
+            if k in nested_keys:
+                for sk, sv in v.items():
+                    row[f"{k}.{sk}"] = sv
+            else:
+                row[k] = v
+        flat.append(row)
+    return flat
+
+
 def _factor_and_columnize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not items:
         return None
+    items = _flatten_uniform_nested(items)
     keys: list[str] = []
     seen: set[str] = set()
     for item in items:
@@ -102,13 +146,46 @@ def _factor_and_columnize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
         else:
             var_keys.append(k)
 
+    # Lossless sparse/dominant-default factoring: if >=80% of rows share a single primitive
+    # default value (e.g. None, False, ""), store default + sparse {row_idx: val} map.
+    defaults: dict[str, Any] = {}
+    sparse: dict[str, dict[str, Any]] = {}
+    n_items = len(items)
+    if n_items >= 10:
+        kept_var: list[str] = []
+        for k in var_keys:
+            counts: dict[tuple[type, Any], int] = {}
+            all_prim = True
+            for it in items:
+                v = it.get(k)
+                if v is None or isinstance(v, (bool, int, float, str)):
+                    tk = (type(v), v)
+                    counts[tk] = counts.get(tk, 0) + 1
+                else:
+                    all_prim = False
+                    break
+            if all_prim and counts:
+                best_tk, best_cnt = max(counts.items(), key=lambda kv: kv[1])
+                if best_cnt >= int(n_items * 0.80) and (n_items - best_cnt) <= max(3, n_items // 5):
+                    def_val = best_tk[1]
+                    exc = {str(i): it.get(k) for i, it in enumerate(items) if it.get(k) != def_val or type(it.get(k)) is not best_tk[0]}
+                    # Only factor if it actually saves bytes vs dense column
+                    dense_est = sum(len(json.dumps(it.get(k), separators=(",", ":"), default=str)) + 1 for it in items)
+                    sparse_est = len(json.dumps(exc, separators=(",", ":"), default=str)) + len(k) + 16
+                    if sparse_est < int(dense_est * 0.75):
+                        defaults[k] = def_val
+                        sparse[k] = exc
+                        continue
+            kept_var.append(k)
+        var_keys = kept_var
+
     if len(var_keys) > 30:
         return None
 
     # Lossless: integer columns that advance by a fixed step become {"start", "step"}
     # (row i holds start + i * step), e.g. sequential ids.
     seqs: dict[str, dict[str, int]] = {}
-    if len(items) >= 5:
+    if n_items >= 5:
         for k in list(var_keys):
             vals = [it.get(k) for it in items]
             if not all(type(v) is int and k in it for v, it in zip(vals, items)):
@@ -118,12 +195,65 @@ def _factor_and_columnize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
                 seqs[k] = {"start": vals[0], "step": step}
                 var_keys.remove(k)
 
-    rows = [[it.get(k) for k in var_keys] for it in items]
+    # Lossless: common string prefix factoring (URLs, paths, ARNs, timestamps)
+    prefixes: dict[str, str] = {}
+    if n_items >= 5:
+        for k in var_keys:
+            vals = [it.get(k) for it in items]
+            if all(isinstance(v, str) for v in vals):
+                pfx = _common_str_prefix(vals, min_len=10)
+                if pfx and len(pfx) * (n_items - 1) > len(pfx) + len(k) + 14:
+                    prefixes[k] = pfx
+
+    # Lossless: low-cardinality enum/dictionary encoding (2..8 distinct strings across >=12 rows)
+    dicts: dict[str, list[str]] = {}
+    dict_maps: dict[str, dict[str, int]] = {}
+    if n_items >= 12:
+        for k in var_keys:
+            if k in prefixes:
+                continue
+            vals = [it.get(k) for it in items]
+            if not all(isinstance(v, str) and len(v) >= 4 for v in vals):
+                continue
+            uniq: list[str] = []
+            umap: dict[str, int] = {}
+            for v in vals:
+                if v not in umap:
+                    umap[v] = len(uniq)
+                    uniq.append(v)
+                    if len(uniq) > 8:
+                        break
+            if 2 <= len(uniq) <= 8:
+                raw_col_bytes = sum(len(v) + 3 for v in vals)
+                dict_col_bytes = sum(len(u) + 3 for u in uniq) + n_items * 2 + len(k) + 12
+                if dict_col_bytes < int(raw_col_bytes * 0.80):
+                    dicts[k] = uniq
+                    dict_maps[k] = umap
+
+    rows: list[list[Any]] = []
+    for it in items:
+        row: list[Any] = []
+        for k in var_keys:
+            v = it.get(k)
+            if k in prefixes and isinstance(v, str):
+                v = v[len(prefixes[k]):]
+            elif k in dict_maps and isinstance(v, str):
+                v = dict_maps[k][v]
+            row.append(v)
+        rows.append(row)
+
     out: dict[str, Any] = {"_format": "columnar"}
     if consts:
         out["_const"] = consts
+    if defaults:
+        out["_default"] = defaults
+        out["_sparse"] = sparse
     if seqs:
         out["_seq"] = seqs
+    if prefixes:
+        out["_prefix"] = prefixes
+    if dicts:
+        out["_dict"] = dicts
     out["cols"] = var_keys
     out["rows"] = rows
     return out
@@ -292,10 +422,10 @@ def crush_json(
         targets = _find_all_nested_arrays(data, max_depth=5, max_arrays=4)
 
     if not targets:
-        # Lossless minification fallback for large pretty-printed single JSON objects/arrays
-        if not is_ndjson and len(stripped) >= 1500:
+        # Lossless minification fallback for pretty-printed single JSON objects/arrays
+        if not is_ndjson and len(stripped) >= _MIN_CHARS:
             minified = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-            if len(minified) < int(len(stripped) * 0.80):
+            if len(minified) < int(len(stripped) * 0.95) and (len(stripped) - len(minified)) >= 40:
                 return minified
         return None
 

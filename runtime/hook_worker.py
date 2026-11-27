@@ -34,6 +34,7 @@ _MAX_LIFETIME_S = 4 * 3600.0
 _MAX_REQUEST_BYTES = 6 * 1024 * 1024
 _ACK_MARGIN_S = 0.25
 _RECV_TIMEOUT_S = 2.0
+_CODE_SIG_CHECK_INTERVAL_S = 2.0
 
 
 def _code_signature() -> tuple[tuple[str, int, int], ...]:
@@ -86,12 +87,18 @@ def _parse_request(data: bytes | None, token: str) -> tuple[dict[str, Any], byte
 
 def _install_context(req: dict[str, Any]) -> None:
     env = {str(k): str(v) for k, v in req["env"].items()}
-    os.environ.clear()
-    os.environ.update(env)
+    cur = os.environ
+    for k in list(cur.keys()):
+        if k not in env:
+            del cur[k]
+    for k, v in env.items():
+        if cur.get(k) != v:
+            cur[k] = v
     cwd = str(req.get("cwd") or "")
     if cwd:
         try:
-            os.chdir(cwd)
+            if os.getcwd() != cwd:
+                os.chdir(cwd)
         except OSError:
             pass
 
@@ -120,6 +127,7 @@ def serve(
             "started": time.time(),
         })
         started = time.time()
+        last_sig_check = started
         while time.time() - started < _MAX_LIFETIME_S:
             try:
                 conn, _ = srv.accept()
@@ -131,7 +139,11 @@ def serve(
                     parsed = _parse_request(_recv_request(conn), token)
                 except OSError:
                     continue
-                stale = _code_signature() != signature
+                now = time.time()
+                stale = False
+                if now - last_sig_check >= _CODE_SIG_CHECK_INTERVAL_S:
+                    last_sig_check = now
+                    stale = _code_signature() != signature
                 if parsed is None or stale:
                     try:
                         conn.sendall(b"0")

@@ -179,6 +179,11 @@ def _chunk_lines(lines: list[str]) -> list[tuple[int, int, str]]:
     return chunks
 
 
+_INITIALIZED_DBS: dict[str, int] = {}
+_HAS_FTS5_CACHE: dict[str, bool] = {}
+_HAS_TRIGRAM_CACHE: dict[str, bool] = {}
+
+
 def _db_path(env: dict[str, str] | None = None) -> Path:
     return state_home(env) / "sandbox.db"
 
@@ -237,11 +242,30 @@ def _ensure_fts_table(conn: sqlite3.Connection) -> bool:
 
 def _connect(env: dict[str, str] | None = None) -> sqlite3.Connection:
     p = _db_path(env)
+    key = str(p)
+    cached_ver = _INITIALIZED_DBS.get(key)
+    if cached_ver is not None and p.is_file():
+        try:
+            c = sqlite3.connect(key, timeout=3.0)
+            row = c.execute("PRAGMA schema_version").fetchone()
+            if row is not None and int(row[0]) == cached_ver:
+                c.execute("PRAGMA synchronous=NORMAL")
+                c.execute("PRAGMA temp_store=MEMORY")
+                return c
+            c.close()
+        except sqlite3.DatabaseError:
+            pass
+        _INITIALIZED_DBS.pop(key, None)
+        _HAS_FTS5_CACHE.pop(key, None)
+        _HAS_TRIGRAM_CACHE.pop(key, None)
+
     p.parent.mkdir(parents=True, exist_ok=True)
 
     def _open_and_init() -> sqlite3.Connection:
-        c = sqlite3.connect(str(p), timeout=3.0)
+        c = sqlite3.connect(key, timeout=3.0)
         c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA temp_store=MEMORY")
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS blobs (
@@ -276,9 +300,14 @@ def _connect(env: dict[str, str] | None = None) -> sqlite3.Connection:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_ws_ts ON session_events (workspace, created_at DESC)"
     )
-    _ensure_fts_table(conn)
+    has_fts = _ensure_fts_table(conn)
     _ensure_blob_session_column(conn)
-    _ensure_trigram_table(conn)
+    has_tri = _ensure_trigram_table(conn)
+    ver_row = conn.execute("PRAGMA schema_version").fetchone()
+    if ver_row is not None:
+        _INITIALIZED_DBS[key] = int(ver_row[0])
+    _HAS_FTS5_CACHE[key] = has_fts
+    _HAS_TRIGRAM_CACHE[key] = has_tri
     return conn
 
 

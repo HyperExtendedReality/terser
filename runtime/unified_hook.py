@@ -36,7 +36,43 @@ _PLUGIN_ROOT = _THIS_DIR.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
-from runtime import cmd_delta, codex_hooks, index_bridge, loop_guard, output_compressor, read_funnel, session_brief
+class _LazyModule:
+    """Defer importing heavy runtime submodules until first attribute access."""
+
+    __slots__ = ("_mod_name", "_global_name")
+
+    def __init__(self, mod_name: str, global_name: str) -> None:
+        object.__setattr__(self, "_mod_name", mod_name)
+        object.__setattr__(self, "_global_name", global_name)
+
+    def _resolve(self) -> Any:
+        import importlib
+
+        mod_name = object.__getattribute__(self, "_mod_name")
+        global_name = object.__getattribute__(self, "_global_name")
+        mod = importlib.import_module(mod_name)
+        globals()[global_name] = mod
+        return mod
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self._resolve(), attr)
+
+    def __setattr__(self, attr: str, value: Any) -> None:
+        setattr(self._resolve(), attr, value)
+
+    def __delattr__(self, attr: str) -> None:
+        delattr(self._resolve(), attr)
+
+
+cmd_delta: Any = _LazyModule("runtime.cmd_delta", "cmd_delta")
+codex_hooks: Any = _LazyModule("runtime.codex_hooks", "codex_hooks")
+index_bridge: Any = _LazyModule("runtime.index_bridge", "index_bridge")
+loop_guard: Any = _LazyModule("runtime.loop_guard", "loop_guard")
+output_compressor: Any = _LazyModule("runtime.output_compressor", "output_compressor")
+read_funnel: Any = _LazyModule("runtime.read_funnel", "read_funnel")
+session_brief: Any = _LazyModule("runtime.session_brief", "session_brief")
+
+
 from runtime.config import (
     atomic_write_json,
     ensure_vendor_paths,

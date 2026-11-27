@@ -132,7 +132,7 @@ def outline(text: str, file_path: str) -> str | None:
         span = f"L{idx + 1}-{end}" if end > idx + 1 else f"L{idx + 1}"
         indent = len(line) - len(line.lstrip(" \t"))
         pad = "  " * min(4, indent // 2 if "\t" not in line[:indent] else indent)
-        sig = stripped.rstrip("{").rstrip()
+        sig = re.sub(r"\s{2,}", " ", stripped.rstrip("{").rstrip())
         if len(sig) > _SIG_CHARS:
             sig = sig[: _SIG_CHARS - 3] + "..."
         rows.append(f"{pad}{span}: {sig}")

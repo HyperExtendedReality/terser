@@ -1,5 +1,5 @@
 use crate::config::{
-    atomic_write_json, canonical_json, now_secs, record_funnel_event, record_savings,
+    atomic_write_map, canonical_json, now_secs, record_funnel_event, record_savings,
     safe_sid_filename, state_home, tier_backed_off, valid_sid, Config,
 };
 use crate::difflib::{py_slice, splitlines_keepends, unified_diff};
@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
-const MAX_SNAPSHOT_BYTES: usize = 128 * 1024;
+const MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
 const MAX_STORE_ENTRIES: usize = 160;
 const SOFT_DENY_CAP: i64 = 1;
 const DELTA_MAX_DIFF_LINES: usize = 60;
@@ -198,7 +198,7 @@ fn save_store(sid: &str, store: &mut Map<String, Value>) {
         }
     }
     externalize_snapshots(store);
-    atomic_write_json(&cache_path(sid), &Value::Object(store.clone()));
+    atomic_write_map(&cache_path(sid), store);
 }
 
 fn blob_path(digest: &str) -> PathBuf {
@@ -391,6 +391,72 @@ fn merge_intervals(
     merged
 }
 
+fn uncovered_subranges(
+    prev: &Map<String, Value>,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+    total_lines: i64,
+) -> (Vec<(i64, i64)>, i64) {
+    let rs = start_line.unwrap_or(1).max(1);
+    let re = end_line.unwrap_or(total_lines).min(total_lines);
+    if re < rs {
+        return (Vec::new(), 0);
+    }
+    let mut clipped: Vec<(i64, i64)> = Vec::new();
+    let mut push_iv = |ps: Option<i64>, pe: Option<i64>| {
+        let s = ps.unwrap_or(1).max(rs);
+        let e = pe.unwrap_or(total_lines).min(re);
+        if e >= s {
+            clipped.push((s, e));
+        }
+    };
+    if let Some(Value::Array(ivs)) = prev.get("intervals") {
+        if !ivs.is_empty() {
+            for iv in ivs {
+                if let Value::Array(pair) = iv {
+                    if pair.len() == 2 {
+                        push_iv(opt_i64(pair.first()), opt_i64(pair.get(1)));
+                    }
+                }
+            }
+        } else {
+            push_iv(opt_i64(prev.get("start")), opt_i64(prev.get("end")));
+        }
+    } else {
+        push_iv(opt_i64(prev.get("start")), opt_i64(prev.get("end")));
+    }
+    if clipped.is_empty() {
+        return (vec![(rs, re)], 0);
+    }
+    clipped.sort_by_key(|&(s, e)| (s, e));
+    let mut merged: Vec<(i64, i64)> = Vec::new();
+    for (s, e) in clipped {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 + 1 {
+                last.1 = last.1.max(e);
+            } else {
+                merged.push((s, e));
+            }
+        } else {
+            merged.push((s, e));
+        }
+    }
+    let mut uncovered: Vec<(i64, i64)> = Vec::new();
+    let mut cov_lines: i64 = 0;
+    let mut cur = rs;
+    for (s, e) in merged {
+        if s > cur {
+            uncovered.push((cur, s - 1));
+        }
+        cov_lines += e - s + 1;
+        cur = e + 1;
+    }
+    if cur <= re {
+        uncovered.push((cur, re));
+    }
+    (uncovered, cov_lines)
+}
+
 fn intervals_to_json(ivs: &[(i64, Option<i64>)]) -> Value {
     Value::Array(ivs.iter().map(|(s, e)| json!([s, e])).collect())
 }
@@ -408,11 +474,19 @@ fn is_lockfile_or_minified(basename: &str) -> bool {
             | "pipfile.lock"
             | "composer.lock"
             | "gemfile.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "flake.lock"
+            | "mix.lock"
+            | "podfile.lock"
+            | "packages.lock.json"
             | "go.sum"
     ) || low.ends_with(".min.js")
         || low.ends_with(".min.css")
         || low.ends_with(".snap")
         || low.ends_with(".map")
+        || low.ends_with(".g.dart")
+        || low.contains(".generated.")
 }
 
 fn format_range(start: Option<i64>, end: Option<i64>) -> String {
@@ -425,14 +499,17 @@ fn format_range(start: Option<i64>, end: Option<i64>) -> String {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for b in digest {
-        out.push_str(&format!("{b:02x}"));
+    let mut buf = [0u8; 64];
+    for (i, &b) in digest.iter().enumerate() {
+        buf[i * 2] = HEX[(b >> 4) as usize];
+        buf[i * 2 + 1] = HEX[(b & 0x0f) as usize];
     }
-    out
+    // SAFETY: `buf` contains only ASCII hex digits.
+    unsafe { String::from_utf8_unchecked(buf.to_vec()) }
 }
 
 fn opt_i64(val: Option<&Value>) -> Option<i64> {
@@ -638,7 +715,7 @@ pub fn check_read(
             return FunnelOutcome::Allow;
         }
 
-        // Tier 0b: Partial-overlap range trimming -> delegate to Python when >=40 lines overlap
+        // Tier 0b: Partial-overlap range trimming natively in Rust (>=40 lines & >=40% already loaded)
         if prev_sha == sha
             && soft_denies < SOFT_DENY_CAP
             && !cfg.shadow
@@ -648,23 +725,44 @@ pub fn check_read(
             let total_lines = (raw_bytes.iter().filter(|&&b| b == b'\n').count() + 1) as i64;
             let rs = start_line.unwrap_or(1).max(1);
             let re = end_line.unwrap_or(total_lines).min(total_lines);
-            let mut has_large_overlap = false;
-            if let Some(Value::Array(ivs)) = prev.get("intervals") {
-                for iv in ivs {
-                    if let Value::Array(pair) = iv {
-                        if pair.len() == 2 {
-                            let s = opt_i64(pair.first()).unwrap_or(1).max(rs);
-                            let e = opt_i64(pair.get(1)).unwrap_or(total_lines).min(re);
-                            if e >= s && (e - s + 1) >= 40 {
-                                has_large_overlap = true;
-                                break;
-                            }
-                        }
-                    }
+            let req_span = (re - rs + 1).max(1);
+            let (uncovered, cov_lines) = uncovered_subranges(&prev, start_line, end_line, total_lines);
+            if !uncovered.is_empty()
+                && cov_lines >= 40
+                && (cov_lines as f64 / req_span as f64) >= 0.40
+            {
+                prev.insert("soft_denies".into(), json!(soft_denies + 1));
+                prev.insert("ts".into(), json!(now));
+                prev.insert("last_tier".into(), Value::String("t0b".into()));
+                record_funnel_event("t0b", "served", host);
+                if let Some(Value::Object(reads)) = store.get_mut("reads") {
+                    reads.insert(key, Value::Object(prev));
                 }
-            }
-            if has_large_overlap {
-                return FunnelOutcome::Delegate;
+                save_store(sid, &mut store);
+                let spans_str = uncovered
+                    .iter()
+                    .take(4)
+                    .map(|(s, e)| format!("L{s}-L{e}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let range_hint = if host == "antigravity" {
+                    "StartLine/EndLine"
+                } else {
+                    "offset/limit"
+                };
+                let reason = format!(
+                    "[Terser] `{basename}`: {cov_lines}/{req_span} requested lines are already in context. \
+                     Read only the unread span ({spans_str}) using {range_hint}, or retry to load the full range."
+                );
+                let est_saved = ((raw_bytes.len() as f64) * (cov_lines as f64 / total_lines.max(1) as f64)) as usize;
+                record_savings(
+                    "read_trim",
+                    est_saved.max(reason.len() + 1),
+                    reason.len(),
+                    host,
+                    &basename,
+                );
+                return FunnelOutcome::Deny(reason);
             }
         }
 

@@ -121,7 +121,7 @@ def collapse_duplicate_lines(text: str, min_run: int = 3) -> str:
 def fold_uniform_json(text: str) -> str | None:
     """Fold a large JSON array of uniform flat objects into lossless columnar JSON."""
     stripped = text.strip()
-    if len(stripped) < 1200 or not stripped.startswith("[") or not stripped.endswith("]"):
+    if len(stripped) < 500 or not stripped.startswith("[") or not stripped.endswith("]"):
         return None
     try:
         data = json.loads(stripped)
@@ -299,8 +299,9 @@ def group_grep_output(text: str) -> str:
 
 _LOCKFILE_OR_GEN_RE = re.compile(
     r"(?i)(?:^|/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|cargo\.lock|"
-    r"poetry\.lock|uv\.lock|pipfile\.lock|composer\.lock|gemfile\.lock|go\.sum|"
-    r"dist/.*|.*_pb2\.py|.*\.(?:min\.js|min\.css|map|pb\.go|generated\.[a-z0-9]+|snap|svg))$"
+    r"poetry\.lock|uv\.lock|pipfile\.lock|composer\.lock|gemfile\.lock|"
+    r"bun\.lockb?|flake\.lock|mix\.lock|podfile\.lock|packages\.lock\.json|go\.sum|"
+    r"dist/.*|.*_pb2\.py|.*\.(?:min\.js|min\.css|map|pb\.go|generated\.[a-z0-9]+|g\.dart|snap|svg))$"
 )
 _DIFF_HEADER_RE = re.compile(r"^diff --git a/(.+?) b/(.+?)$")
 _DIFF_INDEX_RE = re.compile(r"^index [0-9a-f]+\.\.[0-9a-f]+(?: \d+)?$")
@@ -723,7 +724,7 @@ def compact_file_list(paths: list[str]) -> str:
         else:
             lines.extend(names)
     grouped = "\n".join(lines)
-    return grouped if len(grouped) < int(len(flat) * 0.85) else flat
+    return grouped if len(grouped) < int(len(flat) * 0.95) and (len(flat) - len(grouped)) >= 20 else flat
 
 
 def apply_stream_filters(text: str, command: str) -> str:

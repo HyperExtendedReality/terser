@@ -416,5 +416,54 @@ class FunnelMetricsAndStabilityTests(_Base):
         self.assertEqual(first, second)
 
 
+class SmartCrusherAndLinterLosslessTests(unittest.TestCase):
+    def test_smart_crusher_lossless_prefix_dict_sparse_and_nested(self) -> None:
+        import json
+        from runtime import smart_crusher
+
+        items = [
+            {
+                "id": i,
+                "status": "completed" if i % 2 else "in_progress",
+                "url": f"https://api.github.com/repos/org/project/issues/{i}",
+                "user": {"login": f"dev{i % 3}", "type": "User"},
+                "error": "timeout" if i == 7 else None,
+                "draft": False,
+            }
+            for i in range(1, 25)
+        ]
+        raw = json.dumps(items, indent=2)
+        crushed = smart_crusher.crush_json(raw, allow_sample=False)
+        self.assertIsNotNone(crushed)
+        assert crushed is not None
+        self.assertLess(len(crushed), int(len(raw) * 0.25))
+        doc = json.loads(crushed)
+        self.assertEqual(doc["_format"], "columnar")
+        self.assertEqual(doc["_const"]["user.type"], "User")
+        self.assertEqual(doc["_const"]["draft"], False)
+        self.assertEqual(doc["_seq"]["id"], {"start": 1, "step": 1})
+        self.assertEqual(doc["_prefix"]["url"], "https://api.github.com/repos/org/project/issues/")
+        self.assertIn("status", doc["_dict"])
+        self.assertEqual(doc["_default"]["error"], None)
+        self.assertEqual(doc["_sparse"]["error"], {"6": "timeout"})
+
+    def test_linter_handler_preserves_every_diagnostic_and_dedups_footers(self) -> None:
+        from runtime import command_handlers
+
+        lines = []
+        for i in range(1, 8):
+            lines.append(f"src/mod_{i}.py:{i * 10}:5: error: Incompatible return value type [return-value]")
+            lines.append("  note: See https://mypy.readthedocs.io/en/stable/error_codes.html")
+            lines.append("  help: Fix the return annotation")
+        lines.append("Found 7 errors in 7 files (checked 20 source files)")
+        raw = "\n".join(lines) + "\n"
+        out = command_handlers.compress("mypy src/", raw, returncode=1)
+        for i in range(1, 8):
+            self.assertIn(f"src/mod_{i}.py:{i * 10}:5: error: Incompatible return value type", out)
+        self.assertIn("Found 7 errors in 7 files", out)
+        self.assertEqual(out.count("See https://mypy.readthedocs.io"), 1)
+        self.assertIn("repeated linter note/help", out)
+
+
 if __name__ == "__main__":
     unittest.main()

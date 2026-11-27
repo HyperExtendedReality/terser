@@ -44,7 +44,7 @@ if str(_THIS.parents[1]) not in sys.path:
 
 _DESC_MAX = 300
 _PARAM_DESC_MAX = 160
-_COMPRESS_MIN = 1500
+_COMPRESS_MIN = 600
 _LOSSLESS_MAX = 8000
 _DROP_SCHEMA_KEYS = ("examples", "$schema", "title", "$comment")
 

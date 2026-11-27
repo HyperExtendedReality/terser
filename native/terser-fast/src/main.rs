@@ -464,7 +464,13 @@ fn handle_pre_tool_use(host: &str, payload: &Map<String, Value>, cfg: &Config) -
             };
         }
 
-        if tool_name == "run_command" || tool_name == "grep_search" {
+        if tool_name == "grep_search" {
+            if gates::grep_pre_is_noop(host, args, cfg) {
+                return DispatchResult::Done(None);
+            }
+            return DispatchResult::Delegate;
+        }
+        if tool_name == "run_command" {
             return DispatchResult::Delegate;
         }
 
@@ -755,15 +761,32 @@ fn handle_post_tool_use(
             if let Some(obj) = tool_resp.and_then(|v| v.as_object()) {
                 let stdout_s = obj.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
                 let stderr_s = obj.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
-                let needs_py = |s: &str| {
+                let try_native_json = |s: &str| -> Result<Option<String>, ()> {
+                    if s.len() <= 300 {
+                        return Ok(None);
+                    }
                     let t = s.trim_start();
-                    s.len() > 16384 || t.starts_with('{') || t.starts_with('[')
+                    if t.starts_with('{') || t.starts_with('[') {
+                        if s.len() > 65536 {
+                            return Err(());
+                        }
+                        if let Some(crushed) = compress::crush_json_lossless(s) {
+                            return Ok(Some(crushed));
+                        }
+                        // Delegate NDJSON, >80-item arrays, or complex nested envelopes to Python SmartCrusher.
+                        return Err(());
+                    }
+                    if s.len() > 16384 {
+                        return Err(());
+                    }
+                    Ok(None)
                 };
-                if (stdout_s.len() > 300 && needs_py(stdout_s))
-                    || (stderr_s.len() > 300 && needs_py(stderr_s))
-                {
+                let Ok(stdout_json) = try_native_json(stdout_s) else {
                     return DispatchResult::Delegate;
-                }
+                };
+                let Ok(stderr_json) = try_native_json(stderr_s) else {
+                    return DispatchResult::Delegate;
+                };
                 if stdout_s.len() > 300 || stderr_s.len() > 300 {
                     let cmd = tool_input
                         .get("command")
@@ -787,7 +810,8 @@ fn handle_post_tool_use(
                     let mut updated_obj = obj.clone();
                     let mut changed = false;
                     if stdout_s.len() > 300 {
-                        let mut comp = compress::compress_output_with_ws(stdout_s, cmd, ws_opt);
+                        let mut comp = stdout_json
+                            .unwrap_or_else(|| compress::compress_output_with_ws(stdout_s, cmd, ws_opt));
                         let comp_len_before_delta = comp.len();
                         let mut delta_used = false;
                         if is_delta_eligible_cmd(cmd) {
@@ -796,7 +820,9 @@ fn handle_post_tool_use(
                             comp = delta_out;
                             delta_used = applied;
                         }
-                        if comp.len() < (stdout_s.len() * 85) / 100 {
+                        if comp.len() < (stdout_s.len() * 95) / 100
+                            && stdout_s.len().saturating_sub(comp.len()) >= 40
+                        {
                             if !delta_used && comp_len_before_delta < stdout_s.len() {
                                 record_savings(
                                     "output_compress",
@@ -811,8 +837,11 @@ fn handle_post_tool_use(
                         }
                     }
                     if stderr_s.len() > 300 {
-                        let comp_err = compress::compress_output_with_ws(stderr_s, cmd, ws_opt);
-                        if comp_err.len() < (stderr_s.len() * 85) / 100 {
+                        let comp_err = stderr_json
+                            .unwrap_or_else(|| compress::compress_output_with_ws(stderr_s, cmd, ws_opt));
+                        if comp_err.len() < (stderr_s.len() * 95) / 100
+                            && stderr_s.len().saturating_sub(comp_err.len()) >= 40
+                        {
                             record_savings(
                                 "output_compress",
                                 stderr_s.len(),
@@ -1286,6 +1315,8 @@ fn is_delta_eligible_cmd(cmd: &str) -> bool {
     let (head, rest) =
         if matches!(toks[0], "python" | "python3") && toks.len() >= 3 && toks[1] == "-m" {
             (toks[2], &toks[3..])
+        } else if toks[0] == "uv" && toks.len() >= 3 && toks[1] == "run" {
+            (toks[2], &toks[3..])
         } else if toks[0] == "npx" && toks.len() >= 2 {
             (toks[1], &toks[2..])
         } else {
@@ -1305,6 +1336,8 @@ fn is_delta_eligible_cmd(cmd: &str) -> bool {
             | "pyright"
             | "ruff"
             | "eslint"
+            | "biome"
+            | "oxlint"
             | "flake8"
     ) || (matches!(head, "npm" | "pnpm" | "yarn")
         && (matches!(sub, "test" | "lint" | "build" | "check")

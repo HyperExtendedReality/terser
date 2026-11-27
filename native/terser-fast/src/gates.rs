@@ -158,13 +158,17 @@ fn code_index_dir() -> PathBuf {
     PathBuf::from(raw)
 }
 
-/// Claude Grep PreToolUse: true when `index_bridge.try_answer_large_grep` would return None
-/// before touching the index (bad pattern, feature off, or no code index on disk at all).
+/// Claude/Antigravity Grep PreToolUse: true when `index_bridge.try_answer_large_grep` would
+/// return None before touching the index (bad pattern, feature off, or no code index on disk).
 pub fn grep_pre_is_noop(host: &str, tool_input: &Map<String, Value>, cfg: &Config) -> bool {
     if host == "codex" || !cfg.index_grep_answer || cfg.shadow {
         return true;
     }
-    let pattern = match tool_input.get("pattern") {
+    let raw_pat = tool_input
+        .get("pattern")
+        .or_else(|| tool_input.get("Query"))
+        .or_else(|| tool_input.get("query"));
+    let pattern = match raw_pat {
         Some(Value::String(s)) => s.trim().to_string(),
         Some(Value::Null) | None => String::new(),
         Some(_) => return false, // Python str()-coerces odd types; let it decide
@@ -381,18 +385,43 @@ pub fn stop_summary_is_noop(sid: &str, payload: &Map<String, Value>, cfg: &Confi
         .get("summary_shown")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let savings_path = state_home().join("savings.jsonl");
+    // O(1) fast-path: if savings.jsonl hasn't been modified since this session started, 0 tokens saved.
+    if let Ok(meta) = fs::metadata(&savings_path) {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        if mtime + 1.0 < started {
+            return true;
+        }
+    } else {
+        return true;
+    }
     let mut saved: u64 = 0;
-    for line in tail_lines(&state_home().join("savings.jsonl"), 1024 * 1024)
-        .iter()
-        .rev()
-    {
-        let Ok(Value::Object(rec)) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if rec.get("ts").and_then(Value::as_f64).unwrap_or(0.0) < started {
+    // Read progressively (64 KB first, expanding to 1 MB only if the session spans >64 KB of logs).
+    for window in [64 * 1024_u64, 1024 * 1024_u64] {
+        saved = 0;
+        let lines = tail_lines(&savings_path, window);
+        let mut reached_start = false;
+        for line in lines.iter().rev() {
+            let Ok(Value::Object(rec)) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if rec.get("ts").and_then(Value::as_f64).unwrap_or(0.0) < started {
+                reached_start = true;
+                break;
+            }
+            saved += as_u64(rec.get("saved_tok"));
+        }
+        if reached_start || saved >= 5000 && (last == 0 || saved >= 2 * last) {
             break;
         }
-        saved += as_u64(rec.get("saved_tok"));
+        if fs::metadata(&savings_path).map(|m| m.len()).unwrap_or(0) <= window {
+            break;
+        }
     }
     saved < 5000 || (last > 0 && saved < 2 * last)
 }

@@ -10,6 +10,9 @@ pub fn strip_ansi_and_progress(text: &str) -> String {
         return String::new();
     }
     let bytes = text.as_bytes();
+    if !bytes.contains(&0x1b) && !bytes.contains(&b'\r') {
+        return text.to_string();
+    }
     let n = bytes.len();
     let mut out = String::with_capacity(n);
     let mut i = 0;
@@ -123,12 +126,20 @@ fn is_lockfile_path(diff_header: &str) -> bool {
         "uv.lock",
         "composer.lock",
         "gemfile.lock",
+        "bun.lock",
+        "bun.lockb",
+        "flake.lock",
+        "mix.lock",
+        "podfile.lock",
+        "packages.lock.json",
         "go.sum",
         ".min.js",
         ".min.css",
         ".map",
         ".pb.go",
         "_pb2.py",
+        ".generated.",
+        ".g.dart",
         ".snap",
         ".svg",
         "/dist/",
@@ -736,6 +747,211 @@ pub fn compress_output(text: &str, command: &str) -> String {
     compress_output_with_ws(text, command, None)
 }
 
+/// Lossless native JSON minification & columnar folding for payloads <= 64 KB.
+/// Factors `_const` (identical across all rows), `_seq` (arithmetic integer step),
+/// and `_prefix` (common string prefix >= 10 chars across all rows).
+/// Returns `None` when not valid JSON or when savings are negligible.
+pub fn crush_json_lossless(text: &str) -> Option<String> {
+    use serde_json::{Map, Value};
+
+    let stripped = text.trim();
+    if stripped.len() < 500 || stripped.len() > 65536 {
+        return None;
+    }
+    let first = stripped.as_bytes()[0];
+    if first != b'{' && first != b'[' {
+        return None;
+    }
+    let val: Value = serde_json::from_str(stripped).ok()?;
+
+    fn common_prefix(strings: &[&str]) -> Option<String> {
+        let first = *strings.first()?;
+        if first.len() < 10 {
+            return None;
+        }
+        let mut prefix_len = first.len();
+        for s in &strings[1..] {
+            let mut m = 0;
+            for (a, b) in first.as_bytes().iter().zip(s.as_bytes().iter()) {
+                if a == b && m < prefix_len {
+                    m += 1;
+                } else {
+                    break;
+                }
+            }
+            prefix_len = m;
+            if prefix_len < 10 {
+                return None;
+            }
+        }
+        // Trim back to a valid UTF-8 char boundary
+        while prefix_len > 0 && !first.is_char_boundary(prefix_len) {
+            prefix_len -= 1;
+        }
+        if prefix_len < 10 {
+            return None;
+        }
+        Some(first[..prefix_len].to_string())
+    }
+
+    fn fold_array(items: &[Value]) -> Option<Value> {
+        if items.len() < 5 || items.len() > 80 {
+            return None;
+        }
+        let mut objs: Vec<&Map<String, Value>> = Vec::with_capacity(items.len());
+        for it in items {
+            objs.push(it.as_object()?);
+        }
+        let mut keys: Vec<String> = Vec::new();
+        for obj in &objs {
+            for k in obj.keys() {
+                if !keys.contains(k) {
+                    keys.push(k.clone());
+                }
+            }
+        }
+        if keys.is_empty() {
+            return None;
+        }
+        let mut consts = Map::new();
+        let mut var_keys: Vec<String> = Vec::new();
+        for k in &keys {
+            let first = objs[0].get(k).unwrap_or(&Value::Null);
+            if objs.iter().all(|o| o.get(k).unwrap_or(&Value::Null) == first) {
+                let is_empty = match first {
+                    Value::Null => true,
+                    Value::String(s) => s.is_empty(),
+                    Value::Array(a) => a.is_empty(),
+                    Value::Object(m) => m.is_empty(),
+                    _ => false,
+                };
+                if !is_empty {
+                    consts.insert(k.clone(), first.clone());
+                }
+            } else {
+                var_keys.push(k.clone());
+            }
+        }
+        if var_keys.len() > 30 {
+            return None;
+        }
+        let mut seqs = Map::new();
+        var_keys.retain(|k| {
+            let mut ints: Vec<i64> = Vec::with_capacity(objs.len());
+            for o in &objs {
+                match o.get(k).and_then(Value::as_i64) {
+                    Some(v) => ints.push(v),
+                    None => return true,
+                }
+            }
+            let step = ints[1] - ints[0];
+            if step != 0 && ints.windows(2).all(|w| w[1] - w[0] == step) {
+                let mut m = Map::new();
+                m.insert("start".into(), Value::from(ints[0]));
+                m.insert("step".into(), Value::from(step));
+                seqs.insert(k.clone(), Value::Object(m));
+                false
+            } else {
+                true
+            }
+        });
+        let mut prefixes: Vec<(String, String)> = Vec::new();
+        for k in &var_keys {
+            let strs: Option<Vec<&str>> = objs
+                .iter()
+                .map(|o| o.get(k).and_then(Value::as_str))
+                .collect();
+            if let Some(ss) = strs {
+                if let Some(pfx) = common_prefix(&ss) {
+                    if pfx.len() * (objs.len().saturating_sub(1)) > pfx.len() + k.len() + 12 {
+                        prefixes.push((k.clone(), pfx));
+                    }
+                }
+            }
+        }
+        let rows: Vec<Value> = objs
+            .iter()
+            .map(|o| {
+                let row: Vec<Value> = var_keys
+                    .iter()
+                    .map(|k| {
+                        let v = o.get(k).cloned().unwrap_or(Value::Null);
+                        if let Some((_, pfx)) = prefixes.iter().find(|(pk, _)| pk == k) {
+                            if let Value::String(s) = &v {
+                                if let Some(rest) = s.strip_prefix(pfx.as_str()) {
+                                    return Value::String(rest.to_string());
+                                }
+                            }
+                        }
+                        v
+                    })
+                    .collect();
+                Value::Array(row)
+            })
+            .collect();
+        let mut out = Map::new();
+        out.insert("_format".into(), Value::String("columnar".into()));
+        if !consts.is_empty() {
+            out.insert("_const".into(), Value::Object(consts));
+        }
+        if !seqs.is_empty() {
+            out.insert("_seq".into(), Value::Object(seqs));
+        }
+        if !prefixes.is_empty() {
+            let pmap: Map<String, Value> = prefixes
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect();
+            out.insert("_prefix".into(), Value::Object(pmap));
+        }
+        out.insert(
+            "cols".into(),
+            Value::Array(var_keys.into_iter().map(Value::String).collect()),
+        );
+        out.insert("rows".into(), Value::Array(rows));
+        Some(Value::Object(out))
+    }
+
+    const ENVELOPE_KEYS: &[&str] = &[
+        "items", "results", "data", "entries", "records", "files", "issues", "nodes", "events",
+        "hits",
+    ];
+    let mut folded_any = false;
+    let transformed = match &val {
+        Value::Array(arr) => {
+            if let Some(f) = fold_array(arr) {
+                folded_any = true;
+                f
+            } else {
+                val.clone()
+            }
+        }
+        Value::Object(map) => {
+            let mut out = map.clone();
+            for ek in ENVELOPE_KEYS {
+                if let Some(Value::Array(arr)) = map.get(*ek) {
+                    if let Some(f) = fold_array(arr) {
+                        out.insert((*ek).to_string(), f);
+                        folded_any = true;
+                        break;
+                    }
+                }
+            }
+            Value::Object(out)
+        }
+        _ => return None,
+    };
+
+    let encoded = serde_json::to_string(&transformed).ok()?;
+    let threshold_pct = if folded_any { 85 } else { 95 };
+    if encoded.len() < (stripped.len() * threshold_pct) / 100
+        && stripped.len().saturating_sub(encoded.len()) >= 40
+    {
+        return Some(encoded);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,5 +1044,27 @@ mod tests {
         assert!(!out.contains("index 111111"));
         assert!(out.contains("@@ -1,2 +1,2 @@"));
         assert!(out.contains("+let x = 2;"));
+    }
+
+    #[test]
+    fn crushes_json_losslessly_with_const_seq_prefix() {
+        let mut items = Vec::new();
+        for i in 1..=10 {
+            items.push(format!(
+                r#"{{"id": {i}, "org": "acme-corp", "url": "https://api.example.com/v2/repositories/item-{i}", "active": true}}"#
+            ));
+        }
+        let raw = format!("[\n  {}\n]", items.join(",\n  "));
+        let crushed = crush_json_lossless(&raw).expect("should fold losslessly");
+        assert!(crushed.len() < raw.len());
+        let parsed: serde_json::Value = serde_json::from_str(&crushed).unwrap();
+        assert_eq!(parsed["_format"], "columnar");
+        assert_eq!(parsed["_const"]["org"], "acme-corp");
+        assert_eq!(parsed["_seq"]["id"]["start"], 1);
+        assert_eq!(parsed["_seq"]["id"]["step"], 1);
+        assert_eq!(
+            parsed["_prefix"]["url"],
+            "https://api.example.com/v2/repositories/item-"
+        );
     }
 }

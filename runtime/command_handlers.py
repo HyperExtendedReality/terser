@@ -402,10 +402,45 @@ def _logcat(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# linters & typecheckers (tsc, eslint, ruff, mypy, pyright, biome, oxlint)
+# ---------------------------------------------------------------------------
+
+_DIAG_REPEAT_FOOTER_RE = re.compile(
+    r"^\s*(?:help:|note:|info:|For more information|See https?://|https?://\S+\s*$|\[\*\]\s+Fixable\b)",
+    re.IGNORECASE,
+)
+
+
+def _linter_diag(text: str) -> str:
+    """Losslessly preserve every diagnostic file:line:col and message while deduplicating
+    repeated help/note/URL footers and collapsing excessive blank runs."""
+    out: list[str] = []
+    seen_footers: set[str] = set()
+    deduped = 0
+    prev_blank = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            if not prev_blank:
+                out.append("")
+                prev_blank = True
+            continue
+        prev_blank = False
+        if _DIAG_REPEAT_FOOTER_RE.match(line):
+            key = re.sub(r"\s+", " ", s)
+            if key in seen_footers:
+                deduped += 1
+                continue
+            seen_footers.add(key)
+        out.append(line)
+    return _join(out, [_note(deduped, "repeated linter note/help")])
+
+
+# ---------------------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------------------
 
-_TEST_HANDLERS = {"pytest", "cargo-test", "go-test", "js-test", "dotnet-test", "xcodebuild-test"}
+_TEST_HANDLERS = {"pytest", "cargo-test", "go-test", "js-test", "dotnet-test", "xcodebuild-test", "linter"}
 TEST_HANDLER_NAMES = frozenset(_TEST_HANDLERS)
 
 # Named handlers that `command-filters.toml` may reuse via `handler = "<name>"`.
@@ -455,6 +490,10 @@ def _pick(argv: list[str]) -> tuple[str, Callable[[str], str]] | None:
         return ("xcodebuild-test" if "test" in rest or "test-without-building" in rest else "xcodebuild"), _xcodebuild
     if exe == "adb" and sub == "logcat":
         return "logcat", _logcat
+    if exe in ("tsc", "eslint", "ruff", "mypy", "pyright", "biome", "oxlint") or (
+        exe in ("python", "python3", "py") and len(rest) >= 2 and rest[0] == "-m" and rest[1] in ("mypy", "ruff", "pyright")
+    ):
+        return "linter", _linter_diag
     return None
 
 
@@ -464,6 +503,7 @@ HANDLERS.update({
     "cargo-test": _cargo, "go-test": _go_test, "js-test": _js_test, "jvm": _jvm_build,
     "dotnet": _dotnet, "dotnet-test": _dotnet, "docker": _docker, "terraform": _terraform,
     "xcodebuild": _xcodebuild, "xcodebuild-test": _xcodebuild, "logcat": _logcat,
+    "linter": _linter_diag,
 })
 
 

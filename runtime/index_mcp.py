@@ -783,6 +783,11 @@ def _db_query_def_files(slug: str, sym_name: str, *, env: dict[str, str] | None 
 def _init_index_db(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    try:
+        conn.execute("PRAGMA mmap_size=67108864")
+    except sqlite3.Error:
+        pass
     conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
     conn.execute("CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY)")
     conn.execute("CREATE TABLE IF NOT EXISTS file_digests (path TEXT PRIMARY KEY, digest TEXT NOT NULL)")

@@ -130,11 +130,25 @@ def uninstall_opencode(*, dry_run: bool = False, env: dict[str, str] | None = No
 # Cursor
 # ---------------------------------------------------------------------------
 
-def cursor_hook_command(python_exe: str, event: str, root: Path = PLUGIN_ROOT, *, windows: bool | None = None) -> str:
+def _native_fast_bin(root: Path, *, windows: bool) -> Path:
+    return root / "bin" / ("terser-fast.exe" if windows else "terser-fast")
+
+
+def cursor_hook_command(
+    python_exe: str,
+    event: str,
+    root: Path = PLUGIN_ROOT,
+    *,
+    windows: bool | None = None,
+    use_native: bool = False,
+) -> str:
     # Cursor's desktop app runs hook commands through PowerShell on Windows, where
     # a quoted executable path needs the call operator `&`.
     windows = (os.name == "nt") if windows is None else windows
     call = "& " if windows else ""
+    fast_bin = _native_fast_bin(root, windows=windows)
+    if use_native and fast_bin.is_file() and event in ("preToolUse", "postToolUse", "postToolUseFailure", "subagentStart", "subagentStop", "stop"):
+        return f"{call}{_q(str(fast_bin))} --python {_q(python_exe)} --script {_q(_hook_script(root))} {_CURSOR_MARK} --event {event}"
     return f"{call}{_q(python_exe)} -E -s -X utf8 {_q(_hook_script(root))} {_CURSOR_MARK} --event {event}"
 
 
@@ -163,14 +177,24 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def merge_cursor_hooks(doc: dict[str, Any], python_exe: str, root: Path = PLUGIN_ROOT, *, remove: bool = False) -> dict[str, Any]:
+def merge_cursor_hooks(
+    doc: dict[str, Any],
+    python_exe: str,
+    root: Path = PLUGIN_ROOT,
+    *,
+    remove: bool = False,
+    use_native: bool = True,
+) -> dict[str, Any]:
     out = dict(doc)
     out.setdefault("version", 1)
     hooks = dict(out.get("hooks") or {})
     for event in set(hooks) | (set() if remove else set(CURSOR_EVENTS)):
         entries = [e for e in (hooks.get(event) or []) if not _is_terser_cursor_hook(e)]
         if not remove and event in CURSOR_EVENTS:
-            entry: dict[str, Any] = {"command": cursor_hook_command(python_exe, event, root), "timeout": CURSOR_EVENTS[event]}
+            entry: dict[str, Any] = {
+                "command": cursor_hook_command(python_exe, event, root, use_native=use_native),
+                "timeout": CURSOR_EVENTS[event],
+            }
             if event in ("preToolUse", "postToolUse", "postToolUseFailure"):
                 entry["matcher"] = _CURSOR_TOOL_MATCHER
             entries.append(entry)

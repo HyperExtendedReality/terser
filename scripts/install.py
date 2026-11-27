@@ -57,7 +57,7 @@ def _codex_home() -> Path:
     return Path(os.path.expanduser(raw)) if raw else (Path.home() / ".codex")
 
 
-_HOT_EVENTS = frozenset({"PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart", "SubagentStop"})
+_HOT_EVENTS = frozenset({"PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart", "SubagentStop", "Stop", "PreInvocation"})
 _RELEASE_BASE = "https://github.com/HyperExtendedReality/terser/releases/latest/download"
 
 

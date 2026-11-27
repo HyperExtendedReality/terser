@@ -283,7 +283,7 @@ pub fn load_config() -> Config {
     cfg
 }
 
-pub fn atomic_write_json(path: &Path, data: &Value) {
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         if fs::create_dir_all(parent).is_err() {
             return;
@@ -291,18 +291,28 @@ pub fn atomic_write_json(path: &Path, data: &Value) {
         let pid = std::process::id();
         let ts = (now_secs() * 1_000_000.0) as u64;
         let tmp = parent.join(format!(".terser.{pid}.{ts}.tmp"));
-        if let Ok(bytes) = serde_json::to_vec(data) {
-            if fs::write(&tmp, &bytes).is_ok() {
+        if fs::write(&tmp, bytes).is_ok() {
+            if fs::rename(&tmp, path).is_err() {
+                let _ = fs::remove_file(path);
                 if fs::rename(&tmp, path).is_err() {
-                    let _ = fs::remove_file(path);
-                    if fs::rename(&tmp, path).is_err() {
-                        let _ = fs::remove_file(&tmp);
-                    }
+                    let _ = fs::remove_file(&tmp);
                 }
-            } else {
-                let _ = fs::remove_file(&tmp);
             }
+        } else {
+            let _ = fs::remove_file(&tmp);
         }
+    }
+}
+
+pub fn atomic_write_json(path: &Path, data: &Value) {
+    if let Ok(bytes) = serde_json::to_vec(data) {
+        atomic_write_bytes(path, &bytes);
+    }
+}
+
+pub fn atomic_write_map(path: &Path, data: &serde_json::Map<String, Value>) {
+    if let Ok(bytes) = serde_json::to_vec(data) {
+        atomic_write_bytes(path, &bytes);
     }
 }
 
