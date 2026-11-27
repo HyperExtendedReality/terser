@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Terser — Reproducible Local Token-Savings Benchmark.
 
-Measures exact before/after token counts (~chars/4) across every optimization
-layer in Terser using realistic developer workloads. Zero network calls.
+Estimates before/after token counts (~chars/4) across optimization layers
+using realistic developer workloads. Zero network calls.
 
 Run:
     python scripts/benchmark.py
@@ -153,7 +153,58 @@ def run_benchmark() -> list[tuple[str, int, int, float]]:
     return rows
 
 
-def main() -> int:
+def _compare_codex_rollouts(before: Path, after: Path) -> int:
+    config.ensure_vendor_paths()
+    from tokeneconomizer.trace.codex import codex_session_usage
+
+    baseline = codex_session_usage(before)
+    optimized = codex_session_usage(after)
+    if baseline["input_tokens"] is None or optimized["input_tokens"] is None:
+        print("Both rollouts must contain cumulative Codex token usage.", file=sys.stderr)
+        return 2
+    if baseline.get("model") and optimized.get("model") and baseline["model"] != optimized["model"]:
+        print("Use rollouts recorded with the same Codex model.", file=sys.stderr)
+        return 2
+
+    print(f"{'Codex reported usage':<28} {'Before':>12} {'After':>12} {'Change':>12}")
+    for label, field in (
+        ("Uncached input", "input_tokens"),
+        ("Cached input read", "cache_read_input_tokens"),
+        ("Cache creation input", "cache_creation_input_tokens"),
+        ("Output (includes reasoning)", "output_tokens"),
+    ):
+        raw, served = baseline[field], optimized[field]
+        print(f"{label:<28} {raw:>12,} {served:>12,} {served - raw:>+12,}")
+    return 0
+
+
+BASELINE_PATH = Path(__file__).resolve().parent / "benchmark_baseline.json"
+# A layer regresses when its served tokens grow past baseline by more than this slack.
+_REGRESSION_RATIO = 1.05
+_REGRESSION_MIN_TOKENS = 3
+
+
+def check_regressions(rows: list[tuple[str, int, int, float]], baseline: dict[str, int]) -> list[str]:
+    """Layers whose served-token count regressed versus the committed baseline (or vanished)."""
+    current = {name: after for name, _, after, _ in rows}
+    failures = []
+    for name, base_after in sorted(baseline.items()):
+        if name not in current:
+            failures.append(f"{name}: missing from benchmark (baseline {base_after})")
+            continue
+        limit = max(base_after * _REGRESSION_RATIO, base_after + _REGRESSION_MIN_TOKENS)
+        if current[name] > limit:
+            failures.append(f"{name}: {current[name]} tok served > baseline {base_after} (limit {int(limit)})")
+    return failures
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--check", action="store_true", help="fail when any layer regresses vs benchmark_baseline.json")
+    ap.add_argument("--write-baseline", action="store_true", help="record current served tokens as the new baseline")
+    args = ap.parse_args(argv)
     rows = run_benchmark()
     print("Terser — Measured Local Token-Savings Benchmark")
     print("=" * 74)
@@ -168,6 +219,20 @@ def main() -> int:
     print("-" * 74)
     tot_pct = (1 - tot_after / max(1, tot_before)) * 100
     print(f"{'TOTAL (pooled across 8 layers)':<38} {tot_before:>8,} {tot_after:>8,} {tot_pct:>9.1f}%")
+    if args.write_baseline:
+        BASELINE_PATH.write_text(
+            json.dumps({name: after for name, _, after, _ in rows}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Baseline written: {BASELINE_PATH}")
+    if args.check:
+        failures = check_regressions(rows, json.loads(BASELINE_PATH.read_text(encoding="utf-8")))
+        if failures:
+            print("Token regressions vs baseline:", file=sys.stderr)
+            for line in failures:
+                print(f"  - {line}", file=sys.stderr)
+            return 1
+        print("No token regressions vs baseline.")
     return 0
 
 

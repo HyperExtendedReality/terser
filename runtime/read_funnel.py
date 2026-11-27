@@ -9,6 +9,8 @@ AST navigation into one conflict-free PreToolUse funnel:
   Tier 1 (Small-edit re-read):
       Return exact unified diff (<= 60 lines & < 40% of slice) ONCE instead of
       re-reading the entire file. Immediate retry returns the full file.
+  Tier 1b (Larger change confined to a few symbols):
+      Return those whole symbols, bounded by unchanged anchor lines, ONCE.
   Tier 2 (First unranged read of a LARGE code file >= 10 KB & >= 250 lines):
       Return an inline, line-numbered AST/structure outline (imports + class/fn
       signatures + exact line spans) ONCE, pointing to ranged reads or `terser-index`
@@ -34,6 +36,8 @@ from typing import Any
 from runtime.config import (
     atomic_write_json,
     ensure_vendor_paths,
+    record_funnel_event,
+    tier_backed_off,
     record_savings,
     state_home,
 )
@@ -63,9 +67,21 @@ _MUTATING_OR_LIVE_MCP_TOKENS = frozenset({
     "execute", "invoke", "trigger", "start", "stop", "kill", "cancel",
     "status", "poll", "wait", "watch", "tail", "logs", "time", "now",
     "clock", "health", "ping", "refresh", "invalidate", "register", "index",
+    # UI / browser / device / session tools whose result reflects state other calls change.
+    "computer", "screenshot", "screen", "snapshot", "capture", "page", "tab", "tabs",
+    "navigate", "click", "scroll", "type", "key", "hover", "drag", "console", "network",
+    "javascript", "eval", "evaluate", "messages", "inbox", "notifications", "events",
+    "current", "latest", "recent", "live", "session", "sessions", "terminal", "clipboard",
+    "query", "sql", "select",
+})
+# Server names whose tools observe or drive live state (browsers, desktops, devices, debuggers).
+_LIVE_MCP_SERVER_TOKENS = frozenset({
+    "browser", "chrome", "playwright", "puppeteer", "selenium", "computer", "desktop",
+    "terminal", "devtools", "screen", "android", "adb", "ios", "simulator", "emulator",
+    "frida", "gdb", "debug", "debugger", "rizin", "rea",
 })
 
-# Regex fallback for non-Python code outlines when vendor structure_map isn't matched
+# Regex fallback for non-Python code outlines when runtime.code_outline finds too few symbols
 _GENERIC_SYM_RE = re.compile(
     r"^(?P<indent>[ \t]*)"
     r"(?:export\s+|public\s+|private\s+|protected\s+|static\s+|async\s+|pub\s+|override\s+|virtual\s+)*"
@@ -111,42 +127,128 @@ def _cache_path(session_id: str, env: dict[str, str] | None = None) -> Path:
     return _cache_dir(env) / f"{safe_sid}.json"
 
 
+_SWEEP_INTERVAL_SECONDS = 3600
+_SWEEP_MARKER = ".last-sweep"
+_BLOB_DIR = "blobs"
+_BLOB_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 def _sweep_stale(cdir: Path, now: float) -> None:
+    """Delete session stores and snapshot blobs untouched for the TTL, at most once per hour.
+
+    Live blobs are touched each time a store references them, so only unreferenced or
+    long-idle blobs age out. A missing blob only costs one delta tier (the read falls back to T3).
+    """
     try:
         if not cdir.is_dir():
             return
+        marker = cdir / _SWEEP_MARKER
+        try:
+            if now - marker.stat().st_mtime < _SWEEP_INTERVAL_SECONDS:
+                return
+        except OSError:
+            pass
+        try:
+            marker.touch()
+        except OSError:
+            pass
         cutoff = now - _STORE_TTL_SECONDS
-        for p in cdir.glob("*.json"):
-            try:
-                if p.stat().st_mtime < cutoff:
-                    p.unlink()
-            except OSError:
+        for pattern, base in (("*.json", cdir), ("*.txt", cdir / _BLOB_DIR)):
+            if not base.is_dir():
                 continue
+            for p in base.glob(pattern):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink()
+                except OSError:
+                    continue
     except OSError:
         pass
+
+
+def _blob_path(digest: str, env: dict[str, str] | None = None) -> Path:
+    return _cache_dir(env) / _BLOB_DIR / f"{digest}.txt"
+
+
+def _write_blob(text: str, env: dict[str, str] | None = None) -> str | None:
+    """Store `text` content-addressed (sha256 of its UTF-8 bytes); returns the digest."""
+    data = text.encode("utf-8", errors="surrogatepass")
+    digest = hashlib.sha256(data).hexdigest()
+    p = _blob_path(digest, env)
+    try:
+        if p.is_file():
+            os.utime(p, None)
+            return digest
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f"{digest}.tmp.{os.getpid()}")
+        tmp.write_bytes(data)
+        os.replace(tmp, p)
+        return digest
+    except OSError:
+        return None
+
+
+def _snapshot_text(entry: dict[str, Any], env: dict[str, str] | None = None) -> str | None:
+    """Return an entry's cached snapshot: inline (legacy/in-flight) or from its verified blob."""
+    inline = entry.get("snapshot")
+    if isinstance(inline, str):
+        return inline
+    digest = entry.get("snapshot_sha")
+    if not isinstance(digest, str) or not _BLOB_NAME_RE.match(digest):
+        return None
+    try:
+        data = _blob_path(digest, env).read_bytes()
+    except OSError:
+        return None
+    if hashlib.sha256(data).hexdigest() != digest:
+        return None  # corrupt or truncated blob: never diff against it
+    return data.decode("utf-8", errors="surrogatepass")
+
+
+def _drop_snapshot(entry: dict[str, Any]) -> None:
+    entry.pop("snapshot", None)
+    entry.pop("snapshot_sha", None)
+
+
+def _externalize_snapshots(store: dict, env: dict[str, str] | None = None) -> None:
+    """Move inline snapshots into shared blobs so each hook parses and rewrites a small store."""
+    reads = store.get("reads")
+    if not isinstance(reads, dict):
+        return
+    for entry in reads.values():
+        if not isinstance(entry, dict):
+            continue
+        snap = entry.get("snapshot")
+        if not isinstance(snap, str):
+            continue
+        digest = _write_blob(snap, env)
+        if digest:
+            entry.pop("snapshot", None)
+            entry["snapshot_sha"] = digest
 
 
 def _load_store(session_id: str, env: dict[str, str] | None = None) -> dict[str, dict]:
     p = _cache_path(session_id, env)
     try:
         if not p.is_file():
-            return {"reads": {}, "mcp": {}}
+            return {"reads": {}, "mcp": {}, "meta": {}, "searches": {}}
         data = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return {"reads": {}, "mcp": {}, "meta": {}}
+            return {"reads": {}, "mcp": {}, "meta": {}, "searches": {}}
         return {
             "reads": data.get("reads") if isinstance(data.get("reads"), dict) else {},
             "mcp": data.get("mcp") if isinstance(data.get("mcp"), dict) else {},
             "meta": data.get("meta") if isinstance(data.get("meta"), dict) else {},
+            "searches": data.get("searches") if isinstance(data.get("searches"), dict) else {},
         }
     except (OSError, json.JSONDecodeError, ValueError):
-        return {"reads": {}, "mcp": {}, "meta": {}}
+        return {"reads": {}, "mcp": {}, "meta": {}, "searches": {}}
 
 
 def _save_store(session_id: str, store: dict, now: float, env: dict[str, str] | None = None) -> None:
     cdir = _cache_dir(env)
     _sweep_stale(cdir, now)
-    for bucket_key in ("reads", "mcp"):
+    for bucket_key in ("reads", "mcp", "searches"):
         bucket = store.get(bucket_key)
         if isinstance(bucket, dict) and len(bucket) > _MAX_STORE_ENTRIES:
             ordered = sorted(
@@ -155,6 +257,7 @@ def _save_store(session_id: str, store: dict, now: float, env: dict[str, str] | 
                 reverse=True,
             )[:_MAX_STORE_ENTRIES]
             store[bucket_key] = dict(ordered)
+    _externalize_snapshots(store, env)
     atomic_write_json(_cache_path(session_id, env), store)
 
 
@@ -191,15 +294,11 @@ def _range_covered(
     req_start: int | None,
     req_end: int | None,
 ) -> bool:
-    p_s = 1 if prev_start is None else prev_start
-    r_s = 1 if req_start is None else req_start
-    if r_s < p_s:
-        return False
-    if prev_end is None:
-        return True
-    if req_end is None:
-        return False
-    return req_end <= prev_end
+    """True when the requested span lies inside the span already delivered (None = open end)."""
+    inf = float("inf")
+    have = (1 if prev_start is None else prev_start, inf if prev_end is None else prev_end)
+    want = (1 if req_start is None else req_start, inf if req_end is None else req_end)
+    return have[0] <= want[0] and want[1] <= have[1]
 
 
 def _merge_intervals(
@@ -293,10 +392,10 @@ def _intervals_cover(
 
 
 def _slice_lines(text: str, start_line: int | None, end_line: int | None) -> list[str]:
-    lines = text.splitlines(keepends=True)
-    s = max(0, (start_line - 1) if start_line else 0)
-    e = end_line if end_line else len(lines)
-    return lines[s:e]
+    """1-based inclusive line window of ``text`` (line endings kept)."""
+    first = max(1, start_line or 1)
+    window = text.splitlines(keepends=True)
+    return window[first - 1 : end_line] if end_line else window[first - 1 :]
 
 
 def _compact_unified_diff(
@@ -306,34 +405,24 @@ def _compact_unified_diff(
     start_line: int | None,
     end_line: int | None,
 ) -> str | None:
-    old_slice = _slice_lines(old_text, start_line, end_line)
-    new_slice = _slice_lines(new_text, start_line, end_line)
-    if not new_slice:
+    """Unified diff of the requested window, or None when a diff would not be worth sending."""
+    before = _slice_lines(old_text, start_line, end_line)
+    after = _slice_lines(new_text, start_line, end_line)
+    if not after:
         return None
-    diff_lines = list(
-        difflib.unified_diff(
-            old_slice,
-            new_slice,
-            fromfile=f"a/{basename}",
-            tofile=f"b/{basename}",
-            n=2,
-        )
-    )
-    if not diff_lines or len(diff_lines) > _DELTA_MAX_DIFF_LINES:
+    hunks = list(difflib.unified_diff(before, after, f"a/{basename}", f"b/{basename}", n=2))
+    too_long = len(hunks) > _DELTA_MAX_DIFF_LINES
+    too_dense = len(after) >= 20 and len(hunks) > _DELTA_MAX_RATIO * len(after)
+    if not hunks or too_long or too_dense:
         return None
-    if len(new_slice) >= 20 and (len(diff_lines) / max(len(new_slice), 1)) > _DELTA_MAX_RATIO:
-        return None
-    return "".join(diff_lines).rstrip()
+    return "".join(hunks).rstrip()
 
 
 def _format_range(start_line: int | None, end_line: int | None) -> str:
-    if start_line is None and end_line is None:
-        return "full file"
-    if start_line is not None and end_line is not None:
-        return f"lines {start_line}-{end_line}"
-    if start_line is not None:
-        return f"from line {start_line}"
-    return f"lines 1-{end_line}"
+    """Human label for a read span."""
+    if end_line is None:
+        return "full file" if start_line is None else f"from line {start_line}"
+    return f"lines {1 if start_line is None else start_line}-{end_line}"
 
 
 _DOC_EXTS = frozenset({".md", ".mdx", ".markdown"})
@@ -444,7 +533,9 @@ def _outline_structured_data(file_path: str, text: str, *, env: dict[str, str] |
             for i, ln in enumerate(lines[-5:], start=len(lines) - 4):
                 parts.append(f"L{i}: {ln[:140]}")
         if aid:
-            parts.append(f'Indexed in sandbox: `terse query {aid} "<terms>"` or `terse expand {aid} <start> <end>`')
+            from runtime import context_sandbox
+
+            parts.append(f"Indexed in sandbox: {context_sandbox.retrieval_hint(aid, env=env)}")
         return "\n".join(parts)
 
     return None
@@ -453,7 +544,7 @@ def _outline_structured_data(file_path: str, text: str, *, env: dict[str, str] |
 def build_code_outline(file_path: str, text: str, *, env: dict[str, str] | None = None) -> str | None:
     """Build a compact line-numbered symbol, doc-heading, or structured-data outline for a large file.
 
-    Prefers Terser's bundled ``structure_map`` when available, falling back to
+    Prefers ``runtime.code_outline`` for non-Python code, falling back to
     Python's ``ast`` module (for .py), Markdown heading TOC (for .md), structured data
     outlines (JSON/YAML/TOML/lockfiles/logs), or a fast regex extractor.
     """
@@ -485,19 +576,16 @@ def build_code_outline(file_path: str, text: str, *, env: dict[str, str] | None 
     if ext not in _CODE_EXTS:
         return None
 
-    # 1. Try Terser's bundled multi-language structure_map
-    try:
-        ensure_vendor_paths()
-        import structure_map as _sm  # type: ignore
+    # 1. Native multi-language outline (Python uses the exact AST path below)
+    if ext != ".py":
+        try:
+            from runtime import code_outline
 
-        if _sm.is_structure_supported_file(file_path):
-            res = _sm.summarize_code_source(text, file_path)
-            if res and getattr(res, "summary", None):
-                summary = str(res.summary).strip()
-                if summary and len(summary) < int(len(text) * 0.35):
-                    return summary
-    except Exception:
-        pass
+            summary = code_outline.outline(text, file_path)
+            if summary and len(summary) < int(len(text) * 0.35):
+                return summary
+        except Exception:
+            pass
 
     # 2. Fast exact Python AST outline
     if ext == ".py":
@@ -543,6 +631,113 @@ def build_code_outline(file_path: str, text: str, *, env: dict[str, str] | None 
     if len(rows) >= 3:
         return "\n".join(rows)
     return None
+
+
+_RETRY_WINDOW_S = 180.0
+
+
+def _note_retry(prev: dict[str, Any], soft_denies: int, host: str, env: dict[str, str] | None) -> None:
+    """Record that the model re-requested content right after a short funnel answer."""
+    tier = prev.pop("last_tier", None)
+    try:
+        recent = (time.time() - float(prev.get("ts") or 0.0)) <= _RETRY_WINDOW_S
+    except (TypeError, ValueError):
+        recent = False
+    if tier and soft_denies >= _SOFT_DENY_CAP and recent:
+        record_funnel_event(str(tier), "retry", host=host, env=env)
+
+
+_SYMBOL_DELTA_MAX_REGIONS = 4
+_SYMBOL_DELTA_MAX_RATIO = 0.40
+
+
+def _symbol_region_delta(file_path: str, old_text: str, new_text: str) -> str | None:
+    """Describe a change as whole replaced symbol regions when every hunk sits inside a symbol.
+
+    Lossless by construction: each region is bounded by unchanged anchor lines (or the file
+    edges), so `old lines a-b` -> `current lines c-d` plus the unchanged rest is the full file.
+    """
+    if Path(file_path).suffix.lower() not in _CODE_EXTS:
+        return None
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    if not new_lines or not old_lines:
+        return None
+    ops = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes()
+    hunks = [(i1, i2, j1, j2) for tag, i1, i2, j1, j2 in ops if tag != "equal"]
+    if not hunks:
+        return None
+    try:
+        from runtime import index_mcp
+
+        _, syms, _ = index_mcp._source_snapshot(Path(file_path).name, new_text.encode("utf-8"))
+    except Exception:
+        return None
+    spans = sorted(
+        {(int(x["start_line"]), int(x["end_line"]), str(x.get("qualified_name") or x.get("name") or "")) for x in syms
+         if int(x.get("end_line") or 0) >= int(x.get("start_line") or 0) >= 1},
+        key=lambda t: (t[1] - t[0], t[0]),
+    )
+    if not spans:
+        return None
+    n_new = len(new_lines)
+    n_old = len(old_lines)
+
+    def new_to_old(line: int) -> int | None:
+        for tag, i1, _i2, j1, j2 in ops:
+            if tag == "equal" and j1 < line <= j2:
+                return i1 + (line - j1)
+        return None
+
+    regions: list[list[Any]] = []
+    for i1, i2, j1, j2 in hunks:
+        if j2 > j1:
+            lo, hi = j1 + 1, j2
+        else:  # pure deletion between new lines j1 and j1+1
+            lo, hi = j1, j1 + 1
+        owner = next((sp for sp in spans if sp[0] <= lo and sp[1] >= hi), None)
+        if owner is None:
+            return None
+        a, b = owner[0], owner[1]
+        steps = 0
+        while a > 1 and new_to_old(a - 1) is None and steps < 6:
+            a -= 1
+            steps += 1
+        steps = 0
+        while b < n_new and new_to_old(b + 1) is None and steps < 6:
+            b += 1
+            steps += 1
+        if (a > 1 and new_to_old(a - 1) is None) or (b < n_new and new_to_old(b + 1) is None):
+            return None
+        regions.append([a, b, {owner[2]}])
+    regions.sort(key=lambda r: r[0])
+    merged: list[list[Any]] = []
+    for r in regions:
+        if merged and r[0] <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], r[1])
+            merged[-1][2] |= r[2]
+        else:
+            merged.append(r)
+    if len(merged) > _SYMBOL_DELTA_MAX_REGIONS:
+        return None
+    shown = sum(b - a + 1 for a, b, _ in merged)
+    if shown > n_new * _SYMBOL_DELTA_MAX_RATIO:
+        return None
+    blocks: list[str] = []
+    for a, b, names in merged:
+        before = new_to_old(a - 1) if a > 1 else 0
+        after = new_to_old(b + 1) if b < n_new else n_old + 1
+        if before is None or after is None:
+            return None
+        oa, ob = before + 1, after - 1
+        old_rng = f"old L{oa}-L{ob}" if ob >= oa else f"insert after old L{before}"
+        label = ", ".join(sorted(n for n in names if n)) or "symbol"
+        body = "\n".join(f"{ln}: {new_lines[ln - 1]}" for ln in range(a, b + 1))
+        blocks.append(f"{old_rng} -> now L{a}-L{b} (`{label}`):\n{body}")
+    out = "\n".join(blocks)
+    if len(out) > len(new_text) * _SYMBOL_DELTA_MAX_RATIO:
+        return None
+    return out
 
 
 def check_read(
@@ -597,9 +792,10 @@ def check_read(
         and _intervals_cover(prev, start_line, end_line)
     ):
         soft_denies = int(prev.get("soft_denies") or 0)
-        if soft_denies < _SOFT_DENY_CAP and not cfg.get("shadow"):
+        if soft_denies < _SOFT_DENY_CAP and not cfg.get("shadow") and not tier_backed_off("t0", host, env):
             prev["soft_denies"] = soft_denies + 1
             prev["ts"] = now
+            prev["last_tier"] = "t0"
             _save_store(session_id, store, now, env)
             rng = _format_range(start_line, end_line)
             reason = (
@@ -607,7 +803,9 @@ def check_read(
                 "Reuse the content already in context, or retry to refresh (e.g. after /compact)."
             )
             record_savings("read_dedup", st.st_size, len(reason), host=host, detail=basename, env=env)
+            record_funnel_event("t0", "served", host=host, env=env)
             return {"action": "deny", "reason": reason}
+        _note_retry(prev, soft_denies, host, env)
         prev["soft_denies"] = 0
         prev["ts"] = now
         _save_store(session_id, store, now, env)
@@ -640,6 +838,7 @@ def check_read(
         # session (task genuinely requires whole-file reads), auto-backoff outline_first
         # to avoid extra round-trip turns (round-trip cost guardrail).
         if outline_only:
+            _note_retry(prev, soft_denies, host, env)
             prev["outline_only"] = False
             prev["sha"] = sha
             prev["mtime_ns"] = st.st_mtime_ns
@@ -662,9 +861,10 @@ def check_read(
 
         # Tier 0: Unchanged re-read (full coverage OR high partial-overlap trimming)
         if prev_sha == sha and _intervals_cover(prev, start_line, end_line):
-            if soft_denies < _SOFT_DENY_CAP and not cfg.get("shadow"):
+            if soft_denies < _SOFT_DENY_CAP and not cfg.get("shadow") and not tier_backed_off("t0", host, env):
                 prev["soft_denies"] = soft_denies + 1
                 prev["ts"] = now
+                prev["last_tier"] = "t0"
                 _save_store(session_id, store, now, env)
                 rng = _format_range(start_line, end_line)
                 reason = (
@@ -672,7 +872,9 @@ def check_read(
                     "Reuse the content already in context, or retry to refresh (e.g. after /compact)."
                 )
                 record_savings("read_dedup", len(raw_bytes), len(reason), host=host, detail=basename, env=env)
+                record_funnel_event("t0", "served", host=host, env=env)
                 return {"action": "deny", "reason": reason}
+            _note_retry(prev, soft_denies, host, env)
             prev["soft_denies"] = 0
             prev["ts"] = now
             _save_store(session_id, store, now, env)
@@ -684,6 +886,7 @@ def check_read(
             and soft_denies < _SOFT_DENY_CAP
             and not cfg.get("shadow")
             and (start_line is not None or end_line is not None)
+            and not tier_backed_off("t0b", host, env)
         ):
             total_lines = raw_bytes.count(b"\n") + 1
             rs = max(1, start_line) if start_line is not None else 1
@@ -694,6 +897,8 @@ def check_read(
             if uncovered and cov_lines >= 40 and (cov_lines / req_span) >= 0.40:
                 prev["soft_denies"] = soft_denies + 1
                 prev["ts"] = now
+                prev["last_tier"] = "t0b"
+                record_funnel_event("t0b", "served", host=host, env=env)
                 _save_store(session_id, store, now, env)
                 spans_str = ", ".join(f"L{s}-L{e}" for s, e in uncovered[:4])
                 range_hint = "StartLine/EndLine" if host == "antigravity" else "offset/limit"
@@ -706,29 +911,60 @@ def check_read(
                 return {"action": "deny", "reason": reason}
 
         # Tier 1: Compact unified delta diff on small edits
-        if (
-            cfg.get("delta_diff", True)
-            and prev_sha != sha
-            and soft_denies < _SOFT_DENY_CAP
-            and not cfg.get("shadow")
-            and isinstance(prev.get("snapshot"), str)
-            and text_snapshot is not None
-            and _intervals_cover(prev, start_line, end_line)
-        ):
-            diff = _compact_unified_diff(prev["snapshot"], text_snapshot, basename, start_line, end_line)
+        old_snapshot = (
+            _snapshot_text(prev, env)
+            if (
+                cfg.get("delta_diff", True)
+                and prev_sha != sha
+                and soft_denies < _SOFT_DENY_CAP
+                and not cfg.get("shadow")
+                and text_snapshot is not None
+                and _intervals_cover(prev, start_line, end_line)
+            )
+            else None
+        )
+        if old_snapshot is not None and text_snapshot is not None:
+            diff = (
+                None if tier_backed_off("t1", host, env)
+                else _compact_unified_diff(old_snapshot, text_snapshot, basename, start_line, end_line)
+            )
+            reason = ""
+            tier = ""
             if diff:
+                reason = (
+                    f"[Terser] `{basename}` changed slightly since your last read. "
+                    f"Exact unified diff:\n```diff\n{diff}\n```\n(Retry read to load the full file.)"
+                )
+                tier = "t1"
+            elif (
+                cfg.get("symbol_delta", True)
+                and not tier_backed_off("t1sym", host, env)
+                and start_line is None
+                and end_line is None
+                and _intervals_cover(prev, None, None)
+            ):
+                regions = _symbol_region_delta(file_path, old_snapshot, text_snapshot)
+                if regions:
+                    reason = (
+                        f"[Terser] `{basename}` changed only inside the symbol(s) below since your last read; "
+                        "every other line is unchanged. Each block replaces the old line range shown, "
+                        f"with current line numbers:\n{regions}\n(Retry read to load the full file.)"
+                    )
+                    tier = "t1sym"
+            if reason:
                 prev["sha"] = sha
                 prev["mtime_ns"] = st.st_mtime_ns
                 prev["size"] = st.st_size
                 prev["snapshot"] = text_snapshot
                 prev["soft_denies"] = soft_denies + 1
                 prev["ts"] = now
+                prev["last_tier"] = tier
                 _save_store(session_id, store, now, env)
-                reason = (
-                    f"[Terser] `{basename}` changed slightly since your last read. "
-                    f"Exact unified diff:\n```diff\n{diff}\n```\n(Retry read to load the full file.)"
+                record_savings(
+                    "read_delta" if tier == "t1" else "read_symbol_delta",
+                    len(raw_bytes), len(reason), host=host, detail=basename, env=env,
                 )
-                record_savings("read_delta", len(raw_bytes), len(reason), host=host, detail=basename, env=env)
+                record_funnel_event(tier, "served", host=host, env=env)
                 return {"action": "deny", "reason": reason}
 
     # Tier 2: First unranged read (or huge first-time ranged slice >= 400L) of a LARGE code/doc/data file
@@ -741,6 +977,7 @@ def check_read(
     if (
         prev is None
         and cfg.get("outline_first", True)
+        and not tier_backed_off("t2", host, env)
         and (backoff_limit <= 0 or outline_overrides < backoff_limit)
         and not cfg.get("shadow")
         and st.st_size >= (outline_min_bytes if is_unranged else max(_LARGE_SLICE_MIN_BYTES, outline_min_bytes))
@@ -769,8 +1006,10 @@ def check_read(
                     "intervals": [],
                     "soft_denies": 1,
                     "outline_only": True,
+                    "last_tier": "t2",
                     "ts": now,
                 }
+                record_funnel_event("t2", "served", host=host, env=env)
                 _save_store(session_id, store, now, env)
                 range_hint = "StartLine/EndLine" if host == "antigravity" else "offset/limit"
                 slice_note = "" if is_unranged else f" (requested {req_span_t2} lines: L{rs_t2}-L{re_t2})"
@@ -784,6 +1023,8 @@ def check_read(
                 return {"action": "deny", "reason": reason}
 
     # Tier 3: First read / wider range / large change -> record snapshot & disjoint intervals and allow
+    if isinstance(prev, dict):
+        _note_retry(prev, int(prev.get("soft_denies") or 0), host, env)
     existing_ivs = None
     if isinstance(prev, dict) and prev.get("sha") == sha:
         if isinstance(prev.get("intervals"), list) and prev["intervals"]:
@@ -819,6 +1060,7 @@ def seed_after_write(
     session_id: str,
     file_path: str,
     *,
+    written: str | None = None,
     env: dict[str, str] | None = None,
 ) -> None:
     """Seed the writing session's read cache after a full-file Write so immediate verification re-reads hit T0.
@@ -842,6 +1084,7 @@ def seed_after_write(
     sha = hashlib.sha256(raw_bytes).hexdigest()
     key = _norm_path(file_path)
     store = _load_store(session_id, env)
+    actual_text = raw_bytes.decode("utf-8", errors="replace")
     entry: dict[str, Any] = {
         "sha": sha,
         "mtime_ns": st.st_mtime_ns,
@@ -853,8 +1096,19 @@ def seed_after_write(
         "outline_only": False,
         "ts": now,
     }
-    if len(raw_bytes) <= _MAX_SNAPSHOT_BYTES:
-        entry["snapshot"] = raw_bytes.decode("utf-8", errors="replace")
+    if isinstance(written, str) and not _same_text(written, actual_text):
+        # Something (a formatter, another hook) changed the file after the write. Cache the
+        # content the model actually wrote so the next read returns an exact diff to disk.
+        record_funnel_event("write_seed", "mismatch", env=env)
+        if len(written.encode("utf-8")) > _MAX_SNAPSHOT_BYTES:
+            store["reads"].pop(key, None)
+            _save_store(session_id, store, now, env)
+            return
+        entry["sha"] = hashlib.sha256(written.encode("utf-8")).hexdigest()
+        entry.pop("mtime_ns", None)
+        entry["snapshot"] = written
+    elif len(raw_bytes) <= _MAX_SNAPSHOT_BYTES:
+        entry["snapshot"] = actual_text
     store["reads"][key] = entry
     _save_store(session_id, store, now, env)
 
@@ -911,20 +1165,84 @@ def seed_read_interval(
     _save_store(session_id, store, now, env)
 
 
+def _same_text(expected: str, actual: str) -> bool:
+    # Line-ending-only differences are invisible in Read output, so they count as equal.
+    return expected == actual or expected.replace("\r\n", "\n") == actual.replace("\r\n", "\n")
+
+
+EditSpec = tuple[str, str, bool]
+
+
+def _apply_edits(snap: str, edits: list[EditSpec]) -> tuple[str, list[tuple[int, int, int]] | None] | None:
+    """Apply edits like the host tool does. Returns new text plus per-edit (start, end, delta)
+    line spans in running coordinates (None when replace_all makes spans ambiguous)."""
+    cur = snap
+    spans: list[tuple[int, int, int]] | None = []
+    for old, new, replace_all in edits:
+        if not old:
+            return None
+        cnt = cur.count(old)
+        if cnt == 0:
+            return None
+        if replace_all:
+            cur = cur.replace(old, new)
+            spans = None
+            continue
+        if cnt != 1:
+            return None
+        pos = cur.find(old)
+        start_line = cur.count("\n", 0, pos) + 1
+        if spans is not None:
+            spans.append((start_line, start_line + old.count("\n"), new.count("\n") - old.count("\n")))
+        cur = cur[:pos] + new + cur[pos + len(old):]
+    return cur, spans
+
+
+def _edit_variants(snap: str, edits: list[EditSpec]) -> list[list[EditSpec]]:
+    out = [edits]
+    if "\r\n" in snap:
+        out.append([
+            (o.replace("\r\n", "\n").replace("\n", "\r\n"), n.replace("\r\n", "\n").replace("\n", "\r\n"), ra)
+            for o, n, ra in edits
+        ])
+    return out
+
+
+def _shift_intervals(raw_ivs: list[Any], edit_start: int, edit_end: int, delta: int) -> list[list[int | None]]:
+    shifted: list[list[int | None]] = []
+    for iv in raw_ivs:
+        if not isinstance(iv, list) or len(iv) != 2:
+            continue
+        s = int(iv[0]) if iv[0] is not None else 1
+        e = int(iv[1]) if iv[1] is not None else None
+        if e is None:
+            new_s = max(1, s + delta) if s > edit_end else s
+            shifted.append([new_s, None])
+        elif e < edit_start:
+            shifted.append([s, e])
+        elif s > edit_end:
+            shifted.append([max(1, s + delta), max(1, e + delta)])
+        else:
+            shifted.append([s, max(s, e + delta)])
+    return shifted
+
+
 def seed_after_edit(
     session_id: str,
     file_path: str,
     *,
     old_text: str | None = None,
     new_text: str | None = None,
+    replace_all: bool = False,
+    edits: list[EditSpec] | None = None,
     env: dict[str, str] | None = None,
 ) -> None:
-    """Update the editing session's cached sha/snapshot after a successful partial Edit.
+    """Update the editing session's cached sha/snapshot after a successful Edit / MultiEdit.
 
-    Seeds when either:
-      1. The session already loaded the FULL file, OR
-      2. The edit is line-count-preserving (`delta_lines == 0`) inside an already-covered
-         interval (so line numbers elsewhere never shift and unread lines are never masked).
+    The cache is only advanced when the file on disk equals the cached snapshot with the
+    edits applied, so a formatter or concurrent writer can never produce a false "unchanged".
+    On mismatch the cache holds the model's expected text, so the next read is an exact diff.
+    Partial-coverage seeding additionally requires each edit inside an already-read span.
     Sibling/parent subagents are always invalidated.
     """
     if not session_id or not file_path or not _SID_RE.match(session_id):
@@ -935,57 +1253,9 @@ def seed_after_edit(
     prev = store["reads"].get(key)
     if not isinstance(prev, dict) or prev.get("outline_only"):
         return
-
-    full_covered = _intervals_cover(prev, None, None)
-    if not full_covered:
-        # Check safe partial-interval edit inside an already-covered span (including deterministic
-        # line-number shifting when lines are inserted or deleted inside the covered span).
-        if (
-            not isinstance(old_text, str)
-            or not isinstance(new_text, str)
-            or not old_text
-        ):
-            return
-        snap = prev.get("snapshot")
-        if not isinstance(snap, str) or snap.count(old_text) != 1:
-            return
-        pos = snap.find(old_text)
-        if pos < 0:
-            return
-        old_nl = old_text.count("\n")
-        new_nl = new_text.count("\n")
-        edit_start = snap.count("\n", 0, pos) + 1
-        edit_end = edit_start + old_nl
-        if not _intervals_cover(prev, edit_start, edit_end):
-            return
-        delta = new_nl - old_nl
-        if delta != 0:
-            raw_ivs = (
-                prev.get("intervals")
-                if isinstance(prev.get("intervals"), list) and prev.get("intervals")
-                else [[prev.get("start") or 1, prev.get("end")]]
-            )
-            shifted: list[list[int | None]] = []
-            for iv in raw_ivs:
-                if not isinstance(iv, list) or len(iv) != 2:
-                    continue
-                s = int(iv[0]) if iv[0] is not None else 1
-                e = int(iv[1]) if iv[1] is not None else None
-                if e is None:
-                    new_s = max(1, s + delta) if s > edit_end else s
-                    shifted.append([new_s, None])
-                elif e < edit_start:
-                    shifted.append([s, e])
-                elif s > edit_end:
-                    shifted.append([max(1, s + delta), max(1, e + delta)])
-                else:
-                    shifted.append([s, max(s, e + delta)])
-            if not shifted:
-                return
-            prev["intervals"] = shifted
-            if len(shifted) == 1:
-                prev["start"] = None if (shifted[0][0] == 1 and shifted[0][1] is None) else shifted[0][0]
-                prev["end"] = shifted[0][1]
+    if edits is None:
+        edits = [(old_text, new_text, bool(replace_all))] if isinstance(old_text, str) and isinstance(new_text, str) else []
+    edits = [(o, n, bool(ra)) for o, n, ra in edits if isinstance(o, str) and isinstance(n, str)]
 
     target = Path(file_path)
     try:
@@ -998,16 +1268,77 @@ def seed_after_edit(
     if b"\x00" in raw_bytes[:4096]:
         return
     now = time.time()
+    actual = raw_bytes.decode("utf-8", errors="replace") if len(raw_bytes) <= _MAX_SNAPSHOT_BYTES else None
+    full_covered = _intervals_cover(prev, None, None)
+    snap = _snapshot_text(prev, env)
+
+    if isinstance(snap, str) and edits:
+        expected: tuple[str, list[tuple[int, int, int]] | None] | None = None
+        for variant in _edit_variants(snap, edits):
+            expected = _apply_edits(snap, variant)
+            if expected is not None and actual is not None and _same_text(expected[0], actual):
+                break
+        else:
+            # Disk differs from what the model expects (formatter, external write, or an edit
+            # the cache can't model). Keep the model's view so the next read is an exact diff.
+            record_funnel_event("edit_seed", "mismatch", env=env)
+            if expected is not None and full_covered and len(expected[0].encode("utf-8")) <= _MAX_SNAPSHOT_BYTES:
+                prev["sha"] = hashlib.sha256(expected[0].encode("utf-8")).hexdigest()
+                prev["snapshot"] = expected[0]
+                prev.pop("mtime_ns", None)
+                prev["soft_denies"] = 0
+                prev["ts"] = now
+                store["reads"][key] = prev
+                _save_store(session_id, store, now, env)
+            return
+        assert expected is not None
+        if not full_covered:
+            spans = expected[1]
+            if not spans:
+                return
+            ivs: list[Any] = (
+                prev.get("intervals")
+                if isinstance(prev.get("intervals"), list) and prev.get("intervals")
+                else [[prev.get("start") or 1, prev.get("end")]]
+            )
+            probe = dict(prev)
+            for edit_start, edit_end, delta in spans:
+                probe["intervals"] = ivs
+                if not _intervals_cover(probe, edit_start, edit_end):
+                    return
+                if delta:
+                    ivs = _shift_intervals(ivs, edit_start, edit_end, delta)
+                    if not ivs:
+                        return
+            prev["intervals"] = ivs
+            if len(ivs) == 1:
+                prev["start"] = None if (ivs[0][0] == 1 and ivs[0][1] is None) else ivs[0][0]
+                prev["end"] = ivs[0][1]
+    else:
+        # No snapshot to replay against (large file) or unknown edit payload: only seed a
+        # fully-read file when the byte-size change matches the edits exactly.
+        if not full_covered or not edits or any(ra for _, _, ra in edits):
+            return
+        prev_size = prev.get("size")
+        if not isinstance(prev_size, int):
+            return
+        lf_delta = sum(len(n.encode("utf-8")) - len(o.encode("utf-8")) for o, n, _ in edits)
+        crlf_delta = lf_delta + sum(n.count("\n") - o.count("\n") for o, n, _ in edits)
+        if st.st_size - prev_size not in (lf_delta, crlf_delta):
+            return
+        if any(n and n.replace("\r\n", "\n").encode("utf-8") not in raw_bytes.replace(b"\r\n", b"\n") for _, n, _ in edits):
+            return
+
     prev["sha"] = hashlib.sha256(raw_bytes).hexdigest()
     prev["mtime_ns"] = st.st_mtime_ns
     prev["size"] = st.st_size
     prev["soft_denies"] = 0
     prev["outline_only"] = False
     prev["ts"] = now
-    if len(raw_bytes) <= _MAX_SNAPSHOT_BYTES:
-        prev["snapshot"] = raw_bytes.decode("utf-8", errors="replace")
+    if actual is not None:
+        prev["snapshot"] = actual
     else:
-        prev.pop("snapshot", None)
+        _drop_snapshot(prev)
     store["reads"][key] = prev
     _save_store(session_id, store, now, env)
 
@@ -1052,28 +1383,37 @@ def invalidate_on_edit(
             entry["outline_only"] = False
             entry.pop("mtime_ns", None)
             changed = True
-        mcp_map = store.get("mcp")
-        if isinstance(mcp_map, dict):
-            stale_mcp = [
-                k for k, v in mcp_map.items()
-                if isinstance(v, dict)
-                and any(tok in str(v.get("tool") or "").lower() for tok in ("terser-index", "terser_index"))
-            ]
-            for k in stale_mcp:
-                mcp_map.pop(k, None)
-                changed = True
+        # Any MCP server (code indexes, docs-from-repo, DB views) may read the edited file.
+        if isinstance(store.get("mcp"), dict) and store["mcp"]:
+            store["mcp"] = {}
+            changed = True
         if changed:
             _save_store(sid, store, now, env)
 
 
-def _is_mutating_or_live_mcp(name: str) -> bool:
-    # Strip MCP server prefix (`server:tool` or `mcp__server__tool`) so server names
-    # like `terser-index` don't misclassify read-only tools such as `search_symbols`.
-    tool_part = name.rsplit(":", 1)[-1]
+def _split_mcp_name(name: str) -> tuple[str, str]:
+    """``(server, tool)`` for ``server:tool``, ``mcp__server__tool`` or a bare tool name."""
+    server = ""
+    tool_part = name
+    if ":" in tool_part:
+        server, tool_part = tool_part.rsplit(":", 1)
     if "__" in tool_part:
-        tool_part = tool_part.rsplit("__", 1)[-1]
+        head, tool_part = tool_part.rsplit("__", 1)
+        server = server or head
+    if server.startswith("mcp__"):
+        server = server[5:]
+    return server, tool_part
+
+
+def _is_mutating_or_live_mcp(name: str) -> bool:
+    # Tool tokens decide on their own; server tokens only mark live-state servers, so server
+    # names like `terser-index` never misclassify read-only tools such as `search_symbols`.
+    server, tool_part = _split_mcp_name(name)
     tokens = [t for t in re.split(r"[^a-z0-9]+", tool_part.lower()) if t]
-    return any(t in _MUTATING_OR_LIVE_MCP_TOKENS for t in tokens)
+    if any(t in _MUTATING_OR_LIVE_MCP_TOKENS for t in tokens):
+        return True
+    server_tokens = [t for t in re.split(r"[^a-z0-9]+", server.lower()) if t]
+    return any(t in _LIVE_MCP_SERVER_TOKENS for t in server_tokens)
 
 
 def check_mcp_refetch(
@@ -1087,11 +1427,18 @@ def check_mcp_refetch(
     env: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """Bounded duplicate-call guard for identical read-only MCP calls within 120s."""
-    if not cfg.get("mcp_refetch_guard", True) or cfg.get("shadow"):
+    if host == "codex" or not cfg.get("mcp_refetch_guard", True) or cfg.get("shadow"):
         return None
     if not session_id or not _SID_RE.match(session_id):
         return None
-    if not display_name or _is_mutating_or_live_mcp(display_name):
+    if not display_name:
+        return None
+    if _is_mutating_or_live_mcp(display_name):
+        # A mutating or live call can change what any earlier read-only call would return.
+        store = _load_store(session_id, env)
+        if store.get("mcp"):
+            store["mcp"] = {}
+            _save_store(session_id, store, time.time() if now is None else float(now), env)
         return None
 
     now = time.time() if now is None else float(now)
@@ -1145,3 +1492,52 @@ def record_mcp_response_size(
     if isinstance(prev, dict):
         prev["resp_bytes"] = int(resp_bytes)
         _save_store(session_id, store, time.time(), env)
+
+
+def check_search_repeat(
+    session_id: str,
+    tool_name: str,
+    tool_input: Any,
+    output: str,
+    *,
+    basis: str | None = None,
+    cwd: str = "",
+    host: str = "claude",
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """Elide a Glob/Grep result identical to one already returned this session (once).
+
+    Returns the replacement text, or None to pass the output through. An immediate
+    identical re-run always gets the full output, and /compact clears this state.
+    """
+    if not session_id or not _SID_RE.match(session_id) or len(output) <= 600:
+        return None
+    try:
+        canonical = json.dumps({"t": tool_name, "a": tool_input, "cwd": cwd}, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+    fp = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    # `basis` is the result without volatile fields (e.g. `durationMs`), so timing alone
+    # never makes two identical results look different.
+    out_hash = hashlib.sha256((basis if basis is not None else output).encode("utf-8", errors="replace")).hexdigest()[:32]
+    now = time.time()
+    store = _load_store(session_id, env)
+    searches = store["searches"]
+    prev = searches.get(fp)
+    if isinstance(prev, dict) and prev.get("h") == out_hash:
+        if int(prev.get("soft") or 0) < _SOFT_DENY_CAP:
+            prev["soft"] = int(prev.get("soft") or 0) + 1
+            prev["ts"] = now
+            _save_store(session_id, store, now, env)
+            lines = output.count("\n") + 1
+            msg = (
+                f"[Terser] Same {tool_name} arguments returned the identical result ({lines} lines) "
+                "earlier in this session. Reuse that result, or run it again to get the full output."
+            )
+            record_savings("search_repeat", len(output), len(msg), host=host, detail=tool_name, env=env)
+            record_funnel_event("search_repeat", "served", host=host, env=env)
+            return msg
+        record_funnel_event("search_repeat", "retry", host=host, env=env)
+    searches[fp] = {"h": out_hash, "soft": 0, "ts": now}
+    _save_store(session_id, store, now, env)
+    return None

@@ -13,27 +13,53 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Six targets. Non-native targets are cross-compiled with `--target`, so the
+        # job does not depend on ARM / Intel runner availability for this repo.
         include:
           - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
             artifact: terser-fast-linux-x86_64
             bin: terser-fast
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: terser-fast-linux-aarch64
+            bin: terser-fast
+            cross_linux: true
           - os: macos-latest
+            target: aarch64-apple-darwin
             artifact: terser-fast-macos-aarch64
             bin: terser-fast
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: terser-fast-macos-x86_64
+            bin: terser-fast
           - os: windows-latest
+            target: x86_64-pc-windows-msvc
             artifact: terser-fast-windows-x86_64.exe
+            bin: terser-fast.exe
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            artifact: terser-fast-windows-aarch64.exe
             bin: terser-fast.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install aarch64 Linux cross linker
+        if: matrix.cross_linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - name: Build release binary
-        run: cargo build --release --manifest-path native/terser-fast/Cargo.toml
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path native/terser-fast/Cargo.toml
       - name: Stage artifact
         shell: bash
         run: |
           mkdir -p release-assets
-          cp "native/terser-fast/target/release/${{ matrix.bin }}" "release-assets/${{ matrix.artifact }}"
+          cp "native/terser-fast/target/${{ matrix.target }}/release/${{ matrix.bin }}" "release-assets/${{ matrix.artifact }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -47,6 +73,12 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+      - name: Write SHA256SUMS
+        working-directory: release-assets
+        run: |
+          count=$(ls terser-fast-* | wc -l)
+          if [ "$count" -ne 6 ]; then echo "expected 6 binaries, found $count"; ls -la; exit 1; fi
+          sha256sum terser-fast-* > SHA256SUMS
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

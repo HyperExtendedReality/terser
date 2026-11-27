@@ -5,8 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SessionStart",
-            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event SessionStart } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event SessionStart } }",
+            "command": "sh \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SessionStart",
+            "commandWindows": "& (Join-Path $env:PLUGIN_ROOT 'scripts\\terse-hook.cmd') --host codex --event SessionStart",
             "timeout": 15
           }
         ]
@@ -17,8 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SubagentStart",
-            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event SubagentStart } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event SubagentStart } }",
+            "command": "sh \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SubagentStart",
+            "commandWindows": "& (Join-Path $env:PLUGIN_ROOT 'scripts\\terse-hook.cmd') --host codex --event SubagentStart",
             "timeout": 10
           }
         ]
@@ -29,8 +29,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SubagentStop",
-            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event SubagentStop } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event SubagentStop } }",
+            "command": "sh \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SubagentStop",
+            "commandWindows": "& (Join-Path $env:PLUGIN_ROOT 'scripts\\terse-hook.cmd') --host codex --event SubagentStop",
             "timeout": 5
           }
         ]
@@ -41,8 +41,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event UserPromptSubmit",
-            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event UserPromptSubmit } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event UserPromptSubmit } }",
+            "command": "sh \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event UserPromptSubmit",
+            "commandWindows": "& (Join-Path $env:PLUGIN_ROOT 'scripts\\terse-hook.cmd') --host codex --event UserPromptSubmit",
             "timeout": 10
           }
         ]
@@ -50,11 +50,12 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "^(Bash|mcp__(plugin_terser_)?terser[-_]index__(menu|route|order))$",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event PreToolUse",
-            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event PreToolUse } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event PreToolUse } }",
+            "command": "sh \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event PreToolUse",
+            "commandWindows": "& (Join-Path $env:PLUGIN_ROOT 'scripts\\terse-hook.cmd') --host codex --event PreToolUse",
             "timeout": 10
           }
         ]
@@ -62,12 +63,25 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "^(Bash|apply_patch|Edit|Write|MultiEdit|NotebookEdit|mcp__.*)$",
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event PostToolUse",
-            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event PostToolUse } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event PostToolUse } }",
+            "command": "sh \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event PostToolUse",
+            "commandWindows": "& (Join-Path $env:PLUGIN_ROOT 'scripts\\terse-hook.cmd') --host codex --event PostToolUse",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event PostCompact",
+            "commandWindows": "& (Join-Path $env:PLUGIN_ROOT 'scripts\\terse-hook.cmd') --host codex --event PostCompact",
+            "timeout": 5
           }
         ]
       }
@@ -77,8 +91,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event Stop",
-            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event Stop } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event Stop } }",
+            "command": "sh \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event Stop",
+            "commandWindows": "& (Join-Path $env:PLUGIN_ROOT 'scripts\\terse-hook.cmd') --host codex --event Stop",
             "timeout": 10
           }
         ]
@@ -89,8 +103,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SessionEnd",
-            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event SessionEnd } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event SessionEnd } }",
+            "command": "sh \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SessionEnd",
+            "commandWindows": "& (Join-Path $env:PLUGIN_ROOT 'scripts\\terse-hook.cmd') --host codex --event SessionEnd",
             "timeout": 3
           }
         ]

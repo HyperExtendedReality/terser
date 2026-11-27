@@ -22,19 +22,19 @@ _LOW_SIGNALS = (
 
 _TIERS: dict[str, dict[str, str]] = {
     "low": {
-        "antigravity": "Gemini Flash (Low/Medium)",
+        "antigravity": "Flash Lite / Flash (subagent: flash_lite or flash, effort: low)",
         "claude": "Claude Haiku (fast/cheap, ~80% cheaper than Opus)",
-        "codex": "GPT-5.6 Luna / GPT-5.4-Mini (Low reasoning effort)",
+        "codex": "GPT-5.4-Mini / Codex Mini (Low reasoning effort)",
     },
     "medium": {
-        "antigravity": "Gemini Flash / Neon (Medium)",
+        "antigravity": "Gemini Flash / Gemini 4 Neon (subagent: flash, effort: medium)",
         "claude": "Claude Sonnet (balanced, ~60% cheaper than Opus)",
-        "codex": "GPT-5.6 Terra (Medium reasoning effort)",
+        "codex": "GPT-5.4 / Codex (Medium reasoning effort)",
     },
     "high": {
-        "antigravity": "Gemini Pro / Neon (High)",
+        "antigravity": "Gemini Pro / Gemini 4 Neon (subagent: pro, effort: high)",
         "claude": "Claude Opus (frontier reasoning)",
-        "codex": "GPT-5.6 Sol (High reasoning effort)",
+        "codex": "GPT-5.4 Pro / Codex High (High reasoning effort)",
     },
 }
 

@@ -3,7 +3,8 @@
 ///   2. Git lockfile / minified-asset diff elision
 ///   3. Stream filters (Cargo, Go, pytest, npm/pnpm/uv/pip)
 ///   4. Consecutive duplicate-line collapsing (never touches errors/warnings/diffs)
-
+///
+/// Entry point for stage 1:
 pub fn strip_ansi_and_progress(text: &str) -> String {
     if text.is_empty() {
         return String::new();
@@ -151,7 +152,9 @@ pub fn elide_lockfile_diffs(text: &str) -> String {
     for line in text.lines() {
         if line.starts_with("diff --git ") {
             if in_lockfile && elided_count > 0 {
-                out.push(format!("  [... elided lockfile/generated diff ({elided_count} lines) ...]"));
+                out.push(format!(
+                    "  [... elided lockfile/generated diff ({elided_count} lines) ...]"
+                ));
             }
             elided_count = 0;
             in_lockfile = is_lockfile_path(line);
@@ -163,7 +166,9 @@ pub fn elide_lockfile_diffs(text: &str) -> String {
         }
     }
     if in_lockfile && elided_count > 0 {
-        out.push(format!("  [... elided lockfile/generated diff ({elided_count} lines) ...]"));
+        out.push(format!(
+            "  [... elided lockfile/generated diff ({elided_count} lines) ...]"
+        ));
     }
     out.join("\n")
 }
@@ -251,7 +256,8 @@ pub fn apply_stream_filters(text: &str, command: &str) -> String {
     for line in text.lines() {
         let t = line.trim_start();
         let test_pass = is_test
-            && ((t.contains("::") && (t.ends_with(" PASSED") || t.contains(" PASSED [") || t.ends_with(" SKIPPED")))
+            && ((t.contains("::")
+                && (t.ends_with(" PASSED") || t.contains(" PASSED [") || t.ends_with(" SKIPPED")))
                 || (t.starts_with("test_") && t.ends_with("... ok"))
                 || t.starts_with("✓ ")
                 || t.starts_with("PASS "));
@@ -304,7 +310,9 @@ pub fn apply_stream_filters(text: &str, command: &str) -> String {
     if !joined.is_empty() {
         joined.push('\n');
     }
-    joined.push_str(&format!("[Terser: filtered {dropped} noisy build/progress lines]"));
+    joined.push_str(&format!(
+        "[Terser: filtered {dropped} noisy build/progress lines]"
+    ));
     joined
 }
 
@@ -351,9 +359,7 @@ pub fn collapse_duplicate_lines(text: &str, min_run: usize) -> String {
             out.push(line.to_string());
             out.push(format!("  [... repeated {}x more ...]", run_len - 1));
         } else {
-            for k in i..j {
-                out.push(lines[k].to_string());
-            }
+            out.extend(lines[i..j].iter().map(|l| l.to_string()));
         }
         i = j;
     }
@@ -472,9 +478,7 @@ pub fn fold_framework_stack_frames(text: &str, min_run: usize) -> String {
                     "  [... {frames} framework/stdlib stack frames omitted ...]"
                 ));
             } else {
-                for k in start..i {
-                    out.push(lines[k].to_string());
-                }
+                out.extend(lines[start..i].iter().map(|l| l.to_string()));
             }
         } else {
             out.push(ln.to_string());
@@ -598,9 +602,7 @@ pub fn compact_aligned_tables(text: &str) -> String {
                     continue;
                 }
             }
-            for k in i..j {
-                out.push(lines[k].to_string());
-            }
+            out.extend(lines[i..j].iter().map(|l| l.to_string()));
             i = j;
         } else {
             out.push(lines[i].to_string());
@@ -632,7 +634,7 @@ pub fn error_pinned_window(text: &str, max_chars: usize) -> String {
     for (offset, ln) in mid.iter().enumerate() {
         if is_signal_line(ln) {
             let entry = format!("L{}: {ln}", head_n + offset + 1);
-            if used + entry.len() + 1 <= pinned_budget {
+            if used + entry.len() < pinned_budget {
                 used += entry.len() + 1;
                 pinned.push(entry);
             }
@@ -680,6 +682,56 @@ pub fn compress_output_with_ws(text: &str, command: &str, workspace: Option<&str
     collapse_duplicate_lines(&s7, 3)
 }
 
+/// Size above which even an explicitly scoped read gets the error-pinned window.
+pub const SCOPED_READ_MAX: usize = 40_000;
+
+/// True when the command already selects a line range (`sed -n A,Bp`, `head -n N`,
+/// `tail -n N`, `awk 'NR..'`, PowerShell `-TotalCount`/`-Tail`/`Select-Object -First`).
+/// The agent asked for exactly those lines, so they are not elided mid-output.
+pub fn is_scoped_read(command: &str) -> bool {
+    let low = command.to_ascii_lowercase();
+    let toks: Vec<&str> = low.split_whitespace().collect();
+    for (i, t) in toks.iter().enumerate() {
+        let next = toks.get(i + 1).copied().unwrap_or("");
+        let bare = t.trim_start_matches(['|', '(']);
+        match bare {
+            "sed" if next == "-n" => {
+                let arg = toks
+                    .get(i + 2)
+                    .copied()
+                    .unwrap_or("")
+                    .trim_matches(|c| c == '\'' || c == '"');
+                if arg.ends_with('p') && arg[..arg.len() - 1].chars().any(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+            "head" | "tail" => {
+                if next == "-n"
+                    || next.starts_with("-n")
+                    || (next.len() > 1
+                        && next[1..].chars().all(|c| c.is_ascii_digit())
+                        && next.starts_with('-'))
+                {
+                    return true;
+                }
+            }
+            "awk" if next.trim_start_matches(['\'', '"']).starts_with("nr") => return true,
+            "-totalcount" | "-tail" | "-head" | "-first" | "-last" | "-index" => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The window cap for a command's output: raised for explicitly scoped reads.
+pub fn window_limit(command: &str, default: usize) -> usize {
+    if is_scoped_read(command) {
+        default.max(SCOPED_READ_MAX)
+    } else {
+        default
+    }
+}
+
 pub fn compress_output(text: &str, command: &str) -> String {
     compress_output_with_ws(text, command, None)
 }
@@ -687,6 +739,18 @@ pub fn compress_output(text: &str, command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_reads_are_detected() {
+        assert!(is_scoped_read("sed -n '10,50p' README.md"));
+        assert!(is_scoped_read("cat a.log | head -n 40"));
+        assert!(is_scoped_read("tail -200 build.log"));
+        assert!(is_scoped_read("Get-Content x.txt -TotalCount 30"));
+        assert!(!is_scoped_read("cargo build"));
+        assert!(!is_scoped_read("sed -i s/a/b/ f"));
+        assert_eq!(window_limit("cargo test", 12000), 12000);
+        assert_eq!(window_limit("head -n 5 f", 12000), SCOPED_READ_MAX);
+    }
 
     #[test]
     fn strips_ansi_and_preserves_osc8_label() {

@@ -47,7 +47,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Read|Grep|Bash|Agent|Task|mcp__.*",
+        "matcher": "Read|Grep|Bash|PowerShell|Agent|Task|mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -71,7 +71,7 @@
     ],
     "PostToolUseFailure": [
       {
-        "matcher": "Bash|PowerShell|Read|Edit|Write|mcp__.*",
+        "matcher": "Bash|PowerShell|Read|Glob|Grep|Edit|MultiEdit|Write|mcp__.*",
         "hooks": [
           {
             "type": "command",

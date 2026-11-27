@@ -1,0 +1,976 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Terser HUD</title>
+<style>
+  :root {
+    --bg-1: var(--color-background-primary, #0f1117);
+    --bg-2: var(--color-background-secondary, #161a23);
+    --bg-3: var(--color-background-tertiary, #1f2533);
+    --fg-1: var(--color-text-primary, #e6edf3);
+    --fg-2: var(--color-text-secondary, #9aa4b2);
+    --fg-3: var(--color-text-tertiary, #6e7889);
+    --bd-1: var(--color-border-primary, rgba(255, 255, 255, 0.12));
+    --bd-2: var(--color-border-secondary, rgba(255, 255, 255, 0.07));
+    --accent: #14b8a6;
+    --accent-soft: rgba(20, 184, 166, 0.14);
+    --ok: var(--color-text-success, #34d399);
+    --ok-bg: var(--color-background-success, rgba(52, 211, 153, 0.14));
+    --warn: var(--color-text-warning, #fbbf24);
+    --warn-bg: var(--color-background-warning, rgba(251, 191, 36, 0.15));
+    --err: var(--color-text-danger, #f87171);
+    --err-bg: var(--color-background-danger, rgba(248, 113, 113, 0.15));
+    --info: var(--color-text-info, #60a5fa);
+    --font: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --radius: 10px;
+  }
+  [data-theme="light"] {
+    --bg-1: var(--color-background-primary, #ffffff);
+    --bg-2: var(--color-background-secondary, #f6f8fa);
+    --bg-3: var(--color-background-tertiary, #eaeef2);
+    --fg-1: var(--color-text-primary, #1f2328);
+    --fg-2: var(--color-text-secondary, #59636e);
+    --fg-3: var(--color-text-tertiary, #818b98);
+    --bd-1: var(--color-border-primary, rgba(31, 35, 40, 0.14));
+    --bd-2: var(--color-border-secondary, rgba(31, 35, 40, 0.08));
+    --accent: #0f766e;
+    --accent-soft: rgba(15, 118, 110, 0.10);
+    --ok: var(--color-text-success, #059669);
+    --ok-bg: var(--color-background-success, rgba(5, 150, 105, 0.12));
+    --warn: var(--color-text-warning, #d97706);
+    --warn-bg: var(--color-background-warning, rgba(217, 119, 6, 0.12));
+    --err: var(--color-text-danger, #dc2626);
+    --err-bg: var(--color-background-danger, rgba(220, 38, 38, 0.12));
+    --info: var(--color-text-info, #2563eb);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg-1);
+    color: var(--fg-1);
+    font-family: var(--font);
+    font-size: 13px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  .shell {
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  /* ---- Docked Status Bar Tab ---- */
+  .status-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 10px;
+    padding: 8px 12px;
+    background: var(--bg-2);
+    border: 1px solid var(--bd-1);
+    border-radius: var(--radius);
+  }
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    color: var(--accent);
+    white-space: nowrap;
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--ok);
+    display: inline-block;
+  }
+  .dot.warn { background: var(--warn); }
+  .dot.err { background: var(--err); }
+  .sep {
+    width: 1px;
+    height: 16px;
+    background: var(--bd-1);
+  }
+  .stat {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat .v { font-weight: 600; }
+  .stat .sub { color: var(--fg-2); font-size: 12px; }
+  .ok { color: var(--ok); }
+  .warn { color: var(--warn); }
+  .err { color: var(--err); }
+  .info { color: var(--info); }
+  .muted { color: var(--fg-2); }
+
+  .meter-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .meter {
+    width: 58px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--bg-3);
+    overflow: hidden;
+    border: 1px solid var(--bd-2);
+  }
+  .meter-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: var(--ok);
+    transition: width 0.25s ease;
+  }
+  .meter-fill.warn { background: var(--warn); }
+  .meter-fill.err { background: var(--err); }
+
+  .grade-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 22px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 11px;
+    background: var(--ok-bg);
+    color: var(--ok);
+  }
+  .grade-badge.B { background: rgba(96, 165, 250, 0.16); color: var(--info); }
+  .grade-badge.C { background: var(--warn-bg); color: var(--warn); }
+  .grade-badge.D, .grade-badge.F { background: var(--err-bg); color: var(--err); }
+
+  .spacer { flex: 1 1 auto; }
+
+  .bar-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  select, button, input[type="number"] {
+    font-family: inherit;
+    font-size: 12px;
+    color: var(--fg-1);
+    background: var(--bg-3);
+    border: 1px solid var(--bd-1);
+    border-radius: 7px;
+    padding: 4px 8px;
+    outline: none;
+  }
+  select:focus, button:focus-visible, input:focus {
+    border-color: var(--accent);
+  }
+  button {
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-weight: 500;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  button.icon-btn {
+    padding: 4px 7px;
+  }
+
+  /* ---- Banner / Error ---- */
+  .banner {
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    background: var(--warn-bg);
+    color: var(--warn);
+    border: 1px solid var(--bd-1);
+  }
+  .hidden { display: none !important; }
+
+  /* ---- Details Dashboard ---- */
+  .details {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 8px;
+  }
+  .kpi {
+    background: var(--bg-2);
+    border: 1px solid var(--bd-1);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .kpi-label { font-size: 11px; color: var(--fg-2); text-transform: uppercase; letter-spacing: 0.04em; }
+  .kpi-val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi-sub { font-size: 11px; color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 10px;
+  }
+  .card {
+    background: var(--bg-2);
+    border: 1px solid var(--bd-1);
+    border-radius: var(--radius);
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .card-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .kv {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .kv .k { color: var(--fg-2); }
+  .kv .v { font-weight: 500; text-align: right; }
+
+  .cat-row {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .cat-bar {
+    width: 100%;
+    height: 5px;
+    border-radius: 999px;
+    background: var(--bg-3);
+    overflow: hidden;
+  }
+  .cat-bar > div {
+    height: 100%;
+    background: var(--ok);
+    border-radius: 999px;
+  }
+
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .chip {
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: var(--bg-3);
+    border: 1px solid var(--bd-2);
+    color: var(--fg-2);
+    font-family: var(--mono);
+  }
+  .engine-pill {
+    font-size: 11px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    background: var(--bg-3);
+    border: 1px solid var(--bd-1);
+    color: var(--fg-2);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .engine-pill.on {
+    background: var(--ok-bg);
+    border-color: rgba(52, 211, 153, 0.35);
+    color: var(--fg-1);
+  }
+  .engine-pill .pdot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--fg-3);
+  }
+  .engine-pill.on .pdot { background: var(--ok); }
+
+  .reasons {
+    margin: 0;
+    padding-left: 16px;
+    font-size: 12px;
+    color: var(--warn);
+  }
+  .price-form {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 2px;
+  }
+  .price-form input { width: 70px; font-variant-numeric: tabular-nums; }
+  .foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11px;
+    color: var(--fg-3);
+    padding: 0 2px;
+  }
+</style>
+</head>
+<body>
+<div class="shell" id="app">
+  <!-- Docked Status Bar Tab -->
+  <div class="status-bar" role="region" aria-label="Terser Status Bar">
+    <span class="brand">
+      <span class="dot" id="status-dot"></span>
+      <span>◆ Terser</span>
+      <span class="muted" id="ver-label" style="font-weight:500;font-size:11px;"></span>
+    </span>
+    <span class="sep"></span>
+    <span class="stat" title="Tokens kept out of context this session">
+      <span class="v ok" id="bar-saved">↓ 0</span>
+      <span class="sub" id="bar-saved-usd">saved · $0.000</span>
+    </span>
+    <span class="sep"></span>
+    <span class="stat" id="bar-cost-wrap" title="Estimated session API cost and token usage">
+      <span class="v" id="bar-cost">–</span>
+      <span class="sub" id="bar-tokens"></span>
+    </span>
+    <span class="sep" id="sep-ctx"></span>
+    <span class="stat meter-wrap" id="bar-ctx-wrap" title="Current context window fill and cache hit rate">
+      <span class="sub">ctx</span>
+      <span class="meter"><span class="meter-fill" id="bar-ctx-fill" style="width:0%"></span></span>
+      <span class="v" id="bar-ctx-pct">–</span>
+      <span class="sub" id="bar-cache"></span>
+    </span>
+    <span class="grade-badge hidden" id="bar-grade" title="Session quality grade"></span>
+
+    <span class="spacer"></span>
+
+    <span class="bar-actions">
+      <select id="bar-router" aria-label="Low-cost subagent router" title="Low-cost subagent router">
+        <option value="off">Router: Off</option>
+        <option value="flash_lite">Router: Flash Lite</option>
+        <option value="flash">Router: Flash</option>
+        <option value="pro">Router: Pro</option>
+      </select>
+      <button type="button" id="btn-details" class="primary" aria-expanded="false">Details ▾</button>
+      <button type="button" id="btn-refresh" class="icon-btn" title="Refresh now" aria-label="Refresh">↻</button>
+    </span>
+  </div>
+
+  <div id="err-banner" class="banner hidden" role="status"></div>
+
+  <!-- Full Extras & Details Window / Panel -->
+  <div id="details-panel" class="details hidden" role="region" aria-label="Terser Extras Details">
+    <div class="kpi-grid" id="kpi-grid"></div>
+    <div class="cards" id="cards-grid"></div>
+    <div class="foot">
+      <span id="foot-meta">Live telemetry · auto-refresh every 15s</span>
+      <span id="foot-updated"></span>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  const CAT_LABEL = {
+    read_dedup: 'Read dedup',
+    read_outline: 'Outline-first reads',
+    read_delta: 'Read deltas',
+    output_compress: 'Output compression',
+    fts_sandbox: 'FTS sandbox',
+    cmd_delta: 'Command deltas',
+    form_repair: 'Form repair',
+    mcp_refetch: 'MCP refetch guard',
+  };
+
+  const FEATURE_LABEL = {
+    read_cache: 'Read cache',
+    delta_diff: 'Delta reads',
+    outline_first: 'Outline first',
+    form_repair: 'Form repair',
+    bash_compress: 'Shell compress',
+    cmd_delta: 'Cmd deltas',
+    fts_sandbox: 'FTS sandbox',
+    loop_guard: 'Loop guard',
+    mcp_refetch_guard: 'MCP refetch',
+    repo_map: 'Repo map',
+    index_auto_reindex: 'Auto reindex',
+    toolprune: 'Tool prune',
+    code_discipline: 'Code discipline',
+  };
+
+  const state = {
+    data: null,
+    error: null,
+    detailsOpen: window.innerWidth >= 720,
+    userToggledDetails: false,
+    busy: false,
+    hostCaps: {},
+    hostCtx: {},
+  };
+
+  // ---- Formatters ----
+  const fmtTok = (n) => {
+    const v = Number(n || 0);
+    if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+    if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+    if (v >= 1e3) return (v / 1e3).toFixed(1) + 'k';
+    return String(Math.round(v));
+  };
+  const fmtUsd = (n) => {
+    const v = Number(n || 0);
+    if (v >= 100) return '$' + v.toFixed(0);
+    if (v >= 1) return '$' + v.toFixed(2);
+    return '$' + v.toFixed(3);
+  };
+  const fmtPct = (f) => (f == null ? '–' : Math.round(Number(f) * 100) + '%');
+  const ctxCls = (f) => (f == null ? '' : f >= 0.85 ? 'err' : f >= 0.7 ? 'warn' : 'ok');
+  const catLabel = (c) => CAT_LABEL[c] || String(c).replace(/_/g, ' ');
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+
+  // ---- Theme / Host Context ----
+  function applyHostContext(ctx) {
+    if (!ctx || typeof ctx !== 'object') return;
+    state.hostCtx = Object.assign({}, state.hostCtx, ctx);
+    if (ctx.theme === 'light' || ctx.theme === 'dark') {
+      document.documentElement.setAttribute('data-theme', ctx.theme);
+    }
+    const vars = ctx.styles && ctx.styles.variables;
+    if (vars && typeof vars === 'object') {
+      for (const [k, v] of Object.entries(vars)) {
+        if (typeof k === 'string' && k.startsWith('--') && typeof v === 'string') {
+          document.documentElement.style.setProperty(k, v);
+        }
+      }
+    }
+  }
+
+  // ---- SEP-1865 MCP Apps JSON-RPC Bridge ----
+  let nextRpcId = 1;
+  const pending = new Map();
+  const inIframe = window.parent && window.parent !== window;
+
+  function postRpc(msg) {
+    if (!inIframe) return;
+    window.parent.postMessage(msg, '*');
+  }
+
+  function sendRequest(method, params) {
+    if (!inIframe) return Promise.reject(new Error('Not hosted in MCP App iframe'));
+    const id = nextRpcId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error('Request timed out: ' + method));
+      }, 15000);
+      pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      postRpc({ jsonrpc: '2.0', id, method, params: params || {} });
+    });
+  }
+
+  function sendNotification(method, params) {
+    postRpc({ jsonrpc: '2.0', method, params: params || {} });
+  }
+
+  function extractSnapshot(toolResult) {
+    if (!toolResult || typeof toolResult !== 'object') return null;
+    if (toolResult.structuredContent && typeof toolResult.structuredContent === 'object') {
+      return toolResult.structuredContent;
+    }
+    return null;
+  }
+
+  function ingestSnapshot(snap) {
+    if (!snap) return;
+    state.data = snap;
+    state.error = snap.error && !snap.lifetime ? String(snap.error) : null;
+    if (!state.userToggledDetails && snap.initial_view) {
+      state.detailsOpen = snap.initial_view === 'details';
+    }
+    render();
+  }
+
+  window.addEventListener('message', (event) => {
+    const msg = event.data;
+    if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') return;
+    if ('id' in msg && !msg.method) {
+      const slot = pending.get(msg.id);
+      if (!slot) return;
+      pending.delete(msg.id);
+      if (msg.error) slot.reject(new Error(msg.error.message || 'RPC error'));
+      else slot.resolve(msg.result);
+      return;
+    }
+    if (msg.method === 'ping' && 'id' in msg) {
+      postRpc({ jsonrpc: '2.0', id: msg.id, result: {} });
+      return;
+    }
+    if (msg.method === 'ui/notifications/host-context-changed') {
+      applyHostContext(msg.params);
+    } else if (msg.method === 'ui/notifications/tool-result') {
+      const snap = extractSnapshot(msg.params);
+      if (snap) ingestSnapshot(snap);
+    } else if (msg.method === 'ui/notifications/tool-input') {
+      const args = msg.params && msg.params.arguments;
+      if (args && args.view && !state.userToggledDetails) {
+        state.detailsOpen = args.view === 'details';
+        render();
+      }
+    }
+  });
+
+  async function callServerTool(name, args) {
+    const res = await sendRequest('tools/call', { name, arguments: args || {} });
+    const snap = extractSnapshot(res);
+    if (snap) ingestSnapshot(snap);
+    return res;
+  }
+
+  async function refresh() {
+    if (state.busy || !inIframe) return;
+    state.busy = true;
+    try {
+      await callServerTool('terser_hud_snapshot', {});
+      state.error = null;
+    } catch (e) {
+      state.error = e instanceof Error ? e.message : String(e);
+      render();
+    } finally {
+      state.busy = false;
+    }
+  }
+
+  async function updateConfig(updates) {
+    if (!inIframe) return;
+    try {
+      await callServerTool('terser_hud_set_config', { updates });
+      state.error = null;
+    } catch (e) {
+      state.error = e instanceof Error ? e.message : String(e);
+      render();
+    }
+  }
+
+  // ---- Auto-resize notification for inline mode ----
+  const reportSize = () => {
+    const h = Math.ceil(document.documentElement.scrollHeight);
+    const w = Math.ceil(document.documentElement.scrollWidth);
+    sendNotification('ui/notifications/size-changed', { width: w, height: h });
+  };
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(reportSize).observe(document.body);
+  }
+
+  // ---- Rendering ----
+  function renderRouterOptions(host, current) {
+    const sel = document.getElementById('bar-router');
+    const isAg = host === 'antigravity';
+    const opts = isAg
+      ? [
+          ['off', 'Router: Off'],
+          ['flash_lite', 'Router: Flash Lite'],
+          ['flash', 'Router: Flash'],
+          ['pro', 'Router: Pro'],
+        ]
+      : [
+          ['off', 'Router: Off'],
+          ['haiku', 'Router: Haiku'],
+          ['sonnet', 'Router: Sonnet'],
+          ['opus', 'Router: Opus'],
+        ];
+    if (!opts.some(([v]) => v === current)) opts.push([current, 'Router: ' + current]);
+    sel.innerHTML = opts.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
+    sel.value = current;
+  }
+
+  function renderCatRows(cats) {
+    if (!cats || cats.length === 0) return '<div class="muted" style="font-size:12px;">No savings recorded yet.</div>';
+    const max = Math.max(1, ...cats.map((c) => Number(c.saved_tok || 0)));
+    return cats.map((c) => {
+      const pctW = Math.max(4, Math.min(100, Math.round((Number(c.saved_tok || 0) / max) * 100)));
+      return `
+        <div class="cat-row">
+          <div class="kv">
+            <span>${esc(catLabel(c.cat))}</span>
+            <span><strong class="ok">${fmtTok(c.saved_tok)}</strong> <span class="muted">· ${esc(c.pct)}% · ${esc(c.events)} hits</span></span>
+          </div>
+          <div class="cat-bar"><div style="width:${pctW}%"></div></div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  function render() {
+    const d = state.data;
+    const errEl = document.getElementById('err-banner');
+    if (state.error) {
+      errEl.textContent = '⚠ ' + state.error;
+      errEl.classList.remove('hidden');
+    } else {
+      errEl.classList.add('hidden');
+    }
+
+    const detailsBtn = document.getElementById('btn-details');
+    const detailsPanel = document.getElementById('details-panel');
+    detailsBtn.textContent = state.detailsOpen ? 'Hide Details ▴' : 'Details ▾';
+    detailsBtn.setAttribute('aria-expanded', String(state.detailsOpen));
+    detailsPanel.classList.toggle('hidden', !state.detailsOpen);
+
+    if (!d) {
+      reportSize();
+      return;
+    }
+
+    const s = d.session || {};
+    const lt = d.lifetime || {};
+    const dot = document.getElementById('status-dot');
+    dot.className = 'dot' + (d.enabled === false ? ' err' : d.shadow ? ' warn' : '');
+    document.getElementById('ver-label').textContent = d.version ? 'v' + d.version : '';
+
+    document.getElementById('bar-saved').textContent = '↓ ' + fmtTok(s.saved_tok ?? lt.saved_tok ?? 0);
+    document.getElementById('bar-saved-usd').textContent =
+      (s.saved_tok != null ? 'session' : 'all-time') + ' · ' + fmtUsd(s.saved_usd ?? lt.saved_usd ?? 0);
+
+    const promptTok = Number(s.input_tok || 0) + Number(s.cache_read_tok || 0) + Number(s.cache_write_tok || 0);
+    if (s.cost_usd != null) {
+      document.getElementById('bar-cost').textContent = fmtUsd(s.cost_usd);
+      document.getElementById('bar-tokens').textContent = `${fmtTok(promptTok)} in · ${fmtTok(s.output_tok)} out`;
+    } else {
+      document.getElementById('bar-cost').textContent = fmtTok(lt.saved_tok || 0) + ' total';
+      document.getElementById('bar-tokens').textContent = fmtUsd(lt.saved_usd || 0) + ' saved';
+    }
+
+    const fill = s.ctx_fill;
+    const fillEl = document.getElementById('bar-ctx-fill');
+    const pctEl = document.getElementById('bar-ctx-pct');
+    if (fill != null) {
+      const cls = ctxCls(fill);
+      fillEl.style.width = Math.min(100, Math.round(fill * 100)) + '%';
+      fillEl.className = 'meter-fill ' + cls;
+      pctEl.textContent = fmtPct(fill);
+      pctEl.className = 'v ' + cls;
+      document.getElementById('bar-cache').textContent = s.cache_hit != null ? '· cache ' + fmtPct(s.cache_hit) : '';
+      document.getElementById('bar-ctx-wrap').classList.remove('hidden');
+      document.getElementById('sep-ctx').classList.remove('hidden');
+    } else {
+      document.getElementById('bar-ctx-wrap').classList.add('hidden');
+      document.getElementById('sep-ctx').classList.add('hidden');
+    }
+
+    const gradeEl = document.getElementById('bar-grade');
+    if (s.grade && s.grade.letter) {
+      gradeEl.textContent = s.grade.letter;
+      gradeEl.className = 'grade-badge ' + s.grade.letter;
+    } else {
+      gradeEl.className = 'grade-badge hidden';
+    }
+
+    const r = d.routing || {};
+    const curRouter = r.enabled ? (r.model || (d.host === 'antigravity' ? 'flash' : 'haiku')) : 'off';
+    renderRouterOptions(d.host || 'antigravity', curRouter);
+
+    if (!state.detailsOpen) {
+      reportSize();
+      return;
+    }
+
+    // ---- KPI Tiles ----
+    const win = s.ctx_window || 1000000;
+    document.getElementById('kpi-grid').innerHTML = `
+      <div class="kpi">
+        <div class="kpi-label">Saved · Session</div>
+        <div class="kpi-val ok">${fmtTok(s.saved_tok || 0)}</div>
+        <div class="kpi-sub">≈ ${fmtUsd(s.saved_usd || 0)} · ${s.events || 0} events</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Est. API Cost</div>
+        <div class="kpi-val">${s.cost_usd != null ? fmtUsd(s.cost_usd) : '–'}</div>
+        <div class="kpi-sub">${s.turns || 0} turns · ${esc(s.model || 'no transcript')}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Context Fill</div>
+        <div class="kpi-val ${ctxCls(s.ctx_fill)}">${fmtPct(s.ctx_fill)}</div>
+        <div class="kpi-sub">of ${fmtTok(win)} · peak ${fmtTok(s.peak_ctx || 0)}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Session Quality</div>
+        <div class="kpi-val ${s.grade ? (s.grade.letter === 'A' ? 'ok' : s.grade.letter === 'B' ? 'info' : s.grade.letter === 'C' ? 'warn' : 'err') : ''}">${s.grade ? esc(s.grade.letter) : '–'}</div>
+        <div class="kpi-sub">${s.grade ? esc(s.grade.score) + '/100' : 'awaiting turns'}</div>
+      </div>
+    `;
+
+    // ---- Cards ----
+    const cards = [];
+
+    if (s.cost_usd != null) {
+      cards.push(`
+        <div class="card">
+          <div class="card-title"><span>API Usage</span><span class="muted">${esc(s.model || '')}</span></div>
+          <div class="kv"><span class="k">Uncached input</span><span class="v">${fmtTok(s.input_tok)}</span></div>
+          <div class="kv"><span class="k">Cache read</span><span class="v">${fmtTok(s.cache_read_tok)}</span></div>
+          <div class="kv"><span class="k">Cache write</span><span class="v">${fmtTok(s.cache_write_tok)}</span></div>
+          <div class="kv"><span class="k">Output</span><span class="v">${fmtTok(s.output_tok)}</span></div>
+          <div class="kv"><span class="k">Prompt total</span><span class="v">${fmtTok(promptTok)}</span></div>
+          <div class="kv"><span class="k">Cache hit rate</span><span class="v ${s.cache_hit >= 0.8 ? 'ok' : ''}">${fmtPct(s.cache_hit)}</span></div>
+        </div>
+      `);
+    }
+
+    cards.push(`
+      <div class="card">
+        <div class="card-title"><span>Savings · This Session</span><span class="ok">${fmtTok(s.saved_tok || 0)} · ≈ ${fmtUsd(s.saved_usd || 0)}</span></div>
+        ${renderCatRows(s.by_cat)}
+      </div>
+    `);
+
+    cards.push(`
+      <div class="card">
+        <div class="card-title"><span>Savings · All Time</span><span class="ok">${fmtTok(lt.saved_tok || 0)} · ≈ ${fmtUsd(lt.saved_usd || 0)}</span></div>
+        <div class="kv"><span class="k">Total events</span><span class="v">${esc(lt.events || 0)}</span></div>
+        ${renderCatRows(lt.by_cat)}
+      </div>
+    `);
+
+    if (s.grade) {
+      const reasonsHtml = (s.grade.reasons || []).length === 0
+        ? '<div class="ok" style="font-size:12px;">No avoidable rework detected.</div>'
+        : `<ul class="reasons">${s.grade.reasons.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`;
+      const topHtml = (s.top_tools || []).length
+        ? `<div class="chips">${s.top_tools.slice(0, 6).map((t) => `<span class="chip">${esc(t.tool)} ×${esc(t.n)}</span>`).join('')}</div>`
+        : '';
+      cards.push(`
+        <div class="card">
+          <div class="card-title"><span>Session Quality &amp; Regret</span><span>${esc(s.grade.letter)} · ${esc(s.grade.score)}/100</span></div>
+          ${reasonsHtml}
+          <div class="kv"><span class="k">Tool calls / failed</span><span class="v">${esc(s.tool_calls || 0)} / ${esc(s.tool_errors || 0)}</span></div>
+          <div class="kv"><span class="k">Repeated reads</span><span class="v">${esc(s.repeated_reads || 0)}</span></div>
+          <div class="kv"><span class="k">Quick re-runs</span><span class="v">${esc(s.quick_reruns || 0)}</span></div>
+          <div class="kv"><span class="k">Archive expands</span><span class="v">${esc(s.archive_expands || 0)}</span></div>
+          <div class="kv"><span class="k">Oversized results</span><span class="v">${esc(s.big_results || 0)}</span></div>
+          ${topHtml}
+        </div>
+      `);
+    }
+
+    const isAgHost = (d.host || 'antigravity') === 'antigravity';
+    const modelOpts = isAgHost
+      ? [['off', 'Off (inherit parent)'], ['flash_lite', 'Flash Lite (cheapest)'], ['flash', 'Flash (recommended)'], ['pro', 'Pro (high)']]
+      : [['off', 'Off (inherit parent)'], ['haiku', 'Haiku (cheapest)'], ['sonnet', 'Sonnet (balanced)'], ['opus', 'Opus (high)']];
+    const effortOpts = isAgHost
+      ? [['', 'Inherit'], ['low', 'Low (fast lookup)'], ['medium', 'Medium (cross-check)'], ['high', 'High (thorough)'], ['max', 'Max (exhaustive)']]
+      : [['', 'Inherit'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['xhigh', 'X-High'], ['max', 'Max']];
+    const curModelSel = r.enabled ? (r.model || (isAgHost ? 'flash' : 'haiku')) : 'off';
+    const curEffortSel = r.effort || '';
+    cards.push(`
+      <div class="card">
+        <div class="card-title"><span>Subagent Router</span><span class="muted">${r.enabled ? 'Active' : 'Off'}</span></div>
+        <div class="kv">
+          <span class="k">Target model</span>
+          <select id="card-router-model" style="max-width:170px;">
+            ${modelOpts.map(([v, l]) => `<option value="${esc(v)}" ${v === curModelSel ? 'selected' : ''}>${esc(l)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="kv">
+          <span class="k">Reasoning effort</span>
+          <select id="card-router-effort" style="max-width:170px;">
+            ${effortOpts.map(([v, l]) => `<option value="${esc(v)}" ${v === curEffortSel ? 'selected' : ''}>${esc(l)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="kv">
+          <span class="k">Double-check verify</span>
+          <button type="button" class="engine-pill ${r.verify !== false ? 'on' : ''}" data-toggle="subagent_verify" data-val="${r.verify !== false}"><span class="pdot"></span>${r.verify !== false ? 'On (0-token)' : 'Off'}</button>
+        </div>
+        <div class="kv"><span class="k">Last 7 days</span><span class="v">${esc(r.routed || 0)} routed · ${esc(r.checked || 0)} checked · ${esc(r.failed || 0)} failed</span></div>
+        ${r.backed_off ? '<div class="warn" style="font-size:12px;">Auto-backoff active after failed checks.</div>' : ''}
+        <div class="muted" style="font-size:11px;">Routes simple read-only lookups to a lower-cost model with automatic citation double-checking; never overrides explicit model choices.</div>
+      </div>
+    `);
+
+    if (d.index || (d.funnel && d.funnel.length)) {
+      const funnelRows = (d.funnel || []).map((f) =>
+        `<div class="kv"><span class="k">Funnel ${esc(f.tier)}</span><span class="v">${esc(f.served || 0)} served · ${esc(f.retry || 0)} retried${f.mismatch ? ' · ' + esc(f.mismatch) + ' caught' : ''}</span></div>`
+      ).join('');
+      cards.push(`
+        <div class="card">
+          <div class="card-title"><span>Code Index &amp; Read Funnel</span></div>
+          ${d.index ? `<div class="kv"><span class="k">Workspace</span><span class="v">${esc(d.index.repo)}</span></div>` : ''}
+          ${d.index ? `<div class="kv"><span class="k">Indexed</span><span class="v">${esc(d.index.files)} files · ${esc(d.index.symbols)} symbols</span></div>` : ''}
+          ${funnelRows}
+        </div>
+      `);
+    }
+
+    const featEntries = Object.entries(d.features || {});
+    const isFeatOn = (k, v) => (typeof v === 'string' ? v.toLowerCase() !== 'off' : v !== false);
+    const pills = [
+      `<button type="button" class="engine-pill ${d.enabled !== false ? 'on' : ''}" data-toggle="enabled" data-val="${d.enabled !== false}"><span class="pdot"></span>Master Enabled</button>`,
+      `<button type="button" class="engine-pill ${d.shadow ? 'on' : ''}" data-toggle="shadow" data-val="${Boolean(d.shadow)}"><span class="pdot"></span>Shadow Mode</button>`,
+      ...featEntries.map(([k, v]) => {
+        const on = isFeatOn(k, v);
+        const modeAttr = typeof v === 'string' ? ` data-str-on="${k === 'toolprune' ? 'propose' : 'minimal'}"` : '';
+        return `<button type="button" class="engine-pill ${on ? 'on' : ''}" data-toggle="${esc(k)}" data-val="${on}"${modeAttr}><span class="pdot"></span>${esc(FEATURE_LABEL[k] || k)}</button>`;
+      }),
+    ].join('');
+    cards.push(`
+      <div class="card">
+        <div class="card-title"><span>Engines</span><span class="muted">Click to toggle</span></div>
+        <div class="chips">${pills}</div>
+      </div>
+    `);
+
+    const pr = d.price || {};
+    cards.push(`
+      <div class="card">
+        <div class="card-title"><span>Value &amp; Cost Model</span><span class="muted">$/MTok</span></div>
+        <div class="kv"><span class="k">Cache write / read</span><span class="v">×${esc(pr.cache_write_mult)} / ×${esc(pr.cache_read_mult)}</span></div>
+        <div class="price-form">
+          <label class="muted">In $</label>
+          <input type="number" step="0.05" min="0" id="price-in" value="${esc(pr.input_per_mtok ?? 3)}" />
+          <label class="muted">Out $</label>
+          <input type="number" step="0.05" min="0" id="price-out" value="${esc(pr.output_per_mtok ?? 15)}" />
+          <button type="button" id="btn-save-price">Save</button>
+        </div>
+        <div class="muted" style="font-size:11px;">Kept-out tokens are valued as 1 cache write + ${esc(pr.reread_turns ?? 3)} re-reads.</div>
+      </div>
+    `);
+
+    document.getElementById('cards-grid').innerHTML = cards.join('');
+    document.getElementById('foot-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+    // Wire dynamic buttons inside cards
+    document.querySelectorAll('[data-toggle]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const key = btn.getAttribute('data-toggle');
+        const cur = btn.getAttribute('data-val') === 'true';
+        const strOn = btn.getAttribute('data-str-on');
+        if (strOn) {
+          updateConfig({ [key]: cur ? 'off' : strOn });
+        } else {
+          updateConfig({ [key]: !cur });
+        }
+      });
+    });
+    const cardModelSel = document.getElementById('card-router-model');
+    if (cardModelSel) {
+      cardModelSel.addEventListener('change', (e) => {
+        const val = e.target.value;
+        const mKey = (state.data && state.data.routing && state.data.routing.model_key)
+          || ((state.data && state.data.host) === 'antigravity' ? 'subagent_cheap_model_antigravity' : 'subagent_cheap_model');
+        if (val === 'off') {
+          void updateConfig({ subagent_model_routing: false });
+        } else {
+          void updateConfig({ subagent_model_routing: true, [mKey]: val });
+        }
+      });
+    }
+    const cardEffortSel = document.getElementById('card-router-effort');
+    if (cardEffortSel) {
+      cardEffortSel.addEventListener('change', (e) => {
+        const val = e.target.value;
+        const eKey = (state.data && state.data.routing && state.data.routing.effort_key)
+          || ((state.data && state.data.host) === 'antigravity' ? 'subagent_cheap_effort_antigravity' : 'subagent_cheap_effort');
+        void updateConfig({ [eKey]: val });
+      });
+    }
+    const savePrice = document.getElementById('btn-save-price');
+    if (savePrice) {
+      savePrice.addEventListener('click', () => {
+        const pin = parseFloat(document.getElementById('price-in').value);
+        const pout = parseFloat(document.getElementById('price-out').value);
+        if (!Number.isNaN(pin) && !Number.isNaN(pout)) {
+          updateConfig({ price_input_per_mtok: pin, price_output_per_mtok: pout });
+        }
+      });
+    }
+
+    reportSize();
+  }
+
+  // ---- Static Controls ----
+  document.getElementById('btn-details').addEventListener('click', () => {
+    state.userToggledDetails = true;
+    state.detailsOpen = !state.detailsOpen;
+    render();
+  });
+
+  document.getElementById('btn-refresh').addEventListener('click', () => {
+    void refresh();
+  });
+
+  document.getElementById('bar-router').addEventListener('change', (e) => {
+    const val = e.target.value;
+    const mKey = (state.data && state.data.routing && state.data.routing.model_key)
+      || ((state.data && state.data.host) === 'antigravity' ? 'subagent_cheap_model_antigravity' : 'subagent_cheap_model');
+    if (val === 'off') {
+      void updateConfig({ subagent_model_routing: false });
+    } else {
+      void updateConfig({ subagent_model_routing: true, [mKey]: val });
+    }
+  });
+
+  // ---- Connect on Load ----
+  async function boot() {
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+      document.documentElement.setAttribute('data-theme', 'light');
+    }
+    if (!inIframe) {
+      state.error = 'Open Terser HUD inside Antigravity 2.0 (Side Pane "+" menu or Plugins sidebar) for live telemetry.';
+      render();
+      return;
+    }
+    try {
+      const init = await sendRequest('ui/initialize', {
+        appInfo: { name: 'Terser HUD', version: '1.2.0' },
+        appCapabilities: {},
+        protocolVersion: '2026-01-26',
+      });
+      if (init && init.hostCapabilities) state.hostCaps = init.hostCapabilities;
+      if (init && init.hostContext) applyHostContext(init.hostContext);
+      sendNotification('ui/notifications/initialized', {});
+      setTimeout(() => { if (!state.data) void refresh(); }, 400);
+      setInterval(() => { if (!document.hidden) void refresh(); }, 15000);
+    } catch (e) {
+      state.error = e instanceof Error ? e.message : String(e);
+      render();
+    }
+  }
+
+  void boot();
+})();
+</script>
+</body>
+</html>

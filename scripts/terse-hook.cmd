@@ -3,6 +3,12 @@ setlocal
 set "PLUGIN_ROOT=%~dp0.."
 set "HOOK_PY=%PLUGIN_ROOT%\runtime\unified_hook.py"
 set "FAST_BIN=%PLUGIN_ROOT%\bin\terser-fast.exe"
+if "%~1"=="--host" if "%~2"=="codex" (
+  set "FAST_BIN="
+  if not defined TERSER_PYTHON if exist "%PLUGIN_ROOT%\runtime\codex-python.txt" set /p "TERSER_PYTHON="<"%PLUGIN_ROOT%\runtime\codex-python.txt"
+  if "%~4"=="PreToolUse" set "FAST_BIN=%PLUGIN_ROOT%\bin\terser-codex.exe"
+  if "%~4"=="SubagentStart" set "FAST_BIN=%PLUGIN_ROOT%\bin\terser-codex.exe"
+)
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
 

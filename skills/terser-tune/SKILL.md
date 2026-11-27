@@ -1,11 +1,11 @@
 ---
 name: terser-tune
-description: Configure Terser settings, repo micro-skills (EnvFacts), unused tool pruning, and token coaching.
+description: Configure Terser settings, repo micro-skills (EnvFacts), unused tool pruning, and token coaching. Use when the user wants to turn a Terser feature on or off (compression, outline-first reads, read cache, loop guard, auto-indexing, shadow mode), see or forget learned repo facts, prune unused tools, or get token-efficiency coaching.
 ---
 
 # Terser Tune — Micro-Skills, Tool Pruning & Configuration
 
-Run via the Terser CLI (`terse` / `terse.cmd` / `python <plugin>/runtime/cli.py`):
+Run via the Terser CLI by its quoted absolute path (it is usually not on `PATH`): `scripts/terse` (POSIX shell, incl. Git Bash) or `scripts\terse.cmd` (PowerShell/cmd; in PowerShell prefix the quoted path with `&`), two directories above this skill's base directory. The `terse` below stands for that path.
 
 | Goal | Command |
 | :--- | :--- |

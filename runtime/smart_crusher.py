@@ -5,7 +5,8 @@ Features:
      `data`, `entries`, `records`, `files`, `issues`, `nodes`, `events`).
   2. Factors out constant keys shared identically across all items into `_const`.
   3. Strips redundant null/empty values where safe.
-  4. For 5..40 items: lossless columnar encoding (`_format: "columnar"`, `_const`, `cols`, `rows`).
+  4. For 5..40 items: lossless columnar encoding (`_format: "columnar"`, `_const`, `_seq`, `cols`, `rows`;
+     `_seq` columns hold start + row_index * step).
   5. For >40 items: statistical SmartCrusher sampling + SQLite FTS5 archive:
        - First 3 items (schema/order)
        - Last 3 items (recency)
@@ -104,10 +105,25 @@ def _factor_and_columnize(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     if len(var_keys) > 30:
         return None
 
+    # Lossless: integer columns that advance by a fixed step become {"start", "step"}
+    # (row i holds start + i * step), e.g. sequential ids.
+    seqs: dict[str, dict[str, int]] = {}
+    if len(items) >= 5:
+        for k in list(var_keys):
+            vals = [it.get(k) for it in items]
+            if not all(type(v) is int and k in it for v, it in zip(vals, items)):
+                continue
+            step = vals[1] - vals[0]
+            if step and all(b - a == step for a, b in zip(vals, vals[1:])):
+                seqs[k] = {"start": vals[0], "step": step}
+                var_keys.remove(k)
+
     rows = [[it.get(k) for k in var_keys] for it in items]
     out: dict[str, Any] = {"_format": "columnar"}
     if consts:
         out["_const"] = consts
+    if seqs:
+        out["_seq"] = seqs
     out["cols"] = var_keys
     out["rows"] = rows
     return out
@@ -208,7 +224,7 @@ def _crush_item_list(
     if error_count:
         crushed["_errors_preserved"] = error_count
     if aid:
-        crushed["_retrieve"] = f'terse query {aid} "<keywords>"'
+        crushed["_retrieve"] = context_sandbox.retrieval_hint(aid, "query", env=env).strip("`")
     return crushed
 
 
@@ -216,7 +232,9 @@ def _replace_nested(obj: Any, path: list[str], replacement: Any) -> Any:
     if not path:
         return replacement
     if isinstance(obj, dict):
-        out = {k: v for k, v in obj.items() if k == path[0] or v not in (None, "", [], {})}
+        # Preserve all sibling keys (including empty lists/dicts/nulls like `"errors": []`)
+        # so semantic meaning is never altered during lossless/columnar crushing.
+        out = dict(obj)
         out[path[0]] = _replace_nested(obj[path[0]], path[1:], replacement)
         return out
     return obj

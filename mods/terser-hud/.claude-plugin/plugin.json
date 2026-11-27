@@ -1,0 +1,6 @@
+{
+  "name": "terser-hud",
+  "version": "0.1.0",
+  "description": "Terser status band above the prompt (savings, API usage, cost, context) with a details pane",
+  "types": "./types/index.d.ts"
+}

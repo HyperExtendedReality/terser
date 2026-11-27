@@ -28,6 +28,9 @@ from runtime import (
     unified_hook,
 )
 
+# Hook subprocesses in tests must not leave warm workers behind (each test has its own TERSER_HOME).
+os.environ.setdefault("TERSER_PYTHON_WORKER", "0")
+
 
 class OutputCompressorTests(unittest.TestCase):
     def test_strip_ansi_and_progress_spinners(self) -> None:
@@ -353,7 +356,6 @@ class LoopGuardAndHostDispatchTests(unittest.TestCase):
         for rel in (
             "hooks.json",
             "mcp_config.json",
-            ".mcp.json",
             ".claude-plugin/plugin.json",
             ".claude-plugin/marketplace.json",
             ".codex-plugin/plugin.json",
@@ -364,10 +366,14 @@ class LoopGuardAndHostDispatchTests(unittest.TestCase):
             self.assertIsInstance(data, dict, f"{rel} should be a JSON object")
 
         # Verify Counter front door enforced across all MCP configs
-        for rel in ("mcp_config.json", ".mcp.json", ".claude-plugin/plugin.json"):
+        for rel in ("mcp_config.json", ".claude-plugin/plugin.json"):
             doc = json.loads((ROOT / rel).read_text(encoding="utf-8"))
             env_map = doc["mcpServers"]["terser-index"]["env"]
             self.assertEqual(env_map["TERSER_TOOL_SURFACE"], "counter")
+
+        # The plugin manifest already declares terser-index; a root .mcp.json would register it a
+        # second time (and, as a project server, break on the unset ${CLAUDE_PLUGIN_ROOT}).
+        self.assertFalse((ROOT / ".mcp.json").exists())
 
         # Verify AGENTS.md stays lean and includes quality-preserving guardrails
         agents_md = (ROOT / "rules" / "AGENTS.md").read_text(encoding="utf-8")
@@ -465,7 +471,7 @@ class ResearchUpgradesTests(unittest.TestCase):
         assert isinstance(out, dict)
         capped = (out.get("hookSpecificOutput") or {}).get("updatedToolOutput") or ""
         self.assertIn("more Glob lines omitted", capped)
-        self.assertIn("terse query", capped)
+        self.assertIn('order(action="search_sandbox"', capped)
         self.assertLess(len(capped), len(huge_glob) * 0.4)
 
     def test_smart_crusher_preserves_errors_outliers_and_factors_constants(self) -> None:
@@ -477,6 +483,8 @@ class ResearchUpgradesTests(unittest.TestCase):
         items[35]["error"] = "db_timeout"
         items[72]["latency_ms"] = 9999  # clear statistical outlier
         raw = json.dumps({"total": 100, "items": items}, indent=2)
+        context_sandbox.set_hint_host("claude")
+        self.addCleanup(context_sandbox.set_hint_host, None)
         crushed = smart_crusher.crush_json(raw, command="mcp_list", env=self.env)
         self.assertIsNotNone(crushed)
         assert crushed is not None
@@ -487,7 +495,7 @@ class ResearchUpgradesTests(unittest.TestCase):
         self.assertEqual(inner["_const"]["region"], "us-east-1")
         self.assertIn(35, inner["_kept_indices"])
         self.assertIn(72, inner["_kept_indices"])
-        self.assertIn("terse query", inner["_retrieve"])
+        self.assertIn('order(action="search_sandbox"', inner["_retrieve"])
 
     def test_lockfile_diff_elision_and_framework_stack_folding(self) -> None:
         diff = (
@@ -876,7 +884,7 @@ class NativeFastPathTests(unittest.TestCase):
             )
         )
 
-        # 2. Claude & Codex: agent_id isolates read-cache & loop-guard per subagent, while edits propagate
+        # 2. Claude Read Funnel stays scoped per subagent. Codex Read needs delivered evidence.
         sample = self.tmp / "shared_mod.py"
         for host in ("claude", "codex"):
             sample.write_text(f"value = '{host}_1'\n", encoding="utf-8")
@@ -897,8 +905,10 @@ class NativeFastPathTests(unittest.TestCase):
                 host_hint=host,
                 env=self.env,
             )
-            assert isinstance(p_dup, dict)
-            self.assertEqual((p_dup.get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
+            if host == "claude":
+                self.assertEqual(p_dup["hookSpecificOutput"]["permissionDecision"], "deny")
+            else:
+                self.assertIsNone(p_dup)
 
             # Subagent A has a fresh context -> first read of sample MUST pass through!
             self.assertIsNone(
@@ -916,8 +926,10 @@ class NativeFastPathTests(unittest.TestCase):
                 host_hint=host,
                 env=self.env,
             )
-            assert isinstance(sub_dup, dict)
-            self.assertEqual((sub_dup.get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
+            if host == "claude":
+                self.assertEqual(sub_dup["hookSpecificOutput"]["permissionDecision"], "deny")
+            else:
+                self.assertIsNone(sub_dup)
 
             # Subagent A edits sample -> invalidates parent's soft_denies too!
             unified_hook.dispatch(
@@ -933,8 +945,10 @@ class NativeFastPathTests(unittest.TestCase):
                 host_hint=host,
                 env=self.env,
             )
-            assert isinstance(p_after, dict)
-            self.assertIn(f"+value = '{host}_2'", (p_after.get("hookSpecificOutput") or {}).get("permissionDecisionReason") or "")
+            if host == "claude":
+                self.assertIn(f"+value = '{host}_2'", p_after["hookSpecificOutput"]["permissionDecisionReason"])
+            else:
+                self.assertIsNone(p_after)
 
             # SubagentStop removes subagent ephemeral cache without deleting parent cache
             unified_hook.dispatch(
@@ -945,7 +959,7 @@ class NativeFastPathTests(unittest.TestCase):
             )
             rc_dir = Path(self.env["TERSER_HOME"]) / "read-cache"
             self.assertFalse((rc_dir / f"{sid}--sub-a1.json").exists())
-            self.assertTrue((rc_dir / f"{sid}.json").exists())
+            self.assertEqual((rc_dir / f"{sid}.json").exists(), host == "claude")
 
         # 3. Native fast-path parity for AGY invoke_subagent & Claude agent_id isolation
         if self.fast_bin.is_file():
@@ -1040,10 +1054,12 @@ class TokenEfficiencyUpgradesTests(unittest.TestCase):
         log_lines = [f"2026-11-26 10:00:{i:02d} INFO ok line {i} padding padding" for i in range(40)]
         log_lines[20] = "2026-11-26 10:00:20 ERROR database connection refused"
         logf.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        context_sandbox.set_hint_host("claude")
+        self.addCleanup(context_sandbox.set_hint_host, None)
         r_log = read_funnel.check_read("s-t2c", str(logf), cfg=cfg, env=self.env)
         self.assertIsNotNone(r_log)
         self.assertIn("database connection refused", r_log["reason"])
-        self.assertIn("terse query ", r_log["reason"])
+        self.assertIn('order(action="search_sandbox"', r_log["reason"])
 
         # 4. Disjoint intervals: reading 1-10 then 30-40 must NOT claim 15-25 is covered
         codef = self.tmp / "ranges.py"
@@ -1135,7 +1151,7 @@ class TokenEfficiencyUpgradesTests(unittest.TestCase):
         self.assertIn("Identical output", res2)
         self.assertIn("1.89s", res2)
 
-    def test_and_chain_wrapping_subagent_routing_and_codex_grep_grouping(self) -> None:
+    def test_and_chain_wrapping_subagent_routing_and_codex_grep_passthrough(self) -> None:
         from runtime.config import DEFAULT_CONFIG
 
         # 1. Safe &&-chain wrapping
@@ -1143,18 +1159,21 @@ class TokenEfficiencyUpgradesTests(unittest.TestCase):
         self.assertIsNotNone(wrapped)
         self.assertIn(" && ", wrapped)
 
-        # 2. Subagent complexity routing: low-complexity research -> Model: flash
+        # 2. Subagent complexity routing (opt-in): low-complexity research -> Model: flash
+        ag_payload = {
+            "conversationId": "ag-route-1",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {"TypeName": "research", "Prompt": "Find where typo in readme is"},
+            },
+        }
+        default_route = unified_hook.dispatch("PreToolUse", ag_payload, host_hint="antigravity", env=self.env)
+        self.assertNotIn("Model", ((default_route or {}).get("overwrite") or {}))
         routed = unified_hook.dispatch(
             "PreToolUse",
-            {
-                "conversationId": "ag-route-1",
-                "toolCall": {
-                    "name": "invoke_subagent",
-                    "args": {"TypeName": "research", "Prompt": "Find where typo in readme is"},
-                },
-            },
+            ag_payload,
             host_hint="antigravity",
-            env=self.env,
+            env=dict(self.env, TERSER_SUBAGENT_ROUTING="1"),
         )
         assert isinstance(routed, dict)
         self.assertEqual(routed["overwrite"].get("Model"), "flash")
@@ -1175,7 +1194,7 @@ class TokenEfficiencyUpgradesTests(unittest.TestCase):
         assert isinstance(explicit, dict)
         self.assertNotIn("Model", explicit["overwrite"])
 
-        # 3. Codex PostToolUse Grep grouping parity
+        # 3. Codex PostToolUse does not support replacing the tool response.
         raw_grep = "\n".join(f"src/very/deep/module/handler.py:{i}: const token = {i};" for i in range(1, 15))
         cx = unified_hook.dispatch(
             "PostToolUse",
@@ -1184,8 +1203,8 @@ class TokenEfficiencyUpgradesTests(unittest.TestCase):
             env=self.env,
         )
         hso = (cx or {}).get("hookSpecificOutput") or {}
-        self.assertIn("updatedToolOutput", hso)
-        self.assertIn("src/very/deep/module/handler.py:\n  1:", hso["updatedToolOutput"])
+        self.assertNotIn("updatedToolOutput", hso)
+        self.assertNotIn("updatedMCPToolOutput", hso)
 
     def test_compiler_note_dedup_claude_agent_routing_and_native_exec_delta(self) -> None:
         from runtime import index_mcp
@@ -1216,16 +1235,20 @@ class TokenEfficiencyUpgradesTests(unittest.TestCase):
         )
         self.assertIn("--- a.py::fn (a.py L1-2) ---\n1: def fn():\n2:     return 1", formatted)
 
-        # 3. Claude Code Agent routing: low-complexity Explore -> model: haiku
+        # 3. Claude Code Agent routing is opt-in (it trades quality for cost): default leaves the model alone
+        agent_payload = {
+            "session_id": "cl-ag-1",
+            "tool_name": "Agent",
+            "tool_input": {"subagent_type": "Explore", "prompt": "Find where typo in readme is"},
+        }
+        cl_default = unified_hook.dispatch("PreToolUse", agent_payload, host_hint="claude", env=self.env)
+        hso = (cl_default or {}).get("hookSpecificOutput") or {}
+        self.assertNotIn("model", hso.get("updatedInput") or {})
         cl_route = unified_hook.dispatch(
             "PreToolUse",
-            {
-                "session_id": "cl-ag-1",
-                "tool_name": "Agent",
-                "tool_input": {"subagent_type": "Explore", "prompt": "Find where typo in readme is"},
-            },
+            agent_payload,
             host_hint="claude",
-            env=self.env,
+            env=dict(self.env, TERSER_SUBAGENT_ROUTING="1"),
         )
         hso = (cl_route or {}).get("hookSpecificOutput") or {}
         self.assertEqual((hso.get("updatedInput") or {}).get("model"), "haiku")
@@ -1328,7 +1351,7 @@ class TokenEfficiencyUpgradesTests(unittest.TestCase):
         self.assertIsNone(read_funnel.check_read("parent-1--sub1", str(ef), cfg=cfg, env=self.env))
         # Simulate successful edit_file by parent-1
         ef.write_text("".join(f"v_{i} = {i * 10}\n" if i == 5 else f"v_{i} = {i}\n" for i in range(40)), encoding="utf-8")
-        read_funnel.seed_after_edit("parent-1", str(ef), env=self.env)
+        read_funnel.seed_after_edit("parent-1", str(ef), old_text="v_5 = 5\n", new_text="v_5 = 50\n", env=self.env)
         # Parent re-read hits T0 unchanged (no self-diff echo!)
         parent_reread = read_funnel.check_read("parent-1", str(ef), cfg=cfg, env=self.env)
         self.assertIsNotNone(parent_reread)
@@ -1907,6 +1930,106 @@ class LosslessParityAndCoordinationTests(unittest.TestCase):
         self.assertIn("missing_token", q_res or "")
         e_res = context_sandbox.expand_output(raw_id, start_line=2, end_line=2, env=self.env)
         self.assertIn("L2: error[E0425]", e_res or "")
+
+
+_FAST_BIN = ROOT / "bin" / ("terser-fast.exe" if os.name == "nt" else "terser-fast")
+
+
+@unittest.skipUnless(_FAST_BIN.is_file(), "terser-fast binary not built")
+class NativeGateAndWorkerTests(unittest.TestCase):
+    """Quality-neutral fast paths: Rust may only skip Python when Python would do nothing."""
+
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._td.name)
+        self.state = self.tmp / "state"
+        self.marker = self.tmp / "delegated.txt"
+        self.probe = self.tmp / "probe_hook.py"
+        self.probe.write_text(
+            "open(%r, 'a').write('x')\n" % str(self.marker),
+            encoding="utf-8",
+        )
+        self.env = dict(
+            os.environ,
+            TERSER_HOME=str(self.state),
+            TOKENECONOMIZER_HOME=str(self.tmp / "te"),
+            TERSER_PYTHON_WORKER="0",
+        )
+        self.env.pop("TERSER_DISABLE", None)
+
+    def tearDown(self) -> None:
+        for info in self.state.glob("hook-worker-*.json"):
+            try:
+                os.kill(int(json.loads(info.read_text(encoding="utf-8"))["pid"]), 9)
+            except Exception:
+                pass
+        self._td.cleanup()
+
+    def _run(self, event: str, payload: dict, *, script: Path, env: dict | None = None) -> str:
+        proc = subprocess.run(
+            [str(_FAST_BIN), "--python", sys.executable, "--script", str(script), "--host", "claude", "--event", event],
+            input=json.dumps(payload), capture_output=True, text=True, env=env or self.env, timeout=30,
+        )
+        return proc.stdout
+
+    def _delegated(self) -> bool:
+        hit = self.marker.exists()
+        if hit:
+            self.marker.unlink()
+        return hit
+
+    def test_bash_gate_skips_python_only_when_python_recorded_no_repairs(self) -> None:
+        payload = {"session_id": "gate-1", "cwd": str(ROOT), "tool_name": "Bash", "tool_input": {"command": "pytest -q"}}
+        self._run("PreToolUse", payload, script=self.probe)
+        self.assertTrue(self._delegated(), "no gate entry yet -> must delegate")
+
+        cfg = config.load_config(self.env)
+        out, repaired = loop_guard.apply_form_repair(str(ROOT), "pytest -q", cfg=cfg, host="claude", env=self.env)
+        self.assertEqual((out, repaired), ("pytest -q", False))
+        gate = json.loads((self.state / loop_guard.FORM_REPAIR_GATE_FILE).read_text(encoding="utf-8"))
+        self.assertIs(gate[f"claude|{ROOT}"]["has"], False)
+
+        self._run("PreToolUse", payload, script=self.probe)
+        self.assertFalse(self._delegated(), "recorded no-repair checkout -> Rust answers alone")
+
+        # A changed environment input invalidates the entry.
+        self._run("PreToolUse", payload, script=self.probe, env=dict(self.env, TOKENECONOMIZER_REPO="x/y"))
+        self.assertTrue(self._delegated())
+
+    def test_grep_prompt_and_stop_gates(self) -> None:
+        self._run("PreToolUse", {"session_id": "g", "tool_name": "Grep", "tool_input": {"pattern": "def main"}}, script=self.probe)
+        self.assertFalse(self._delegated(), "no code index on disk -> nothing to answer")
+        (self.state / "code-index").mkdir(parents=True)
+        (self.state / "code-index" / "demo.meta.json").write_text("{}", encoding="utf-8")
+        self._run("PreToolUse", {"session_id": "g", "tool_name": "Grep", "tool_input": {"pattern": "def main"}}, script=self.probe)
+        self.assertTrue(self._delegated())
+
+        self._run("UserPromptSubmit", {"session_id": "p1", "prompt": "hi"}, script=self.probe)
+        self.assertFalse(self._delegated(), "no queued nudge -> nothing to pop")
+        (self.state / "loop-state").mkdir(parents=True, exist_ok=True)
+        (self.state / "loop-state" / "p1.json").write_text(json.dumps({"pending_nudge": "slow down"}), encoding="utf-8")
+        self._run("UserPromptSubmit", {"session_id": "p1", "prompt": "hi"}, script=self.probe)
+        self.assertTrue(self._delegated())
+
+        (self.state / "rollup-claude.lease").touch()
+        self._run("Stop", {"session_id": "p1"}, script=self.probe)
+        self.assertFalse(self._delegated(), "lease held -> fold would be skipped")
+
+    def test_worker_output_matches_cold_run(self) -> None:
+        script = ROOT / "runtime" / "unified_hook.py"
+        payload = {"session_id": "w1", "cwd": str(self.tmp), "tool_name": "Edit",
+                   "tool_input": {"file_path": str(self.tmp / "a.py")}, "tool_response": {}}
+        warm_env = dict(self.env, TERSER_PYTHON_WORKER="1")
+        cold = [self._run("PostToolUse", dict(payload, session_id="cold"), script=script) for _ in range(4)]
+        self._run("PostToolUse", dict(payload, session_id="spawn"), script=script, env=warm_env)
+        import time as _time
+        deadline = _time.time() + 15
+        while _time.time() < deadline and not list(self.state.glob("hook-worker-*.json")):
+            _time.sleep(0.1)
+        self.assertTrue(list(self.state.glob("hook-worker-*.json")), "worker should start")
+        warm = [self._run("PostToolUse", dict(payload, session_id="warm"), script=script, env=warm_env) for _ in range(4)]
+        self.assertEqual(warm, cold)
+        self.assertTrue(any("ran 3x identically" in o for o in warm), "stateful loop guard still fires via worker")
 
 
 if __name__ == "__main__":

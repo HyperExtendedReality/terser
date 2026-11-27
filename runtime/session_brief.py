@@ -23,19 +23,17 @@ def _clean_line(text: str) -> str:
     return " ".join(s.split())[:_LINE_MAX_CHARS]
 
 
-def _load_microskills(cwd: str, env: dict[str, str] | None = None) -> list[str]:
+def _load_microskills(cwd: str, host: str, env: dict[str, str] | None = None) -> list[str]:
     """Read confirmed, cached Terser micro-skills for this repo (zero LLM calls)."""
     if not cwd:
         return []
     try:
         ensure_vendor_paths()
         from tokeneconomizer.plugin import paths as te_paths  # type: ignore
-        from tokeneconomizer.plugin import repos as te_repos  # type: ignore
 
         e = env if env is not None else os.environ
-        root = te_paths.state_root(e)
-        repo = te_repos.resolve(cwd, root=root)
-        inj_path = Path(te_paths.repo_dir(root, repo.key)) / "injection.json"
+        repo = te_paths.repo_identity(cwd, e)
+        inj_path = Path(te_paths.repo_state_dir(repo, host, e)) / "injection.json"
         if not inj_path.is_file():
             return []
         data = json.loads(inj_path.read_text(encoding="utf-8"))
@@ -52,29 +50,17 @@ def _load_microskills(cwd: str, env: dict[str, str] | None = None) -> list[str]:
         return []
 
 
+_LEAN_LINE = "Replies: lead with the answer; show only changed code; skip restating tool output."
+
+
 def _load_continuity(workspace: str, host: str, env: dict[str, str] | None = None) -> list[str]:
     """Load workspace-scoped Terser continuity context (strictly workspace-matched)."""
     if not workspace:
         return []
     env = env if env is not None else os.environ
-    ws_h = workspace_hash(workspace)
-    norm_ws = normalize_workspace(workspace)
+    from runtime.analytics import continuity_path
 
-    candidates: list[Path] = []
-    if host == "antigravity":
-        ag_home = Path(os.path.expanduser(env.get("TOKEN_OPTIMIZER_ANTIGRAVITY_HOME") or "~/.gemini"))
-        to_dir = ag_home / "token-optimizer"
-    elif host == "codex":
-        cx_home = Path(os.path.expanduser(env.get("CODEX_HOME") or "~/.codex"))
-        to_dir = cx_home / "token-optimizer"
-    else:
-        cl_home = Path(os.path.expanduser(env.get("CLAUDE_CONFIG_DIR") or "~/.claude"))
-        to_dir = cl_home / "token-optimizer"
-
-    if ws_h:
-        candidates.append(to_dir / f"restore-context-{ws_h}.md")
-    candidates.append(to_dir / "restore-context.md")
-
+    candidates: list[Path] = [continuity_path(workspace, env)]
     for path in candidates:
         try:
             if not path.is_file() or path.stat().st_size > 16384:
@@ -82,26 +68,29 @@ def _load_continuity(workspace: str, host: str, env: dict[str, str] | None = Non
             text = path.read_text(encoding="utf-8", errors="replace").strip()
             if not text:
                 continue
-            # For the unscoped global file, verify Working dir matches workspace
-            if path.name == "restore-context.md":
-                matched = False
-                for ln in text.splitlines():
-                    s = ln.strip()
-                    if s.lower().startswith("- working dir:"):
-                        if normalize_workspace(s.split(":", 1)[1]) == norm_ws:
-                            matched = True
-                        break
-                if not matched:
-                    continue
             lines = []
             for raw in text.splitlines():
                 c = _clean_line(raw)
-                if c and not c.startswith("#"):
+                if c and not c.startswith(("#", "Working dir:", "Captured:")):
                     lines.append(c)
             return lines[:6]
         except OSError:
             continue
     return []
+
+
+def _line_key(line: str) -> str:
+    return line.strip().removeprefix("- ").removeprefix("* ")
+
+
+def _fit_lines(lines: list[str], room: int) -> list[str]:
+    kept: list[str] = []
+    for line in lines:
+        cost = len(line) + bool(kept)
+        if cost <= room:
+            kept.append(line)
+            room -= cost
+    return kept
 
 
 def build_session_brief(
@@ -110,6 +99,7 @@ def build_session_brief(
     host: str,
     cfg: dict[str, Any],
     env: dict[str, str] | None = None,
+    instruction_lines: tuple[str, ...] = (),
 ) -> tuple[str | None, str | None]:
     """Build ONE compact, budget-capped SessionStart brief.
 
@@ -121,14 +111,30 @@ def build_session_brief(
     max_chars = max(300, int(cfg.get("session_brief_max_chars", 1400)))
     sections: list[str] = []
     notice_parts: list[str] = []
+    brief_header = "[Terser Brief]\n"
+    facts: list[str] = []
+    index_line = index_map = ""
+    seen = {
+        _line_key(line)
+        for line in instruction_lines if _clean_line(line) == line.strip()
+    }
+
+    def new_lines(lines: list[str]) -> list[str]:
+        unique: list[str] = []
+        for line in lines:
+            key = _line_key(line)
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(line)
+        return unique
 
     # Emit static sections FIRST (Repo facts -> Code index / Repo map) and volatile
     # Prior session LAST so the longest possible prompt prefix stays KV-cache warm!
 
     # 1. Confirmed repo micro-skills (EnvFacts — static)
     if cfg.get("microskills", "envfacts") != "off":
-        facts = _load_microskills(workspace, env)
-        if facts:
+        facts = _load_microskills(workspace, host, env)
+        if facts and host != "codex":
             sections.append("Repo facts:\n" + "\n".join(facts))
             notice_parts.append(f"{len(facts)} repo fact(s)")
 
@@ -138,8 +144,11 @@ def build_session_brief(
         surface = cfg.get("index_surface", "counter")
         hint = "use `order`/`route`" if surface == "counter" else "use `search_symbols`/`get_symbol_source`"
         # Prompt-cache stable: avoid volatile symbol counts in model context
-        sections.append(f"Code index: `{idx['repo']}` ready — {hint}.")
-        notice_parts.append(f"code index ready ({idx['symbols']} symbols)")
+        index_status = f"Code index: `{idx['repo']}` ready"
+        index_line = index_status + "."
+        if host != "codex":
+            sections.append(f"{index_status} — {hint}.")
+            notice_parts.append(f"code index ready ({idx['symbols']} symbols)")
     elif cfg.get("repo_map", True):
         try:
             from runtime import repo_map
@@ -149,13 +158,22 @@ def build_session_brief(
                 max_tokens=int(cfg.get("repo_map_max_tokens", 300)),
                 env=env,
             )
-            if rmap:
-                sections.append(rmap)
-                notice_parts.append("PageRank repo map")
+            map_lines = {
+                _line_key(line)
+                for line in (rmap or "").splitlines() if line.strip()
+            }
+            if rmap and (host != "codex" or not map_lines.issubset(seen)):
+                if host == "codex":
+                    # Keep the optional map out of the way of exact resume details.
+                    index_map = rmap
+                else:
+                    sections.append(rmap)
+                    notice_parts.append("PageRank repo map")
         except Exception:
             pass
 
     # 3. Workspace-scoped continuity checkpoint (volatile — placed last for KV prefix stability)
+    cont: list[str] = []
     if cfg.get("continuity_restore", True):
         cont = _load_continuity(workspace, host, env)
         if not cont:
@@ -165,14 +183,43 @@ def build_session_brief(
                 cont = context_sandbox.build_continuity_snapshot(workspace, max_chars=450, env=env)
             except Exception:
                 cont = []
-        if cont:
+        if cont and host != "codex":
             sections.append("Prior session:\n" + "\n".join(cont))
             notice_parts.append("continuity restored")
 
+    if host == "codex":
+        # Reserve room for complete continuity lines, then display static context first.
+        budget = max_chars - len(brief_header)
+        resume_heading = "Prior session:\n"
+        observed = seen.copy()
+        resume = _fit_lines(new_lines(cont), budget - len(resume_heading))
+        seen = observed | {_line_key(line) for line in resume}
+        continuity = resume_heading + "\n".join(resume) if resume else ""
+        if resume:
+            budget -= len(continuity) + 1
+
+        fact_heading = "Repo facts:\n"
+        new_facts = _fit_lines(new_lines(facts), budget - len(fact_heading))
+        if new_facts:
+            fact_section = fact_heading + "\n".join(new_facts)
+            sections.append(fact_section)
+            notice_parts.append(f"{len(new_facts)} repo fact(s)")
+            budget -= len(fact_section) + 1
+        index_section = index_line if idx else index_map
+        if index_section and _line_key(index_section) not in observed and len(index_section) <= budget:
+            sections.append(index_section)
+            notice_parts.append(f"code index ready ({idx['symbols']} symbols)" if idx else "PageRank repo map")
+        if resume:
+            sections.append(continuity)
+            notice_parts.append("continuity restored")
+
+    if sections and host != "codex" and cfg.get("lean_replies", True):
+        # Static, so it never breaks the prompt-cache prefix.
+        sections.insert(0, _LEAN_LINE)
     if not sections:
         return None, None
 
-    body = "[Terser Brief]\n" + "\n".join(sections)
+    body = brief_header + "\n".join(sections)
     if len(body) > max_chars:
         body = body[: max_chars - 16].rstrip() + "\n... (capped)"
 

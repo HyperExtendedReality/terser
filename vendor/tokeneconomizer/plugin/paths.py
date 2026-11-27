@@ -204,7 +204,8 @@ def origin_url(root):
     if not gitdir:
         return None
     try:
-        lines = open(os.path.join(gitdir, "config"), encoding="utf-8", errors="replace").read()
+        with open(os.path.join(gitdir, "config"), encoding="utf-8", errors="replace") as handle:
+            lines = handle.read()
     except OSError:
         return None
     remotes, current = {}, None

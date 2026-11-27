@@ -16,11 +16,13 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
 from typing import Any
 
+from runtime import context_sandbox
 from runtime.config import atomic_write_json, record_savings, state_home
 
 _TTL_SECONDS = 1800.0  # 30-minute delta window
@@ -43,7 +45,9 @@ _DELTA_ELIGIBLE_RE = re.compile(
 
 
 def _store_path(session_id: str, env: dict[str, str] | None = None) -> Path:
-    safe = re.sub(r"[^0-9a-zA-Z_.-]", "_", session_id or "default")[:80]
+    safe = session_id or "default"
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,80}", safe):
+        safe = hashlib.sha256(safe.encode("utf-8")).hexdigest()
     return state_home(env) / "cmd-delta" / f"{safe}.json"
 
 
@@ -78,9 +82,13 @@ def _save(session_id: str, data: dict[str, Any], env: dict[str, str] | None = No
     atomic_write_json(_store_path(session_id, env), data)
 
 
-def _cmd_key(command: str) -> str:
-    norm = " ".join((command or "").split())
-    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:20]
+def _cmd_key(
+    command: str | tuple[str, ...], *, cwd: str | None = None, env: dict[str, str] | None = None,
+    host: str = "unknown", session_id: str = "",
+) -> str:
+    # Hash the execution context without writing environment values or arguments to disk.
+    identity = json.dumps((host, session_id, command, cwd or os.getcwd(), sorted((os.environ if env is None else env).items())))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
 _VOLATILE_RE = re.compile(
@@ -114,6 +122,8 @@ def apply_command_delta(
     host: str = "unknown",
     now: float | None = None,
     env: dict[str, str] | None = None,
+    cwd: str | None = None,
+    argv: tuple[str, ...] | None = None,
 ) -> tuple[str, bool]:
     """Compare `compressed_output` against the previous run of `command` in `session_id`.
 
@@ -123,37 +133,49 @@ def apply_command_delta(
         return compressed_output, False
     if not _DELTA_ELIGIBLE_RE.match(command):
         return compressed_output, False
+    strict = host == "codex"
+    if len(compressed_output) > _MAX_STORED_CHARS or (strict and returncode != 0):
+        return compressed_output, False
 
     now = time.time() if now is None else float(now)
-    key = _cmd_key(command)
+    key = _cmd_key(argv if argv is not None else command, cwd=cwd, env=env, host=host, session_id=session_id)
     store = _load(session_id, env)
+    archive_id = context_sandbox.store_output(compressed_output, command=command, env=env, require_exact=True)
+    if not archive_id:
+        return compressed_output, False
     prev = store.get(key)
 
     cur_sha = hashlib.sha256(compressed_output.encode("utf-8", errors="replace")).hexdigest()
-    cur_norm_sha = hashlib.sha256(
+    cur_norm_sha = cur_sha if strict else hashlib.sha256(
         _normalize_for_delta_hash(compressed_output).encode("utf-8", errors="replace")
     ).hexdigest()
     cur_lines = compressed_output.splitlines(keepends=True)
 
     result_text = compressed_output
     applied = False
+    replay = context_sandbox.retrieval_hint(archive_id, "raw", env=env).strip("`")
+    replay_label = "full stdout" if strict else "stored output"
 
-    if isinstance(prev, dict) and (now - float(prev.get("ts") or 0.0)) <= _TTL_SECONDS:
+    if isinstance(prev, dict) and 0 <= now - float(prev.get("ts") or 0.0) <= _TTL_SECONDS:
         prev_sha = prev.get("sha")
         prev_norm_sha = prev.get("norm_sha") or prev_sha
         prev_rc = prev.get("rc")
-        prev_text = prev.get("text")
-        elapsed = max(1, int(now - float(prev.get("ts") or now)))
+        baseline = str(prev.get("archive_id") or "")
+        prev_text = context_sandbox.read_stored_output(baseline, env=env)
+        if prev_text and hashlib.sha256(prev_text.encode("utf-8", errors="replace")).hexdigest() != prev_sha:
+            prev_text = None
 
         # Case 1: Byte-identical (or timing-only-varying) output and same exit code
-        if (prev_sha == cur_sha or prev_norm_sha == cur_norm_sha) and prev_rc == returncode:
+        if prev_text and (prev_sha == cur_sha or prev_norm_sha == cur_norm_sha) and prev_rc == returncode:
             tail = _last_nonempty_line(compressed_output)
             tail_part = f" Last line: `{tail}`" if tail else ""
-            result_text = (
-                f"[Terser Delta] Identical output to previous `{command[:50]}` run "
-                f"({elapsed}s ago, exit={returncode}, {len(cur_lines)} lines).{tail_part}"
+            candidate = (
+                f"[Terser Delta] Identical output to previous run (exit={returncode}, {len(cur_lines)} lines). "
+                f"Baseline `{baseline}`; {replay_label} `{replay}`.{tail_part}"
             )
-            applied = True
+            if len(candidate) < len(compressed_output):
+                result_text = candidate
+                applied = True
         # Case 2: Small diff against previous run (NAP-safe: keeps exit transition + summary)
         elif isinstance(prev_text, str) and prev_text:
             prev_lines = prev_text.splitlines(keepends=True)
@@ -172,10 +194,10 @@ def apply_command_delta(
                 and len(cur_lines) >= 10
                 and (len(diff_lines) / max(len(cur_lines), 1)) <= _MAX_DIFF_RATIO
             ):
-                diff_body = "".join(diff_lines).rstrip()
+                diff_body = "".join(line if line.endswith("\n") else line + "\n\\ No newline at end of file\n" for line in diff_lines)
                 tail = _last_nonempty_line(compressed_output)
-                header = f"[Terser Delta vs prior run ({elapsed}s ago, exit {prev_rc}->{returncode})]"
-                candidate = f"{header}\n```diff\n{diff_body}\n```"
+                header = f"[Terser Delta vs baseline `{baseline}`, exit {prev_rc}->{returncode}. {replay_label} `{replay}`.]"
+                candidate = f"{header}\n```diff\n{diff_body}```"
                 if tail and tail not in diff_body:
                     candidate += f"\nSummary: {tail}"
                 if len(candidate) < int(len(compressed_output) * 0.75):
@@ -188,7 +210,7 @@ def apply_command_delta(
         "norm_sha": cur_norm_sha,
         "rc": returncode,
         "ts": now,
-        "text": compressed_output[:_MAX_STORED_CHARS],
+        "archive_id": archive_id,
     }
     _save(session_id, store, env)
 
@@ -198,7 +220,7 @@ def apply_command_delta(
             len(compressed_output),
             len(result_text),
             host=host,
-            detail=command[:60],
+            detail=command.split(maxsplit=1)[0],
             env=env,
         )
     return result_text, applied

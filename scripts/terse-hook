@@ -1,9 +1,24 @@
 #!/bin/sh
 # Terser — POSIX hook launcher (native Rust fast-path with lazy Python fallback).
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-PLUGIN_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
+# Resolve paths with parameter expansion only: every `$(...)` is a fork, and forks cost
+# 15-30ms each under Git Bash on Windows, on every single hook event.
+case "$0" in
+  */*) SCRIPT_DIR="${0%/*}" ;;
+  *) SCRIPT_DIR="." ;;
+esac
+PLUGIN_ROOT="$SCRIPT_DIR/.."
 HOOK_PY="$PLUGIN_ROOT/runtime/unified_hook.py"
 FAST_BIN="$PLUGIN_ROOT/bin/terser-fast"
+if [ "${1:-}" = "--host" ] && [ "${2:-}" = "codex" ]; then
+  FAST_BIN="$PLUGIN_ROOT/bin/terser-codex"
+  if [ -z "${TERSER_PYTHON:-}" ] && [ -f "$PLUGIN_ROOT/runtime/codex-python.txt" ]; then
+    IFS= read -r TERSER_PYTHON < "$PLUGIN_ROOT/runtime/codex-python.txt"
+  fi
+  case "${4:-}" in
+    PreToolUse|SubagentStart) ;;
+    *) FAST_BIN="" ;;
+  esac
+fi
 
 if [ -x "$FAST_BIN" ]; then
   if [ -n "${TERSER_PYTHON:-}" ] && [ -x "${TERSER_PYTHON}" ]; then

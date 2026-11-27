@@ -54,9 +54,12 @@ def _state_path(session_id: str, env: dict[str, str] | None = None) -> Path:
 
 
 def _clean_label(text: str) -> str:
-    cleaned = "".join(ch if ch == " " or ch.isprintable() else " " for ch in str(text or ""))
-    cleaned = " ".join(cleaned.split())
-    return (cleaned[: _LABEL_MAX - 3] + "...") if len(cleaned) > _LABEL_MAX else cleaned
+    """Single-line printable label, capped at ``_LABEL_MAX`` chars with an ellipsis."""
+    words = "".join(c if c.isprintable() else " " for c in str(text or "")).split()
+    label = " ".join(words)
+    if len(label) <= _LABEL_MAX:
+        return label
+    return label[: _LABEL_MAX - 3] + "..."
 
 
 def clear_session_state(session_id: str, env: dict[str, str] | None = None) -> None:
@@ -114,11 +117,15 @@ def _tool_signature(tool_name: str, args: dict[str, Any]) -> tuple[str, str] | N
         extra = ""
         if low in ("read_file", "view_file", "read"):
             extra = f":{args.get('StartLine') or args.get('offset')}:{args.get('EndLine') or args.get('limit')}"
-        elif low in ("edit_file", "edit", "write_file", "write"):
-            # Include a prefix of Target/old_string/Content so distinct edits to different
-            # regions of the same file are never mistaken for an identical thrash loop.
-            snippet = str(args.get("Target") or args.get("old_string") or args.get("Content") or args.get("content") or "")[:120]
-            extra = ":" + hashlib.sha256(snippet.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        elif low in ("edit_file", "edit", "write_file", "write", "replace_file_content", "multi_replace_file_content"):
+            # Hash the full target + replacement/content so distinct edits sharing a boilerplate
+            # prefix never collide as an identical thrash loop.
+            part_a = str(
+                args.get("Target") or args.get("TargetContent") or args.get("old_string")
+                or args.get("Content") or args.get("content") or ""
+            )
+            part_b = str(args.get("Replacement") or args.get("ReplacementContent") or args.get("new_string") or "")
+            extra = ":" + hashlib.sha256(f"{part_a}\0{part_b}".encode("utf-8", errors="ignore")).hexdigest()[:16]
         h = hashlib.sha256(f"{low}:{norm_p}{extra}".encode("utf-8")).hexdigest()[:20]
         return h, _clean_label(f"{tool_name}({Path(raw_path).name})")
     if low in ("grep", "glob", "call_mcp_tool") or low.startswith("mcp"):
@@ -231,6 +238,94 @@ def pop_pending_nudge(
     return nudge
 
 
+FORM_REPAIR_GATE_FILE = "form-repair-gate.json"
+_FORM_REPAIR_GATE_MAX = 256
+FORM_REPAIR_GATE_TTL_S = 600.0  # Bounded staleness for anything the stat signatures cannot see
+
+
+def _stat_sig(path: str) -> list[int] | None:
+    """``[mtime_ns, size]`` of a file, or None when it does not exist (mirrored by terser-fast)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return [int(st.st_mtime_ns), int(st.st_size)]
+
+
+def _record_form_repair_gate(
+    cwd: str,
+    host: str,
+    facts_path: str,
+    candidates: list[tuple[str, str]],
+    e: Any,
+    env: dict[str, str] | None,
+) -> None:
+    """Remember whether this checkout has any usable FormRepair facts.
+
+    terser-fast reads this to answer Bash PreToolUse without starting Python when the
+    checkout provably has nothing to repair. The entry is only trusted while every input
+    that decided it (the facts file, the checkout's ``.git/config`` that keys the repo
+    identity, and the TokenEconomizer env overrides) is byte-for-byte unchanged, so the
+    decision is identical to running this function. Linked worktrees (``.git`` is a file)
+    and checkouts outside git are never recorded and always take the full path.
+    """
+    if host != "claude":
+        return
+    try:
+        from tokeneconomizer.plugin import paths as te_paths  # type: ignore
+
+        root = te_paths.find_repo_root(cwd, e)
+        if not root:
+            return  # A later `git init` above cwd would change the identity; never cache.
+        dot_git = os.path.join(root, ".git")
+        if not os.path.isdir(dot_git):
+            return
+        git_config = os.path.join(dot_git, "config")
+        gate_path = state_home(env) / FORM_REPAIR_GATE_FILE
+        try:
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            if not isinstance(gate, dict):
+                gate = {}
+        except (OSError, ValueError):
+            gate = {}
+        entry = {
+            "facts": facts_path,
+            "facts_sig": _stat_sig(facts_path),
+            "git_config": git_config,
+            "git_sig": _stat_sig(git_config),
+            "te_home": str(e.get("TOKENECONOMIZER_HOME") or ""),
+            "te_repo": str(e.get("TOKENECONOMIZER_REPO") or ""),
+            "ceilings": str(e.get("GIT_CEILING_DIRECTORIES") or ""),
+            "home": str(e.get("HOME") or ""),
+            "has": bool(candidates),
+        }
+        key = f"{host}|{cwd}"
+        prev = gate.get(key)
+        if (
+            isinstance(prev, dict)
+            and {k: v for k, v in prev.items() if k != "at"} == entry
+            and time.time() - float(prev.get("at") or 0) < FORM_REPAIR_GATE_TTL_S / 2
+        ):
+            return
+        entry["at"] = time.time()
+        gate.pop(key, None)
+        gate[key] = entry
+        if len(gate) > _FORM_REPAIR_GATE_MAX:
+            for old in list(gate)[: len(gate) - _FORM_REPAIR_GATE_MAX]:
+                gate.pop(old, None)
+        atomic_write_json(gate_path, gate)
+    except Exception:
+        return
+
+
+_PLAIN_EXE_RE = re.compile(r"^[A-Za-z0-9_.+\-]+$")
+
+
+def _is_plain_executable(form: str) -> bool:
+    """True for a bare command name such as ``python3`` or ``py.exe`` (no paths, args, or shell syntax)."""
+    return bool(_PLAIN_EXE_RE.match(form))
+
+
 def apply_form_repair(
     cwd: str,
     command: str,
@@ -238,8 +333,12 @@ def apply_form_repair(
     cfg: dict[str, Any],
     host: str = "antigravity",
     env: dict[str, str] | None = None,
+    shell_neutral_only: bool = False,
 ) -> tuple[str, bool]:
     """Rewrite a leading broken shell command using confirmed Terser EnvFacts.
+
+    ``shell_neutral_only`` limits repairs to plain executable-name swaps (one token, no shell
+    syntax) so facts learned from POSIX shells never inject POSIX-only syntax into PowerShell.
 
     Returns ``(command_out, was_repaired)``. Only rewrites exact leading token/prefix
     matches followed by whitespace or end-of-string, and never rewrites ``cd ... &&``
@@ -251,22 +350,22 @@ def apply_form_repair(
         return command, False
     try:
         ensure_vendor_paths()
-        from tokeneconomizer.microskills.envfacts import EnvFactsDistiller  # type: ignore
+        from tokeneconomizer.microskills.envfacts import STATE_SUBDIR, EnvFactsDistiller  # type: ignore
+        from tokeneconomizer.names import repo_filename  # type: ignore
         from tokeneconomizer.plugin import paths as te_paths  # type: ignore
-        from tokeneconomizer.plugin import repos as te_repos  # type: ignore
 
         e = env if env is not None else os.environ
-        root = te_paths.state_root(e)
-        repo = te_repos.resolve(cwd, root=root)
-        mech_dir = os.path.join(te_paths.repo_dir(root, repo.key), "mech")
+        repo = te_paths.repo_identity(cwd, e)
+        mech_dir = os.path.join(te_paths.repo_state_dir(repo, host, e), "mechanisms")
+        facts_path = os.path.join(mech_dir, STATE_SUBDIR, repo_filename(repo.label) + ".json")
         if not os.path.isdir(mech_dir):
+            _record_form_repair_gate(cwd, host, facts_path, [], e, env)
             return command, False
         dist = EnvFactsDistiller.load(repo.label, mech_dir)
     except Exception:
         return command, False
 
-    stripped = command.lstrip()
-    lead = command[: len(command) - len(stripped)]
+    candidates: list[tuple[str, str]] = []
     for fact in dist.facts.values():
         if getattr(fact, "family", "") != "form_repair" or not fact.injectable():
             continue
@@ -274,8 +373,20 @@ def apply_form_repair(
         good = (fact.working_form() or "").strip()
         if not bad or not good or bad == good or good.startswith("cd "):
             continue
+        candidates.append((bad, good))
+    _record_form_repair_gate(cwd, host, facts_path, candidates, e, env)
+    if shell_neutral_only:
+        candidates = [(b, g) for b, g in candidates if _is_plain_executable(b) and _is_plain_executable(g)]
+
+    stripped = command.lstrip()
+    lead = command[: len(command) - len(stripped)]
+    for bad, good in candidates:
         if stripped == bad or (stripped.startswith(bad) and stripped[len(bad): len(bad) + 1].isspace()):
             repaired = lead + good + stripped[len(bad):]
+            if host == "codex":
+                from runtime import codex_hooks
+                if not codex_hooks.equivalent_command(command, repaired, cwd, env):
+                    continue
             record_savings("form_repair", 2000, len(repaired), host=host, detail=f"{bad}->{good}", env=env)
             return repaired, True
     return command, False

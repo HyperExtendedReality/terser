@@ -1,0 +1,13 @@
+{
+  "Command Delta-Diff (Repeat pytest)": 122,
+  "Git Lockfile Diff Elision": 72,
+  "Lossless Columnar JSON Folding": 244,
+  "MCP Schema (Counter vs Full)": 1050,
+  "Read Funnel T0 (Unchanged Re-read)": 38,
+  "Read Funnel T1 (Small-Edit Delta)": 93,
+  "Read Funnel T2 (Outline-First Code)": 692,
+  "Read Funnel T2b (Outline-First Docs)": 333,
+  "SQLite FTS5 Sandbox Query": 462,
+  "SmartCrusher JSON (120 API items)": 190,
+  "Stream Output Filter (Cargo Build)": 34
+}

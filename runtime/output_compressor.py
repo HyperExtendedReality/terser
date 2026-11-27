@@ -500,14 +500,20 @@ _HTML_ANY_TAG_RE = re.compile(r"<[^>]+>")
 _MD_TABLE_SEP_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
 
 
-def compact_web_and_markdown(text: str) -> str:
-    """Strip HTML nav/script/style boilerplate and compact padded Markdown tables into lossless TSV."""
+_HTML_DOC_HEAD_RE = re.compile(r"(?is)^\s*(?:<!doctype\s+html\b|<html\b|<head\b|<body\b)")
+_WEB_CMD_RE = re.compile(r"(?i)(?:^|\s)(?:curl|wget|http|xh|webfetch|fetch|lynx|w3m)\b")
+
+
+def compact_web_and_markdown(text: str, *, allow_html: bool = False) -> str:
+    """Strip HTML nav/script/style boilerplate (web pages only) and compact padded Markdown tables into lossless TSV."""
     if not text or len(text) < 400:
         return text
 
     cur = text
-    # 1. HTML boilerplate stripping (only when text clearly contains HTML markup)
-    if len(_HTML_TAG_PROBE_RE.findall(cur[:8192])) >= 3:
+    # 1. HTML boilerplate stripping: ONLY for actual HTML documents / web fetches,
+    # never for diffs, source files, JSX/TSX, or arbitrary command output containing markup.
+    is_html_doc = bool(_HTML_DOC_HEAD_RE.search(cur[:1024]))
+    if (allow_html or is_html_doc) and len(_HTML_TAG_PROBE_RE.findall(cur[:8192])) >= 3:
         import html as _html
 
         cleaned = _HTML_BOILERPLATE_RE.sub("\n", cur)
@@ -563,6 +569,53 @@ def compact_web_and_markdown(text: str) -> str:
             cur = "\n".join(out)
 
     return cur
+
+
+_WEB_HEAD_CHARS = 4000
+_WEB_OUTLINE_MAX = 40
+_MD_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
+
+
+def archive_web_page(
+    text: str,
+    *,
+    source: str = "",
+    threshold: int = 12000,
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """Archive a large fetched page into sandbox.db; return head + heading outline + search hint.
+
+    Returns ``None`` when the page is under ``threshold`` or archiving fails, so the caller
+    keeps serving the page itself. Lines in the outline are archive line numbers, so
+    ``expand_sandbox`` can jump straight to a section.
+    """
+    if not text or len(text) <= threshold:
+        return None
+    from runtime import context_sandbox
+
+    label = f"web:{source[:180]}" if source else "web"
+    aid = context_sandbox.store_output(text, command=label, env=env)
+    if not aid:
+        return None
+    lines = text.splitlines()
+    outline: list[str] = []
+    for no, line in enumerate(lines, start=1):
+        m = _MD_HEADING_RE.match(line)
+        if m:
+            outline.append(f"  L{no} {'  ' * (len(m.group(1)) - 1)}{m.group(2)[:100]}")
+            if len(outline) >= _WEB_OUTLINE_MAX:
+                outline.append("  ...")
+                break
+    head = text[:_WEB_HEAD_CHARS]
+    cut = head.rfind("\n")
+    if cut > _WEB_HEAD_CHARS // 2:
+        head = head[:cut]
+    parts = [head.rstrip(), f"\n[Terser: page has {len(lines)} lines / {len(text)} chars; the rest is archived as `{aid}`.]"]
+    if outline:
+        parts.append("Sections (archive line numbers):\n" + "\n".join(outline))
+    parts.append(context_sandbox.retrieval_hint(aid, env=env))
+    record_savings("web_archive", len(text), sum(len(p) for p in parts), host="any", detail=source[:60] or "web", env=env)
+    return "\n".join(parts)
 
 
 _MULTI_SPACE_RE = re.compile(r" {2,}")
@@ -722,8 +775,14 @@ def apply_stream_filters(text: str, command: str) -> str:
     return text
 
 
+def _retrieval_hint(archive_id: str, mode: str = "both") -> str:
+    from runtime import context_sandbox
+
+    return context_sandbox.retrieval_hint(archive_id, mode, env=os.environ)
+
+
 def _error_pinned_window(text: str, max_chars: int, archive_id: str | None) -> str:
-    """Keep head + ALL error/warning/diff lines + tail within max_chars."""
+    """Keep head + ALL error/warning/diff lines (with ±2 stack-trace context) + tail within max_chars."""
     if len(text) <= max_chars:
         return text
     lines = text.splitlines()
@@ -733,49 +792,90 @@ def _error_pinned_window(text: str, max_chars: int, archive_id: str | None) -> s
     mid = lines[head_n: len(lines) - tail_n] if tail_n else lines[head_n:]
     tail = lines[len(lines) - tail_n:] if tail_n else []
 
-    pinned_mid: list[str] = []
-    pinned_budget = max(2000, max_chars // 2)
-    used = 0
-    for idx, ln in enumerate(mid, start=head_n + 1):
+    # Pin signal lines plus ±2 surrounding lines (indented source, caret pointers, assertion diffs)
+    keep_mid: set[int] = set()
+    for i, ln in enumerate(mid):
         if _SIGNAL_LINE_RE.search(ln):
-            entry = f"L{idx}: {ln}"
-            if used + len(entry) + 1 <= pinned_budget:
-                pinned_mid.append(entry)
-                used += len(entry) + 1
+            for j in range(max(0, i - 1), min(len(mid), i + 3)):
+                keep_mid.add(j)
+
+    pinned_mid: list[str] = []
+    pinned_budget = max(2500, int(max_chars * 0.55))
+    used = 0
+    for i in sorted(keep_mid):
+        entry = f"L{head_n + i + 1}: {mid[i]}"
+        if used + len(entry) + 1 <= pinned_budget:
+            pinned_mid.append(entry)
+            used += len(entry) + 1
 
     omitted = max(0, len(mid) - len(pinned_mid))
     pointer = (
-        f" (full output indexed: `terse query {archive_id} \"<keywords>\"` or `terse expand {archive_id} [start end]`)"
+        f" (full output indexed: {_retrieval_hint(archive_id)})"
         if archive_id
         else ""
     )
-    parts: list[str] = list(head)
-    if omitted > 0:
-        parts.append(f"... [{omitted} routine middle lines omitted; {len(pinned_mid)} signal lines preserved{pointer}] ...")
-    parts.extend(pinned_mid)
-    if tail:
-        parts.append("--- tail ---")
-        parts.extend(tail)
-    result = "\n".join(parts)
+
+    def _assemble(h: list[str], p: list[str], t: list[str]) -> str:
+        parts: list[str] = list(h)
+        if omitted > 0:
+            parts.append(f"... [{omitted} routine middle lines omitted; {len(p)} signal/context lines preserved{pointer}] ...")
+        parts.extend(p)
+        if t:
+            parts.append("--- tail ---")
+            parts.extend(t)
+        return "\n".join(parts)
+
+    result = _assemble(head, pinned_mid, tail)
+    # Trim routine head/tail first before ever cutting pinned signal lines
+    while len(result) > max_chars and (len(head) > 10 or len(tail) > 15):
+        if len(head) > 10:
+            head = head[: max(10, len(head) - 5)]
+        if len(tail) > 15:
+            tail = tail[min(5, len(tail) - 15):]
+        result = _assemble(head, pinned_mid, tail)
     if len(result) > max_chars:
         half = max(500, (max_chars - 120) // 2)
         result = result[:half] + f"\n... [truncated{pointer}] ...\n" + result[-half:]
     return result
 
 
+_CRITICAL_VERIFY_RE = re.compile(
+    r"(?i)(?:^\s*(?:FAILED|ERROR|FATAL|PANIC)\b|^E\s+\S|error\[E\d+\]:|Traceback \(most recent call last\)|^@@ -\d+)"
+)
+
+
+def _verify_signal_preserved(raw: str, compressed: str, *, returncode: int = 0) -> bool:
+    """Deterministic post-compression invariant check (inspired by sqz verifier).
+
+    Ensures critical failure/traceback/diff-hunk lines were not accidentally dropped.
+    """
+    if not raw or not compressed:
+        return bool(compressed) or not raw
+    # Only enforce strict signal survival when output was meaningfully shrunk
+    if len(compressed) >= len(raw):
+        return True
+    critical = [ln.strip() for ln in raw.splitlines() if _CRITICAL_VERIFY_RE.search(ln)]
+    if not critical:
+        return True
+    # Sample up to 8 distinct critical lines (first 4 + last 4) and verify at least 75% survive
+    sample = list(dict.fromkeys(critical[:4] + critical[-4:]))
+    if not sample:
+        return True
+    hits = sum(1 for ln in sample if ln[:60] in compressed)
+    min_ratio = 0.75 if returncode != 0 else 0.50
+    return (hits / len(sample)) >= min_ratio
+
+
 def _vendor_compress(text: str, command: str, returncode: int = 0, stderr: str = "") -> str:
-    """Delegate to Terser's bundled specialized command handlers (git, pytest, npm, etc.)."""
+    """Apply Terser's native per-command handlers (git, test runners, package managers)."""
     if not command or not text:
         return text
     try:
-        ensure_vendor_paths()
-        import bash_compress as _bc  # type: ignore
+        from runtime import command_handlers
 
-        fn = getattr(_bc, "compress", None)
-        if callable(fn):
-            out = fn(command, text, returncode=returncode, stderr=stderr)
-            if isinstance(out, str) and out:
-                return out
+        out = command_handlers.compress(command, text, returncode=returncode, stderr=stderr)
+        if isinstance(out, str) and out:
+            return out
     except Exception:
         pass
     return text
@@ -801,6 +901,77 @@ def _maybe_compact_file_listing(text: str, command: str) -> str:
     return compact_file_list(lines)
 
 
+_SCOPED_READ_MAX = 40_000
+_SCOPED_READ_PATTERN = (
+    r"(?i)(?:\bsed\s+-n\s+['\"]?[^\s'\"]*[\d$][^\s'\"]*p['\"]?(?:\s|$)"
+    r"|\b(?:head|tail)\s+-(?:n\s*)?\d+|\b(?:head|tail)\s+-n\b"
+    r"|\bawk\s+['\"]NR|-(?:TotalCount|Tail|Head|First|Last|Index)\b)"
+)
+_SCOPED_READ_RE = re.compile(_SCOPED_READ_PATTERN)
+
+
+_LOSSY_DROP_KEY_RE = re.compile(r"(?i)^(?:x[-_])?(?:trace|request|span|correlation|parent[-_]?span)[-_]?id$")
+_LOSSY_STR_MAX = 500
+_LOSSY_MIN_CHARS = 1200
+
+
+def _json_lossy_enabled(explicit: bool | None, env: dict[str, str] | None) -> bool:
+    if explicit is not None:
+        return explicit
+    e = env if env is not None else os.environ
+    raw = str(e.get("TERSER_JSON_LOSSY") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    try:
+        from runtime.config import load_config
+
+        return bool(load_config(e).get("json_lossy", False))
+    except Exception:
+        return False
+
+
+def _prune_node(node: Any) -> Any:
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if _LOSSY_DROP_KEY_RE.match(str(k)):
+                continue
+            v = _prune_node(v)
+            if v is None or v == "" or v == [] or v == {}:
+                continue
+            out[k] = v
+        return out
+    if isinstance(node, list):
+        return [_prune_node(x) for x in node]
+    if isinstance(node, str) and len(node) > _LOSSY_STR_MAX:
+        return node[:_LOSSY_STR_MAX] + f"...[+{len(node) - _LOSSY_STR_MAX} chars]"
+    return node
+
+
+def prune_json_lossy(text: str) -> str | None:
+    """Opt-in lossy JSON view: drop nulls/empties and trace/request ids, cut long strings.
+
+    Returns compact JSON, or ``None`` when the text is not a JSON document or nothing
+    shrinks. Never used on error output; callers archive the original first.
+    """
+    stripped = (text or "").strip()
+    if len(stripped) < _LOSSY_MIN_CHARS or stripped[:1] not in "{[":
+        return None
+    try:
+        data = json.loads(stripped)
+    except ValueError:
+        return None
+    pruned = json.dumps(_prune_node(data), ensure_ascii=False, separators=(",", ":"))
+    return pruned if len(pruned) < int(len(stripped) * 0.9) else None
+
+
+def is_scoped_read(command: str) -> bool:
+    """True when the command already selects a line range; those lines are not elided below 40 KB."""
+    return bool(command) and bool(_SCOPED_READ_RE.search(command))
+
+
 def compress_output(
     text: str,
     *,
@@ -813,6 +984,7 @@ def compress_output(
     host: str = "unknown",
     workspace: str | None = None,
     env: dict[str, str] | None = None,
+    json_lossy: bool | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Run the 5-stage quality-preserving output compression pipeline.
 
@@ -826,10 +998,28 @@ def compress_output(
         return "", {"raw_chars": 0, "served_chars": 0, "archive_id": None}
 
     raw_len = len(text)
+    user_filters = None
+    if command:
+        try:
+            from runtime import user_filters
+        except Exception:
+            user_filters = None
+        if user_filters is not None and user_filters.is_excluded(command, workspace, env):
+            return text, {"raw_chars": raw_len, "served_chars": raw_len, "archive_id": None, "excluded": True}
     cur = strip_ansi_and_progress(text) if enhanced else text
 
+    # Stage 1b: opt-in lossy JSON pruning (`json_lossy=true`); the raw payload is archived first.
+    lossy_aid: str | None = None
+    if enhanced and not lossless_only and _json_lossy_enabled(json_lossy, env):
+        pruned = prune_json_lossy(cur)
+        if pruned is not None:
+            if lossy_aid is None:
+                lossy_aid = _archive_full_output(text, command=command, env=env)
+            hint = f"\n[terser: lossy JSON view (nulls, empties, trace ids, long strings cut); original: {_retrieval_hint(lossy_aid)}]" if lossy_aid else ""
+            cur = pruned + hint
+
     # Stage 2: lockfile diff elision + framework stack folding + compiler note dedup + base64 + web/table compaction + filters
-    archive_id: str | None = None
+    archive_id: str | None = lossy_aid
     if enhanced:
         if not lossless_only:
             cur = elide_lockfile_diffs(cur)
@@ -840,9 +1030,14 @@ def compress_output(
             cur, b64_aid = fold_base64_blobs(cur, command=command, env=env)
             if b64_aid:
                 archive_id = b64_aid
-        cur = compact_web_and_markdown(cur)
+        cur = compact_web_and_markdown(
+            cur,
+            allow_html=(not lossless_only and bool(_WEB_CMD_RE.search(command or ""))),
+        )
         cur = compact_aligned_tables(cur)
     if command and not lossless_only:
+        if user_filters is not None:
+            cur = user_filters.apply_filters(command, cur, returncode=returncode, workspace=workspace, env=env)
         cur = apply_stream_filters(cur, command) if enhanced else cur
         cur = _vendor_compress(cur, command, returncode=returncode, stderr=stderr)
 
@@ -871,10 +1066,18 @@ def compress_output(
             if not lossless_only:
                 cur = collapse_duplicate_lines(cur)
 
-    if not lossless_only and len(cur) > max_chars:
+    window = max(max_chars, _SCOPED_READ_MAX) if is_scoped_read(command) else max_chars
+    if not lossless_only and len(cur) > window:
         if archive_id is None:
             archive_id = _archive_full_output(text, command=command, env=env)
-        cur = _error_pinned_window(cur, max_chars=max_chars, archive_id=archive_id)
+        cur = _error_pinned_window(cur, max_chars=window, archive_id=archive_id)
+
+    # Post-compression invariant check: if critical error/diff-hunk lines were lost, fall back safely.
+    if not lossless_only and not _verify_signal_preserved(text, cur, returncode=returncode):
+        if archive_id is None and len(text) > window:
+            archive_id = _archive_full_output(text, command=command, env=env)
+        safe_base = strip_ansi_and_progress(text) if enhanced else text
+        cur = _error_pinned_window(safe_base, max_chars=window, archive_id=archive_id) if len(safe_base) > window else safe_base
 
     if len(cur) < raw_len:
         record_savings(
@@ -893,20 +1096,65 @@ def _recheck_safe_argv(argv: list[str]) -> bool:
     if not argv:
         return False
     try:
-        ensure_vendor_paths()
-        import bash_hook as _bh  # type: ignore
+        from runtime import shell_safety as _bh
 
         joined = shlex.join(argv)
-        if _bh._has_dangerous_chars(joined):
+        if _bh.has_dangerous_chars(joined):
             return False
-        return bool(_bh._is_whitelisted(joined))
+        return bool(_bh.is_whitelisted(joined))
     except Exception:
         return False
+
+
+def run_codex_exec(args: list[str]) -> int:
+    """Run an explicit, non-interactive argv command with recoverable stdout deltas."""
+    import subprocess
+    from runtime import cmd_delta
+    from runtime.config import load_config
+
+    from runtime import context_sandbox
+
+    context_sandbox.set_hint_host("codex")
+    session_id = os.environ.get("TERSER_SESSION_ID") or os.environ.get("CODEX_THREAD_ID", "")
+    if len(args) >= 2 and args[0] == "--sid":
+        session_id = args[1]
+        args = args[2:]
+    if len(args) < 2 or args[0] != "--":
+        print("Usage: terse exec [--sid <session-id>] -- <program> [args...]", file=sys.stderr)
+        return 2
+    argv = args[1:]
+    try:
+        proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True)
+    except OSError as exc:
+        print(f"{argv[0]}: {exc}", file=sys.stderr)
+        return 127 if isinstance(exc, FileNotFoundError) else 126
+
+    stdout = proc.stdout
+    cfg = load_config()
+    if session_id and proc.returncode == 0 and not proc.stderr and cfg.get("enabled") and not cfg.get("shadow") and cfg.get("bash_compress") and cfg.get("cmd_delta"):
+        try:
+            compact, used = cmd_delta.apply_command_delta(
+                session_id, shlex.join(argv), stdout.decode("utf-8"), host="codex", argv=tuple(argv),
+            )
+            if used:
+                stdout = (compact + "\n").encode("utf-8")
+        except (UnicodeError, OSError, ValueError):
+            pass
+    sys.stdout.buffer.write(stdout)
+    sys.stderr.buffer.write(proc.stderr)
+    return proc.returncode if proc.returncode >= 0 else 128 - proc.returncode
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI wrapper entrypoint: ``output_compressor.py [--sid <id> --] <cmd> [args...]``."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["--codex-exec"]:
+        return run_codex_exec(args[1:])
+    # This wrapper only runs when a Terser hook rewrote an agent's shell command,
+    # so retrieval hints should target the agent's MCP tools, not the shell CLI.
+    from runtime import context_sandbox
+
+    context_sandbox.set_hint_host(os.environ.get("TERSER_HOST") or "agent")
     session_id = os.environ.get("TERSER_SESSION_ID", "")
     if len(args) >= 3 and args[0] == "--sid" and args[2] == "--":
         session_id = args[1]

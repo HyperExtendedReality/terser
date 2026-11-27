@@ -1,7 +1,8 @@
 use crate::config::{
-    atomic_write_json, canonical_json, now_secs, record_savings, safe_sid_filename, state_home,
-    valid_sid, Config,
+    atomic_write_json, canonical_json, now_secs, record_funnel_event, record_savings,
+    safe_sid_filename, state_home, tier_backed_off, valid_sid, Config,
 };
+use crate::difflib::{py_slice, splitlines_keepends, unified_diff};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -11,12 +12,110 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 128 * 1024;
 const MAX_STORE_ENTRIES: usize = 160;
 const SOFT_DENY_CAP: i64 = 1;
+const DELTA_MAX_DIFF_LINES: usize = 60;
+const DELTA_MAX_RATIO: f64 = 0.40;
+const BLOB_DIR: &str = "blobs";
 
 const MUTATING_OR_LIVE_MCP_TOKENS: &[&str] = &[
-    "write", "edit", "create", "delete", "remove", "drop", "update", "patch", "put", "post",
-    "send", "submit", "publish", "deploy", "run", "exec", "execute", "invoke", "trigger", "start",
-    "stop", "kill", "cancel", "status", "poll", "wait", "watch", "tail", "logs", "time", "now",
-    "clock", "health", "ping", "refresh", "invalidate", "register", "index",
+    "write",
+    "edit",
+    "create",
+    "delete",
+    "remove",
+    "drop",
+    "update",
+    "patch",
+    "put",
+    "post",
+    "send",
+    "submit",
+    "publish",
+    "deploy",
+    "run",
+    "exec",
+    "execute",
+    "invoke",
+    "trigger",
+    "start",
+    "stop",
+    "kill",
+    "cancel",
+    "status",
+    "poll",
+    "wait",
+    "watch",
+    "tail",
+    "logs",
+    "time",
+    "now",
+    "clock",
+    "health",
+    "ping",
+    "refresh",
+    "invalidate",
+    "register",
+    "index",
+    // UI / browser / device / session tools whose result reflects state other calls change.
+    "computer",
+    "screenshot",
+    "screen",
+    "snapshot",
+    "capture",
+    "page",
+    "tab",
+    "tabs",
+    "navigate",
+    "click",
+    "scroll",
+    "type",
+    "key",
+    "hover",
+    "drag",
+    "console",
+    "network",
+    "javascript",
+    "eval",
+    "evaluate",
+    "messages",
+    "inbox",
+    "notifications",
+    "events",
+    "current",
+    "latest",
+    "recent",
+    "live",
+    "session",
+    "sessions",
+    "terminal",
+    "clipboard",
+    "query",
+    "sql",
+    "select",
+];
+
+/// Server names whose tools observe or drive live state. Mirrors `_LIVE_MCP_SERVER_TOKENS`.
+const LIVE_MCP_SERVER_TOKENS: &[&str] = &[
+    "browser",
+    "chrome",
+    "playwright",
+    "puppeteer",
+    "selenium",
+    "computer",
+    "desktop",
+    "terminal",
+    "devtools",
+    "screen",
+    "android",
+    "adb",
+    "ios",
+    "simulator",
+    "emulator",
+    "frida",
+    "gdb",
+    "debug",
+    "debugger",
+    "rizin",
+    "rea",
 ];
 
 pub enum FunnelOutcome {
@@ -66,8 +165,19 @@ fn load_store(sid: &str) -> Map<String, Value> {
     root
 }
 
+/// Record a `retry` when the model re-requested content right after a short funnel answer.
+fn note_retry(prev: &mut Map<String, Value>, soft_denies: i64, host: &str) {
+    const RETRY_WINDOW_S: f64 = 180.0;
+    if let Some(Value::String(tier)) = prev.remove("last_tier") {
+        let ts = prev.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if soft_denies >= SOFT_DENY_CAP && now_secs() - ts <= RETRY_WINDOW_S {
+            record_funnel_event(&tier, "retry", host);
+        }
+    }
+}
+
 fn save_store(sid: &str, store: &mut Map<String, Value>) {
-    for bucket_key in ["reads", "mcp"] {
+    for bucket_key in ["reads", "mcp", "searches"] {
         if let Some(Value::Object(bucket)) = store.get_mut(bucket_key) {
             if bucket.len() > MAX_STORE_ENTRIES {
                 let mut items: Vec<(String, f64)> = bucket
@@ -87,26 +197,130 @@ fn save_store(sid: &str, store: &mut Map<String, Value>) {
             }
         }
     }
+    externalize_snapshots(store);
     atomic_write_json(&cache_path(sid), &Value::Object(store.clone()));
 }
 
+fn blob_path(digest: &str) -> PathBuf {
+    state_home()
+        .join("read-cache")
+        .join(BLOB_DIR)
+        .join(format!("{digest}.txt"))
+}
+
+/// Store `text` content-addressed by the SHA-256 of its UTF-8 bytes (shared with Python).
+fn write_blob(text: &str) -> Option<String> {
+    let digest = sha256_hex(text.as_bytes());
+    let p = blob_path(&digest);
+    if p.is_file() {
+        // Refresh mtime so the TTL sweep keeps referenced blobs alive.
+        if let Ok(f) = fs::OpenOptions::new().append(true).open(&p) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+        return Some(digest);
+    }
+    let dir = p.parent()?;
+    fs::create_dir_all(dir).ok()?;
+    let tmp = dir.join(format!("{digest}.tmp.{}", std::process::id()));
+    fs::write(&tmp, text.as_bytes()).ok()?;
+    fs::rename(&tmp, &p).ok()?;
+    Some(digest)
+}
+
+/// An entry's cached snapshot: inline (legacy) or from its SHA-verified blob.
+fn snapshot_text(entry: &Map<String, Value>) -> Option<String> {
+    if let Some(Value::String(s)) = entry.get("snapshot") {
+        return Some(s.clone());
+    }
+    let digest = entry.get("snapshot_sha")?.as_str()?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let data = fs::read(blob_path(digest)).ok()?;
+    if sha256_hex(&data) != digest {
+        return None;
+    }
+    String::from_utf8(data).ok()
+}
+
+fn has_snapshot(entry: &Map<String, Value>) -> bool {
+    matches!(entry.get("snapshot"), Some(Value::String(_)))
+        || matches!(entry.get("snapshot_sha"), Some(Value::String(_)))
+}
+
+/// Move inline snapshots into shared blobs so each hook parses and rewrites a small store.
+fn externalize_snapshots(store: &mut Map<String, Value>) {
+    let Some(Value::Object(reads)) = store.get_mut("reads") else {
+        return;
+    };
+    for entry in reads.values_mut() {
+        let Value::Object(e) = entry else { continue };
+        let Some(Value::String(snap)) = e.get("snapshot") else {
+            continue;
+        };
+        if let Some(digest) = write_blob(snap) {
+            e.remove("snapshot");
+            e.insert("snapshot_sha".into(), Value::String(digest));
+        }
+    }
+}
+
+/// Python `str.isspace()` (Unicode White_Space plus the C0 separators U+001C..U+001F).
+fn py_isspace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// Unified diff of the requested window (byte-identical to Python `difflib`), or `None`
+/// when the diff is too long or too dense to be worth sending.
+fn compact_unified_diff(
+    old_text: &str,
+    new_text: &str,
+    basename: &str,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+) -> Option<String> {
+    let s = start_line
+        .filter(|&v| v != 0)
+        .map(|v| (v - 1).max(0))
+        .unwrap_or(0);
+    let e = end_line.filter(|&v| v != 0);
+    let old_lines = splitlines_keepends(old_text);
+    let new_lines = splitlines_keepends(new_text);
+    let old_slice = py_slice(&old_lines, Some(s), e);
+    let new_slice = py_slice(&new_lines, Some(s), e);
+    if new_slice.is_empty() {
+        return None;
+    }
+    let diff = unified_diff(
+        old_slice,
+        new_slice,
+        &format!("a/{basename}"),
+        &format!("b/{basename}"),
+        2,
+    );
+    let too_long = diff.len() > DELTA_MAX_DIFF_LINES;
+    let too_dense =
+        new_slice.len() >= 20 && diff.len() as f64 > DELTA_MAX_RATIO * new_slice.len() as f64;
+    if diff.is_empty() || too_long || too_dense {
+        return None;
+    }
+    Some(diff.concat().trim_end_matches(py_isspace).to_string())
+}
+
+/// True when the requested span lies inside the span already delivered (`None` = open end).
 fn range_covered(
     prev_start: Option<i64>,
     prev_end: Option<i64>,
     start: Option<i64>,
     end: Option<i64>,
 ) -> bool {
-    let ps = prev_start.unwrap_or(1);
-    let s = start.unwrap_or(1);
-    if s < ps {
-        return false;
-    }
-    if let Some(pe) = prev_end {
-        if end.is_none() || end.unwrap() > pe {
-            return false;
-        }
-    }
-    true
+    let have = (prev_start.unwrap_or(1), prev_end.unwrap_or(i64::MAX));
+    let want = (start.unwrap_or(1), end.unwrap_or(i64::MAX));
+    have.0 <= want.0 && want.1 <= have.1
 }
 
 fn intervals_cover(prev: &Map<String, Value>, start: Option<i64>, end: Option<i64>) -> bool {
@@ -126,7 +340,12 @@ fn intervals_cover(prev: &Map<String, Value>, start: Option<i64>, end: Option<i6
             return false;
         }
     }
-    range_covered(opt_i64(prev.get("start")), opt_i64(prev.get("end")), start, end)
+    range_covered(
+        opt_i64(prev.get("start")),
+        opt_i64(prev.get("end")),
+        start,
+        end,
+    )
 }
 
 fn merge_intervals(
@@ -161,10 +380,7 @@ fn merge_intervals(
             match last.1 {
                 None => continue,
                 Some(pe) if s <= pe + 1 => {
-                    last.1 = match e {
-                        None => None,
-                        Some(ne) => Some(pe.max(ne)),
-                    };
+                    last.1 = e.map(|ne| pe.max(ne));
                 }
                 _ => merged.push((s, e)),
             }
@@ -176,11 +392,7 @@ fn merge_intervals(
 }
 
 fn intervals_to_json(ivs: &[(i64, Option<i64>)]) -> Value {
-    Value::Array(
-        ivs.iter()
-            .map(|(s, e)| json!([s, e]))
-            .collect(),
-    )
+    Value::Array(ivs.iter().map(|(s, e)| json!([s, e])).collect())
 }
 
 fn is_lockfile_or_minified(basename: &str) -> bool {
@@ -299,9 +511,11 @@ pub fn check_read(
             && intervals_cover(&prev, start_line, end_line)
         {
             let soft_denies = opt_i64(prev.get("soft_denies")).unwrap_or(0);
-            if soft_denies < SOFT_DENY_CAP && !cfg.shadow {
+            if soft_denies < SOFT_DENY_CAP && !cfg.shadow && !tier_backed_off("t0", host) {
                 prev.insert("soft_denies".into(), json!(soft_denies + 1));
                 prev.insert("ts".into(), json!(now));
+                prev.insert("last_tier".into(), Value::String("t0".into()));
+                record_funnel_event("t0", "served", host);
                 if let Some(Value::Object(reads)) = store.get_mut("reads") {
                     reads.insert(key, Value::Object(prev));
                 }
@@ -311,9 +525,16 @@ pub fn check_read(
                     "[Terser] `{basename}` ({rng}) is unchanged since your earlier read. \
                      Reuse the content already in context, or retry to refresh (e.g. after /compact)."
                 );
-                record_savings("read_dedup", meta.len() as usize, reason.len(), host, &basename);
+                record_savings(
+                    "read_dedup",
+                    meta.len() as usize,
+                    reason.len(),
+                    host,
+                    &basename,
+                );
                 return FunnelOutcome::Deny(reason);
             }
+            note_retry(&mut prev, soft_denies, host);
             prev.insert("soft_denies".into(), json!(0));
             prev.insert("ts".into(), json!(now));
             if let Some(Value::Object(reads)) = store.get_mut("reads") {
@@ -350,6 +571,7 @@ pub fn check_read(
 
         // Retry after outline-only -> allow full file & record override
         if outline_only {
+            note_retry(&mut prev, soft_denies, host);
             let ivs = merge_intervals(None, start_line, end_line);
             prev.insert("outline_only".into(), Value::Bool(false));
             prev.insert("sha".into(), Value::String(sha));
@@ -357,8 +579,14 @@ pub fn check_read(
                 prev.insert("mtime_ns".into(), json!(m));
             }
             prev.insert("size".into(), json!(file_size));
-            prev.insert("start".into(), start_line.map(Into::into).unwrap_or(Value::Null));
-            prev.insert("end".into(), end_line.map(Into::into).unwrap_or(Value::Null));
+            prev.insert(
+                "start".into(),
+                start_line.map(Into::into).unwrap_or(Value::Null),
+            );
+            prev.insert(
+                "end".into(),
+                end_line.map(Into::into).unwrap_or(Value::Null),
+            );
             prev.insert("intervals".into(), intervals_to_json(&ivs));
             prev.insert("soft_denies".into(), json!(0));
             prev.insert("ts".into(), json!(now));
@@ -383,9 +611,11 @@ pub fn check_read(
 
         // Tier 0: Unchanged re-read
         if prev_sha == sha && intervals_cover(&prev, start_line, end_line) {
-            if soft_denies < SOFT_DENY_CAP && !cfg.shadow {
+            if soft_denies < SOFT_DENY_CAP && !cfg.shadow && !tier_backed_off("t0", host) {
                 prev.insert("soft_denies".into(), json!(soft_denies + 1));
                 prev.insert("ts".into(), json!(now));
+                prev.insert("last_tier".into(), Value::String("t0".into()));
+                record_funnel_event("t0", "served", host);
                 if let Some(Value::Object(reads)) = store.get_mut("reads") {
                     reads.insert(key, Value::Object(prev));
                 }
@@ -398,6 +628,7 @@ pub fn check_read(
                 record_savings("read_dedup", raw_bytes.len(), reason.len(), host, &basename);
                 return FunnelOutcome::Deny(reason);
             }
+            note_retry(&mut prev, soft_denies, host);
             prev.insert("soft_denies".into(), json!(0));
             prev.insert("ts".into(), json!(now));
             if let Some(Value::Object(reads)) = store.get_mut("reads") {
@@ -412,6 +643,7 @@ pub fn check_read(
             && soft_denies < SOFT_DENY_CAP
             && !cfg.shadow
             && (start_line.is_some() || end_line.is_some())
+            && !tier_backed_off("t0b", host)
         {
             let total_lines = (raw_bytes.iter().filter(|&&b| b == b'\n').count() + 1) as i64;
             let rs = start_line.unwrap_or(1).max(1);
@@ -436,16 +668,50 @@ pub fn check_read(
             }
         }
 
-        // Tier 1: File changed slightly & snapshot exists -> delegate to Python unified diff
+        // Tier 1: File changed slightly & snapshot exists -> exact unified diff natively;
+        // larger changes delegate to Python (symbol-region delta, outline, passthrough).
         if cfg.delta_diff
             && prev_sha != sha
             && soft_denies < SOFT_DENY_CAP
             && !cfg.shadow
-            && prev.get("snapshot").and_then(|v| v.as_str()).is_some()
             && text_snapshot.is_some()
+            && has_snapshot(&prev)
             && intervals_cover(&prev, start_line, end_line)
         {
-            return FunnelOutcome::Delegate;
+            let diff = match (text_snapshot.as_deref(), snapshot_text(&prev)) {
+                _ if tier_backed_off("t1", host) => None,
+                (Some(new_text), Some(old_text)) => {
+                    compact_unified_diff(&old_text, new_text, &basename, start_line, end_line)
+                }
+                _ => None,
+            };
+            let Some(diff) = diff else {
+                return FunnelOutcome::Delegate;
+            };
+            let reason = format!(
+                "[Terser] `{basename}` changed slightly since your last read. \
+                 Exact unified diff:\n```diff\n{diff}\n```\n(Retry read to load the full file.)"
+            );
+            prev.insert("sha".into(), Value::String(sha));
+            match mtime_ns {
+                Some(m) => prev.insert("mtime_ns".into(), json!(m)),
+                None => prev.remove("mtime_ns"),
+            };
+            prev.insert("size".into(), json!(file_size));
+            prev.remove("snapshot_sha");
+            if let Some(new_text) = text_snapshot {
+                prev.insert("snapshot".into(), Value::String(new_text));
+            }
+            prev.insert("soft_denies".into(), json!(soft_denies + 1));
+            prev.insert("ts".into(), json!(now));
+            prev.insert("last_tier".into(), Value::String("t1".into()));
+            if let Some(Value::Object(reads)) = store.get_mut("reads") {
+                reads.insert(key, Value::Object(prev));
+            }
+            save_store(sid, &mut store);
+            record_savings("read_delta", raw_bytes.len(), reason.len(), host, &basename);
+            record_funnel_event("t1", "served", host);
+            return FunnelOutcome::Deny(reason);
         }
     } else {
         // Tier 2: Large unranged first read (or huge first-time ranged slice >= 400L) -> delegate to Python
@@ -461,6 +727,7 @@ pub fn check_read(
             cfg.outline_min_bytes.max(12288)
         };
         if cfg.outline_first
+            && !tier_backed_off("t2", host)
             && (cfg.outline_backoff_limit <= 0 || outline_overrides < cfg.outline_backoff_limit)
             && !cfg.shadow
             && meta.len() >= min_bytes
@@ -491,7 +758,9 @@ pub fn check_read(
                         entry.insert("intervals".into(), json!([]));
                         entry.insert("soft_denies".into(), json!(1));
                         entry.insert("outline_only".into(), Value::Bool(true));
+                        entry.insert("last_tier".into(), Value::String("t2".into()));
                         entry.insert("ts".into(), json!(now));
+                        record_funnel_event("t2", "served", host);
                         if let Some(Value::Object(reads)) = store.get_mut("reads") {
                             reads.insert(key, Value::Object(entry));
                         }
@@ -513,7 +782,13 @@ pub fn check_read(
                              or retry this read immediately to load the full requested span.",
                             meta.len()
                         );
-                        record_savings("read_outline", raw_bytes.len(), reason.len(), host, &basename);
+                        record_savings(
+                            "read_outline",
+                            raw_bytes.len(),
+                            reason.len(),
+                            host,
+                            &basename,
+                        );
                         return FunnelOutcome::Deny(reason);
                     }
                 }
@@ -523,6 +798,12 @@ pub fn check_read(
     }
 
     // Tier 3: First read / ranged read / wider range / large change -> record disjoint intervals & allow
+    if let Some(Value::Object(reads)) = store.get_mut("reads") {
+        if let Some(Value::Object(prev)) = reads.get_mut(&key) {
+            let sd = opt_i64(prev.get("soft_denies")).unwrap_or(0);
+            note_retry(prev, sd, host);
+        }
+    }
     let existing_ivs = store
         .get("reads")
         .and_then(|v| v.as_object())
@@ -559,8 +840,14 @@ pub fn check_read(
         entry.insert("mtime_ns".into(), json!(m));
     }
     entry.insert("size".into(), json!(file_size));
-    entry.insert("start".into(), legacy_start.map(Into::into).unwrap_or(Value::Null));
-    entry.insert("end".into(), legacy_end.map(Into::into).unwrap_or(Value::Null));
+    entry.insert(
+        "start".into(),
+        legacy_start.map(Into::into).unwrap_or(Value::Null),
+    );
+    entry.insert(
+        "end".into(),
+        legacy_end.map(Into::into).unwrap_or(Value::Null),
+    );
     entry.insert("intervals".into(), intervals_to_json(&merged_ivs));
     entry.insert("soft_denies".into(), json!(0));
     entry.insert("outline_only".into(), Value::Bool(false));
@@ -575,18 +862,34 @@ pub fn check_read(
     FunnelOutcome::Allow
 }
 
-fn is_mutating_or_live_mcp(name: &str) -> bool {
-    let tool_part = name.rsplit(':').next().unwrap_or(name);
-    let tool_part = if tool_part.contains("__") {
-        tool_part.rsplit("__").next().unwrap_or(tool_part)
-    } else {
-        tool_part
+/// `(server, tool)` for `server:tool`, `mcp__server__tool` or a bare name. Mirrors `_split_mcp_name`.
+fn split_mcp_name(name: &str) -> (String, String) {
+    let (mut server, mut tool_part) = match name.rsplit_once(':') {
+        Some((s, t)) => (s.to_string(), t.to_string()),
+        None => (String::new(), name.to_string()),
     };
-    let lower = tool_part.to_ascii_lowercase();
-    lower
+    if let Some((head, t)) = tool_part.clone().rsplit_once("__") {
+        if server.is_empty() {
+            server = head.to_string();
+        }
+        tool_part = t.to_string();
+    }
+    if let Some(rest) = server.strip_prefix("mcp__") {
+        server = rest.to_string();
+    }
+    (server, tool_part)
+}
+
+fn has_token(text: &str, list: &[&str]) -> bool {
+    text.to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| !t.is_empty())
-        .any(|t| MUTATING_OR_LIVE_MCP_TOKENS.contains(&t))
+        .any(|t| list.contains(&t))
+}
+
+fn is_mutating_or_live_mcp(name: &str) -> bool {
+    let (server, tool_part) = split_mcp_name(name);
+    has_token(&tool_part, MUTATING_OR_LIVE_MCP_TOKENS) || has_token(&server, LIVE_MCP_SERVER_TOKENS)
 }
 
 pub fn check_mcp_refetch(
@@ -599,7 +902,20 @@ pub fn check_mcp_refetch(
     if !cfg.mcp_refetch_guard || cfg.shadow || sid.is_empty() || !valid_sid(sid) {
         return FunnelOutcome::Allow;
     }
-    if display_name.is_empty() || is_mutating_or_live_mcp(display_name) {
+    if display_name.is_empty() {
+        return FunnelOutcome::Allow;
+    }
+    if is_mutating_or_live_mcp(display_name) {
+        // A mutating or live call can change what any earlier read-only call would return.
+        let mut store = load_store(sid);
+        let has_entries = store
+            .get("mcp")
+            .and_then(|v| v.as_object())
+            .is_some_and(|m| !m.is_empty());
+        if has_entries {
+            store.insert("mcp".into(), Value::Object(Map::new()));
+            save_store(sid, &mut store);
+        }
         return FunnelOutcome::Allow;
     }
 
@@ -641,13 +957,21 @@ pub fn check_mcp_refetch(
     }
 
     if let Some(Value::Object(mcp)) = store.get_mut("mcp") {
-        mcp.insert(fp, json!({"tool": display_name, "ts": now, "soft_denies": 0}));
+        mcp.insert(
+            fp,
+            json!({"tool": display_name, "ts": now, "soft_denies": 0}),
+        );
     }
     save_store(sid, &mut store);
     FunnelOutcome::Allow
 }
 
-pub fn record_mcp_response_size(sid: &str, display_name: &str, inner_args: &Value, resp_bytes: usize) {
+pub fn record_mcp_response_size(
+    sid: &str,
+    display_name: &str,
+    inner_args: &Value,
+    resp_bytes: usize,
+) {
     if sid.is_empty() || !valid_sid(sid) || display_name.is_empty() || resp_bytes == 0 {
         return;
     }

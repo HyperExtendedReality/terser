@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "terser-index": {
+      "command": "python3",
+      "args": ["-E", "-s", "-X", "utf8", "${PLUGIN_ROOT}/runtime/index_mcp.py"],
+      "env": {
+        "TERSER_CLIENT_ID": "codex",
+        "TERSER_TOOL_SURFACE": "counter"
+      }
+    }
+  }
+}

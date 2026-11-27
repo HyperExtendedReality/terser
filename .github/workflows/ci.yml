@@ -33,7 +33,17 @@ jobs:
       - name: Run Python & native integration test suite
         run: python -m unittest discover -s tests -v
 
-      - name: Run doctor & benchmark smoke check
+      - name: Check Rust/Python difflib parity fixtures are current
+        shell: bash
+        run: |
+          python scripts/gen_difflib_fixtures.py
+          git diff --exit-code -- native/terser-fast/tests/fixtures/difflib_cases.json
+
+      - name: Lint Rust hot-path
+        run: cargo clippy --manifest-path native/terser-fast/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run doctor & benchmark regression gate
         run: |
           python runtime/cli.py doctor
-          python scripts/benchmark.py
+          python scripts/benchmark.py --check
+          python scripts/benchmark_codex.py --runs 3

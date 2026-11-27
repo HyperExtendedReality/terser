@@ -80,7 +80,11 @@ fn tool_signature(tool_name: &str, args: &Map<String, Value>) -> Option<(String,
             Value::String(s) => s.clone(),
             Value::Array(arr) => arr
                 .iter()
-                .map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()))
+                .map(|x| {
+                    x.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| x.to_string())
+                })
                 .collect::<Vec<_>>()
                 .join(" "),
             _ => return None,
@@ -200,7 +204,11 @@ pub fn record_tool_event(
     }
 
     let same_streak = if state.get("last_key").and_then(|v| v.as_str()) == Some(key.as_str()) {
-        state.get("same_streak").and_then(|v| v.as_i64()).unwrap_or(0) + 1
+        state
+            .get("same_streak")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            + 1
     } else {
         1
     };

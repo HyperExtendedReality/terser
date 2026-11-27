@@ -17,6 +17,8 @@ pub struct Config {
     pub outline_min_lines: usize,
     pub outline_backoff_limit: i64,
     pub mcp_refetch_guard: bool,
+    pub codex_form_repair: bool,
+    pub codex_mcp_refetch_guard: bool,
     pub mcp_dedup_window_s: f64,
     pub loop_guard: bool,
     pub thrash_streak: i64,
@@ -27,6 +29,14 @@ pub struct Config {
     pub archive_large_outputs: bool,
     pub archive_threshold_bytes: usize,
     pub subagent_model_routing: bool,
+    pub form_repair: bool,
+    pub index_grep_answer: bool,
+    pub python_worker: bool,
+    pub context_fill_nudges: bool,
+    pub compact_recall: bool,
+    pub fanout_checkpoint: bool,
+    pub intent_hints: bool,
+    pub session_summary: bool,
 }
 
 impl Default for Config {
@@ -41,6 +51,8 @@ impl Default for Config {
             outline_min_lines: 250,
             outline_backoff_limit: 2,
             mcp_refetch_guard: true,
+            codex_form_repair: false,
+            codex_mcp_refetch_guard: false,
             mcp_dedup_window_s: 120.0,
             loop_guard: true,
             thrash_streak: 3,
@@ -50,7 +62,15 @@ impl Default for Config {
             enhanced_compression: true,
             archive_large_outputs: true,
             archive_threshold_bytes: 16384,
-            subagent_model_routing: true,
+            subagent_model_routing: false,
+            form_repair: true,
+            index_grep_answer: true,
+            python_worker: true,
+            context_fill_nudges: true,
+            compact_recall: true,
+            fanout_checkpoint: true,
+            intent_hints: true,
+            session_summary: true,
         }
     }
 }
@@ -90,11 +110,17 @@ pub fn state_home() -> PathBuf {
 }
 
 fn is_truthy(val: &str) -> bool {
-    matches!(val.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        val.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn is_falsy(val: &str) -> bool {
-    matches!(val.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+    matches!(
+        val.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 fn env_bool(key: &str) -> Option<bool> {
@@ -143,6 +169,12 @@ pub fn load_config() -> Config {
             if let Some(b) = map.get("mcp_refetch_guard").and_then(|v| v.as_bool()) {
                 cfg.mcp_refetch_guard = b;
             }
+            if let Some(b) = map.get("codex_form_repair").and_then(|v| v.as_bool()) {
+                cfg.codex_form_repair = b;
+            }
+            if let Some(b) = map.get("codex_mcp_refetch_guard").and_then(|v| v.as_bool()) {
+                cfg.codex_mcp_refetch_guard = b;
+            }
             if let Some(n) = map.get("mcp_dedup_window_s").and_then(|v| v.as_f64()) {
                 cfg.mcp_dedup_window_s = n;
             }
@@ -154,6 +186,30 @@ pub fn load_config() -> Config {
             }
             if let Some(b) = map.get("subagent_model_routing").and_then(|v| v.as_bool()) {
                 cfg.subagent_model_routing = b;
+            }
+            if let Some(b) = map.get("form_repair").and_then(|v| v.as_bool()) {
+                cfg.form_repair = b;
+            }
+            if let Some(b) = map.get("index_grep_answer").and_then(|v| v.as_bool()) {
+                cfg.index_grep_answer = b;
+            }
+            if let Some(b) = map.get("python_worker").and_then(|v| v.as_bool()) {
+                cfg.python_worker = b;
+            }
+            if let Some(b) = map.get("context_fill_nudges").and_then(|v| v.as_bool()) {
+                cfg.context_fill_nudges = b;
+            }
+            if let Some(b) = map.get("compact_recall").and_then(|v| v.as_bool()) {
+                cfg.compact_recall = b;
+            }
+            if let Some(b) = map.get("fanout_checkpoint").and_then(|v| v.as_bool()) {
+                cfg.fanout_checkpoint = b;
+            }
+            if let Some(b) = map.get("intent_hints").and_then(|v| v.as_bool()) {
+                cfg.intent_hints = b;
+            }
+            if let Some(b) = map.get("session_summary").and_then(|v| v.as_bool()) {
+                cfg.session_summary = b;
             }
             if let Some(n) = map.get("fail_streak").and_then(|v| v.as_i64()) {
                 cfg.fail_streak = n;
@@ -176,12 +232,19 @@ pub fn load_config() -> Config {
         }
     }
 
-    if env::var("TERSER_DISABLE").map(|v| is_truthy(&v)).unwrap_or(false)
-        || env::var("TE_SIDECALL").map(|v| is_truthy(&v)).unwrap_or(false)
+    if env::var("TERSER_DISABLE")
+        .map(|v| is_truthy(&v))
+        .unwrap_or(false)
+        || env::var("TE_SIDECALL")
+            .map(|v| is_truthy(&v))
+            .unwrap_or(false)
     {
         cfg.enabled = false;
     }
-    if env::var("TERSER_SHADOW").map(|v| is_truthy(&v)).unwrap_or(false) {
+    if env::var("TERSER_SHADOW")
+        .map(|v| is_truthy(&v))
+        .unwrap_or(false)
+    {
         cfg.shadow = true;
     }
     if let Some(b) = env_bool("TERSER_READ_CACHE") {
@@ -198,6 +261,24 @@ pub fn load_config() -> Config {
     }
     if let Some(b) = env_bool("TERSER_BASH_COMPRESS") {
         cfg.bash_compress = b;
+    }
+    if let Some(b) = env_bool("TERSER_FORM_REPAIR") {
+        cfg.form_repair = b;
+    }
+    if let Some(b) = env_bool("TERSER_GREP_ANSWER") {
+        cfg.index_grep_answer = b;
+    }
+    if let Some(b) = env_bool("TERSER_SUBAGENT_ROUTING") {
+        cfg.subagent_model_routing = b;
+    }
+    if let Some(b) = env_bool("TERSER_PYTHON_WORKER") {
+        cfg.python_worker = b;
+    }
+    if let Some(b) = env_bool("TERSER_INTENT_HINTS") {
+        cfg.intent_hints = b;
+    }
+    if let Some(b) = env_bool("TERSER_SESSION_SUMMARY") {
+        cfg.session_summary = b;
     }
     cfg
 }
@@ -233,7 +314,9 @@ fn maybe_rotate_savings(log: &Path) {
     if meta.len() <= SAVINGS_MAX_BYTES {
         return;
     }
-    let Ok(text) = fs::read_to_string(log) else { return };
+    let Ok(text) = fs::read_to_string(log) else {
+        return;
+    };
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= SAVINGS_KEEP_LINES {
         return;
@@ -257,7 +340,62 @@ fn maybe_rotate_savings(log: &Path) {
     }
 }
 
-pub fn record_savings(category: &str, raw_chars: usize, served_chars: usize, host: &str, detail: &str) {
+/// Append a funnel tier event (`served` / `retry`) to `~/.terser/funnel.jsonl` (Python parity).
+/// Tiers Python's `compute_tier_backoff` switched off for `host` because most of their short
+/// answers were retried. The file is written by Python; data older than a day is ignored.
+pub fn tier_backed_off(tier: &str, host: &str) -> bool {
+    const MAX_AGE_S: f64 = 86400.0;
+    let Ok(text) = fs::read_to_string(state_home().join("funnel-backoff.json")) else {
+        return false;
+    };
+    let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    let fresh = root
+        .get("at")
+        .and_then(Value::as_f64)
+        .map(|at| {
+            let age = now_secs() - at;
+            (0.0..MAX_AGE_S).contains(&age)
+        })
+        .unwrap_or(false);
+    fresh
+        && root
+            .get("disabled")
+            .and_then(|d| d.get(host))
+            .and_then(Value::as_array)
+            .is_some_and(|tiers| tiers.iter().any(|t| t.as_str() == Some(tier)))
+}
+
+pub fn record_funnel_event(tier: &str, event: &str, host: &str) {
+    let log = state_home().join("funnel.jsonl");
+    if let Some(parent) = log.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if fs::metadata(&log)
+        .map(|m| m.len() > 4 * 1024 * 1024)
+        .unwrap_or(false)
+    {
+        let _ = fs::rename(&log, log.with_extension("jsonl.1"));
+    }
+    let ts = (now_secs() * 10.0).round() / 10.0;
+    let tier: String = tier.chars().take(32).collect();
+    let event: String = event.chars().take(16).collect();
+    let entry = json!({"ts": ts, "host": host, "tier": tier, "ev": event});
+    if let Ok(line) = serde_json::to_string(&entry) {
+        if let Ok(mut fh) = OpenOptions::new().create(true).append(true).open(&log) {
+            let _ = writeln!(fh, "{line}");
+        }
+    }
+}
+
+pub fn record_savings(
+    category: &str,
+    raw_chars: usize,
+    served_chars: usize,
+    host: &str,
+    detail: &str,
+) {
     let saved_chars = raw_chars.saturating_sub(served_chars);
     if saved_chars == 0 {
         return;
