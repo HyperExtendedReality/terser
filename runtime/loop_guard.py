@@ -59,6 +59,15 @@ def _clean_label(text: str) -> str:
     return (cleaned[: _LABEL_MAX - 3] + "...") if len(cleaned) > _LABEL_MAX else cleaned
 
 
+def clear_session_state(session_id: str, env: dict[str, str] | None = None) -> None:
+    if not session_id:
+        return
+    try:
+        _state_path(session_id, env).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _load(session_id: str, env: dict[str, str] | None = None) -> dict[str, Any]:
     p = _state_path(session_id, env)
     try:

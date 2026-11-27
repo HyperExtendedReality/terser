@@ -490,16 +490,38 @@ def invalidate_on_edit(
     *,
     env: dict[str, str] | None = None,
 ) -> None:
-    """Reset soft_denies after an edit while keeping the prior snapshot so the next read gets a delta diff."""
+    """Reset soft_denies after an edit while keeping the prior snapshot so the next read gets a delta diff.
+
+    Propagates invalidation across parent and sibling subagent caches sharing the same base session.
+    """
     if not session_id or not file_path or not _SID_RE.match(session_id):
         return
-    store = _load_store(session_id, env)
     key = _norm_path(file_path)
-    entry = store["reads"].get(key)
-    if isinstance(entry, dict):
-        entry["soft_denies"] = 0
-        entry["outline_only"] = False
-        _save_store(session_id, store, time.time(), env)
+    now = time.time()
+
+    target_sids: list[str] = [session_id]
+    base_sid = session_id.split("--", 1)[0]
+    if base_sid and base_sid != session_id:
+        target_sids.append(base_sid)
+
+    cdir = _cache_dir(env)
+    safe_base = re.sub(r"[^0-9a-zA-Z_.-]", "_", base_sid)[:44]
+    if safe_base and cdir.is_dir():
+        try:
+            for p in cdir.glob(f"{safe_base}--*.json"):
+                stem = p.stem
+                if stem not in target_sids:
+                    target_sids.append(stem)
+        except OSError:
+            pass
+
+    for sid in target_sids:
+        store = _load_store(sid, env)
+        entry = store["reads"].get(key)
+        if isinstance(entry, dict):
+            entry["soft_denies"] = 0
+            entry["outline_only"] = False
+            _save_store(sid, store, now, env)
 
 
 def _is_mutating_or_live_mcp(name: str) -> bool:

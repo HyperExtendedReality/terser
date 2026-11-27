@@ -5,16 +5,19 @@ mod config;
 mod loop_guard;
 mod read_funnel;
 
-use crate::config::{load_config, record_savings, Config};
+use crate::config::{load_config, record_savings, safe_sid_filename, state_home, Config};
 use crate::read_funnel::FunnelOutcome;
 use serde_json::{json, Map, Value};
 use std::env;
+use std::fs;
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STDIN_MAX_BYTES: usize = 5 * 1024 * 1024;
 const EXIT_DELEGATE: i32 = 2;
+const SUBAGENT_BRIEF_AG: &str = "[Terser Subagent] Prefer `terser-index` (`order`/`route`, if available) or ranged reads (`StartLine`/`EndLine`); batch parallel reads; scope CLI output; return a concise summary with exact file paths and line spans—never dump raw files.";
+const SUBAGENT_BRIEF_CC: &str = "[Terser Subagent] Prefer `terser-index` (`order`/`route`, if available) or ranged reads (`offset`/`limit`); batch parallel reads; scope CLI output; return a concise summary with exact file paths and line spans—never dump raw files.";
 
 struct Args {
     host: Option<String>,
@@ -78,17 +81,51 @@ fn detect_host(payload: &Map<String, Value>, hint: Option<&str>) -> String {
     "claude".to_string()
 }
 
+fn sanitize_sid_part(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn session_id(payload: &Map<String, Value>, host: &str) -> String {
     let key = if host == "antigravity" {
         "conversationId"
     } else {
         "session_id"
     };
-    payload
+    let base = payload
         .get(key)
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .to_string()
+        .trim();
+    let agent = ["agent_id", "subagent_id", "agentId"]
+        .iter()
+        .find_map(|k| {
+            payload
+                .get(*k)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("");
+    if !base.is_empty() && !agent.is_empty() && agent != base {
+        let b = sanitize_sid_part(base);
+        let a = sanitize_sid_part(agent);
+        let composed = format!("{b}--{a}");
+        if composed.len() > 78 {
+            let bp: String = b.chars().take(44).collect();
+            let ap: String = a.chars().take(32).collect();
+            return format!("{bp}--{ap}");
+        }
+        return composed;
+    }
+    base.to_string()
 }
 
 fn parse_int_val(val: Option<&Value>) -> Option<i64> {
@@ -197,6 +234,56 @@ fn handle_pre_tool_use(host: &str, payload: &Map<String, Value>, cfg: &Config) -
 
         if tool_name == "run_command" {
             return DispatchResult::Delegate;
+        }
+
+        if !cfg.shadow {
+            if tool_name == "invoke_subagent" {
+                let type_name = args
+                    .get("TypeName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                if !matches!(type_name.as_str(), "browser" | "image-generator") {
+                    if let Some(prompt) = args.get("Prompt").and_then(|v| v.as_str()) {
+                        if !prompt.trim().is_empty() && !prompt.contains("[Terser Subagent]") {
+                            let updated = format!("{}\n\n{SUBAGENT_BRIEF_AG}", prompt.trim_end());
+                            return DispatchResult::Done(Some(json!({
+                                "decision": "allow",
+                                "overwrite": {"Prompt": updated},
+                            })));
+                        }
+                    }
+                }
+            } else if tool_name == "swarm" {
+                let action = args
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                if action == "add" {
+                    if let Some(brief) = args.get("brief").and_then(|v| v.as_str()) {
+                        if !brief.trim().is_empty() && !brief.contains("[Terser Subagent]") {
+                            let updated = format!("{}\n\n{SUBAGENT_BRIEF_AG}", brief.trim_end());
+                            return DispatchResult::Done(Some(json!({
+                                "decision": "allow",
+                                "overwrite": {"brief": updated},
+                            })));
+                        }
+                    }
+                }
+            } else if tool_name == "define_subagent" {
+                if let Some(sys_prompt) = args.get("SystemPrompt").and_then(|v| v.as_str()) {
+                    if !sys_prompt.trim().is_empty() && !sys_prompt.contains("[Terser Subagent]") {
+                        let updated = format!("{}\n\n{SUBAGENT_BRIEF_AG}", sys_prompt.trim_end());
+                        return DispatchResult::Done(Some(json!({
+                            "decision": "allow",
+                            "overwrite": {"SystemPrompt": updated},
+                        })));
+                    }
+                }
+            }
         }
         return DispatchResult::Done(None);
     }
@@ -368,14 +455,24 @@ fn handle_subagent_start(cfg: &Config) -> DispatchResult {
     if cfg.shadow {
         return DispatchResult::Done(None);
     }
-    let brief = "[Terser Subagent] Prefer `terser-index` (`order`/`route`) or ranged reads (`offset`/`limit`); \
-                 scope CLI output; return a concise summary with exact file paths and line spans—never dump raw files.";
     DispatchResult::Done(Some(json!({
         "hookSpecificOutput": {
             "hookEventName": "SubagentStart",
-            "additionalContext": brief,
+            "additionalContext": SUBAGENT_BRIEF_CC,
         }
     })))
+}
+
+fn handle_subagent_stop(host: &str, payload: &Map<String, Value>) -> DispatchResult {
+    let sid = session_id(payload, host);
+    if sid.contains("--") {
+        let fname = format!("{}.json", safe_sid_filename(&sid));
+        let home = state_home();
+        for dir in ["read-cache", "loop-state", "cmd-delta"] {
+            let _ = fs::remove_file(home.join(dir).join(&fname));
+        }
+    }
+    DispatchResult::Done(None)
 }
 
 fn run_exec_mode(raw_args: &[String]) -> i32 {
@@ -498,10 +595,10 @@ fn main() {
         return;
     }
 
-    // Fast-path only handles PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart
+    // Fast-path only handles PreToolUse, PostToolUse, PostToolUseFailure, SubagentStart, SubagentStop
     if !matches!(
         args.event.as_str(),
-        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "SubagentStart"
+        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "SubagentStart" | "SubagentStop"
     ) {
         std::process::exit(delegate_to_python(&args, &raw_stdin));
     }
@@ -521,6 +618,7 @@ fn main() {
         "PostToolUse" => handle_post_tool_use(&host, &payload, &cfg, false),
         "PostToolUseFailure" => handle_post_tool_use(&host, &payload, &cfg, true),
         "SubagentStart" => handle_subagent_start(&cfg),
+        "SubagentStop" => handle_subagent_stop(&host, &payload),
         _ => DispatchResult::Delegate,
     };
 

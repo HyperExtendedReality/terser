@@ -808,6 +808,175 @@ class NativeFastPathTests(unittest.TestCase):
         nudge = loop_guard.record_tool_event(sid, "run_command", {"CommandLine": "pytest"}, is_error=True, cfg=cfg, env=self.env)
         self.assertIsNone(nudge)
 
+    def test_subagent_support_across_antigravity_claude_and_codex(self) -> None:
+        # 1. Antigravity 2.0: PreToolUse injects brief into invoke_subagent, swarm add, define_subagent
+        ag_inv = unified_hook.dispatch(
+            "PreToolUse",
+            {
+                "conversationId": "ag-parent-1",
+                "toolCall": {
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "research", "Role": "Code Researcher", "Prompt": "Find auth handler."},
+                },
+            },
+            host_hint="antigravity",
+            env=self.env,
+        )
+        assert isinstance(ag_inv, dict)
+        self.assertEqual(ag_inv["decision"], "allow")
+        self.assertIn("[Terser Subagent]", ag_inv["overwrite"]["Prompt"])
+        self.assertIn("StartLine`/`EndLine", ag_inv["overwrite"]["Prompt"])
+
+        # Idempotent: already-injected prompt passes through as None
+        ag_inv_dup = unified_hook.dispatch(
+            "PreToolUse",
+            {
+                "conversationId": "ag-parent-1",
+                "toolCall": {
+                    "name": "invoke_subagent",
+                    "args": {"TypeName": "research", "Prompt": ag_inv["overwrite"]["Prompt"]},
+                },
+            },
+            host_hint="antigravity",
+            env=self.env,
+        )
+        self.assertIsNone(ag_inv_dup)
+
+        # Browser and image-generator subagents are skipped (passthrough None)
+        for skip_type in ("browser", "image-generator"):
+            res_skip = unified_hook.dispatch(
+                "PreToolUse",
+                {
+                    "conversationId": "ag-parent-1",
+                    "toolCall": {"name": "invoke_subagent", "args": {"TypeName": skip_type, "Prompt": "Open page"}},
+                },
+                host_hint="antigravity",
+                env=self.env,
+            )
+            self.assertIsNone(res_skip)
+
+        # Swarm add injects into brief; swarm status passes through
+        ag_swarm = unified_hook.dispatch(
+            "PreToolUse",
+            {
+                "conversationId": "ag-parent-1",
+                "toolCall": {"name": "swarm", "args": {"action": "add", "name": "worker", "brief": "Audit tests"}},
+            },
+            host_hint="antigravity",
+            env=self.env,
+        )
+        assert isinstance(ag_swarm, dict)
+        self.assertIn("[Terser Subagent]", ag_swarm["overwrite"]["brief"])
+        self.assertIsNone(
+            unified_hook.dispatch(
+                "PreToolUse",
+                {"conversationId": "ag-parent-1", "toolCall": {"name": "swarm", "args": {"action": "status"}}},
+                host_hint="antigravity",
+                env=self.env,
+            )
+        )
+
+        # 2. Claude & Codex: agent_id isolates read-cache & loop-guard per subagent, while edits propagate
+        sample = self.tmp / "shared_mod.py"
+        for host in ("claude", "codex"):
+            sample.write_text(f"value = '{host}_1'\n", encoding="utf-8")
+            sid = f"{host}-parent-42"
+            # Parent reads sample -> allowed
+            self.assertIsNone(
+                unified_hook.dispatch(
+                    "PreToolUse",
+                    {"session_id": sid, "tool_name": "Read", "tool_input": {"file_path": str(sample)}},
+                    host_hint=host,
+                    env=self.env,
+                )
+            )
+            # Parent re-reads sample -> soft-denied
+            p_dup = unified_hook.dispatch(
+                "PreToolUse",
+                {"session_id": sid, "tool_name": "Read", "tool_input": {"file_path": str(sample)}},
+                host_hint=host,
+                env=self.env,
+            )
+            assert isinstance(p_dup, dict)
+            self.assertEqual((p_dup.get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
+
+            # Subagent A has a fresh context -> first read of sample MUST pass through!
+            self.assertIsNone(
+                unified_hook.dispatch(
+                    "PreToolUse",
+                    {"session_id": sid, "agent_id": "sub-a1", "tool_name": "Read", "tool_input": {"file_path": str(sample)}},
+                    host_hint=host,
+                    env=self.env,
+                )
+            )
+            # Subagent A's second unchanged read -> soft-denied within its own scope!
+            sub_dup = unified_hook.dispatch(
+                "PreToolUse",
+                {"session_id": sid, "agent_id": "sub-a1", "tool_name": "Read", "tool_input": {"file_path": str(sample)}},
+                host_hint=host,
+                env=self.env,
+            )
+            assert isinstance(sub_dup, dict)
+            self.assertEqual((sub_dup.get("hookSpecificOutput") or {}).get("permissionDecision"), "deny")
+
+            # Subagent A edits sample -> invalidates parent's soft_denies too!
+            unified_hook.dispatch(
+                "PostToolUse",
+                {"session_id": sid, "agent_id": "sub-a1", "tool_name": "Edit", "tool_input": {"file_path": str(sample)}},
+                host_hint=host,
+                env=self.env,
+            )
+            sample.write_text(f"value = '{host}_2'\n", encoding="utf-8")
+            p_after = unified_hook.dispatch(
+                "PreToolUse",
+                {"session_id": sid, "tool_name": "Read", "tool_input": {"file_path": str(sample)}},
+                host_hint=host,
+                env=self.env,
+            )
+            assert isinstance(p_after, dict)
+            self.assertIn(f"+value = '{host}_2'", (p_after.get("hookSpecificOutput") or {}).get("permissionDecisionReason") or "")
+
+            # SubagentStop removes subagent ephemeral cache without deleting parent cache
+            unified_hook.dispatch(
+                "SubagentStop",
+                {"session_id": sid, "agent_id": "sub-a1"},
+                host_hint=host,
+                env=self.env,
+            )
+            rc_dir = Path(self.env["TERSER_HOME"]) / "read-cache"
+            self.assertFalse((rc_dir / f"{sid}--sub-a1.json").exists())
+            self.assertTrue((rc_dir / f"{sid}.json").exists())
+
+        # 3. Native fast-path parity for AGY invoke_subagent & Claude agent_id isolation
+        if self.fast_bin.is_file():
+            nat_ag = self._run_fast(
+                "PreToolUse",
+                {
+                    "conversationId": "ag-nat-1",
+                    "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "self", "Prompt": "Inspect API"}},
+                },
+                host="antigravity",
+                with_py=False,
+            )
+            self.assertEqual(nat_ag.returncode, 0)
+            nat_doc = json.loads(nat_ag.stdout)
+            self.assertEqual(nat_doc["decision"], "allow")
+            self.assertIn("[Terser Subagent]", nat_doc["overwrite"]["Prompt"])
+
+            # Native Claude agent_id isolation + SubagentStop cleanup
+            f_nat = self.tmp / "nat_shared.py"
+            f_nat.write_text("a = 1\n", encoding="utf-8")
+            self._run_fast("PreToolUse", {"session_id": "nat-p1", "tool_name": "Read", "tool_input": {"file_path": str(f_nat)}}, host="claude", with_py=False)
+            sub_first = self._run_fast(
+                "PreToolUse",
+                {"session_id": "nat-p1", "agent_id": "agent-99", "tool_name": "Read", "tool_input": {"file_path": str(f_nat)}},
+                host="claude",
+                with_py=False,
+            )
+            self.assertEqual(sub_first.stdout.strip(), "")
+            self._run_fast("SubagentStop", {"session_id": "nat-p1", "agent_id": "agent-99"}, host="claude", with_py=False)
+            self.assertFalse((Path(self.env["TERSER_HOME"]) / "read-cache" / "nat-p1--agent-99.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

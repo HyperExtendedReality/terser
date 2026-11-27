@@ -44,6 +44,15 @@ def _store_path(session_id: str, env: dict[str, str] | None = None) -> Path:
     return state_home(env) / "cmd-delta" / f"{safe}.json"
 
 
+def clear_session_state(session_id: str, env: dict[str, str] | None = None) -> None:
+    if not session_id:
+        return
+    try:
+        _store_path(session_id, env).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _load(session_id: str, env: dict[str, str] | None = None) -> dict[str, Any]:
     p = _store_path(session_id, env)
     try:

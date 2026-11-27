@@ -51,7 +51,7 @@ def _codex_home() -> Path:
     return Path(os.path.expanduser(raw)) if raw else (Path.home() / ".codex")
 
 
-_HOT_EVENTS = frozenset({"PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart"})
+_HOT_EVENTS = frozenset({"PreToolUse", "PostToolUse", "PostToolUseFailure", "SubagentStart", "SubagentStop"})
 _RELEASE_BASE = "https://github.com/HyperExtendedReality/terser/releases/latest/download"
 
 
@@ -163,7 +163,7 @@ def _build_antigravity_hooks(plugin_dir: Path, python_exe: str) -> dict[str, Any
             "SessionStart": [{"type": "command", "command": cmd("SessionStart"), "timeout": 10}],
             "PreInvocation": [{"type": "command", "command": cmd("PreInvocation"), "timeout": 10}],
             "PreToolUse": [{
-                "matcher": "run_command|read_file|view_file|call_mcp_tool|mcp_.*",
+                "matcher": "run_command|read_file|view_file|call_mcp_tool|mcp_.*|invoke_subagent|swarm|define_subagent",
                 "hooks": [{"type": "command", "command": cmd("PreToolUse"), "timeout": 10}],
             }],
             "PostToolUse": [{
@@ -317,6 +317,7 @@ def install_codex(*, dry_run: bool = False) -> Path:
     events = [
         ("SessionStart", 15),
         ("SubagentStart", 10),
+        ("SubagentStop", 5),
         ("UserPromptSubmit", 10),
         ("PreToolUse", 10),
         ("PostToolUse", 10),

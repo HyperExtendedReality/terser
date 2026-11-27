@@ -24,6 +24,18 @@
         ]
       }
     ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SubagentStop",
+            "commandWindows": "python -X --% -u -X utf8 -c e=__import__('os').environ;r=e.get('PLUGIN_ROOT')or(e['CLAUDE_PLUGIN_ROOT']);s=__import__('sys');s.argv[:]=[r+'/runtime/unified_hook.py','--host','codex','--event','SubagentStop'];__import__('runpy').run_path(s.argv[0],run_name='__main__')",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [

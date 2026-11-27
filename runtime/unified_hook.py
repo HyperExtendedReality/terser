@@ -90,10 +90,40 @@ def _detect_host(payload: dict[str, Any], env: dict[str, str], hint: str | None)
     return "claude"
 
 
+_SUBAGENT_BRIEF_AG = (
+    "[Terser Subagent] Prefer `terser-index` (`order`/`route`, if available) or ranged reads (`StartLine`/`EndLine`); "
+    "batch parallel reads; scope CLI output; return a concise summary with exact file paths and line spans—never dump raw files."
+)
+_SUBAGENT_BRIEF_CC = (
+    "[Terser Subagent] Prefer `terser-index` (`order`/`route`, if available) or ranged reads (`offset`/`limit`); "
+    "batch parallel reads; scope CLI output; return a concise summary with exact file paths and line spans—never dump raw files."
+)
+_SKIP_AG_SUBAGENT_TYPES = frozenset({"browser", "image-generator"})
+
+
+def _sanitize_sid_part(raw: str) -> str:
+    return "".join(c if (c.isascii() and (c.isalnum() or c in "_.-")) else "_" for c in raw)
+
+
 def _session_id(payload: dict[str, Any], host: str) -> str:
     if host == "antigravity":
-        return str(payload.get("conversationId") or "")
-    return str(payload.get("session_id") or "")
+        base = str(payload.get("conversationId") or "").strip()
+    else:
+        base = str(payload.get("session_id") or "").strip()
+    agent = ""
+    for key in ("agent_id", "subagent_id", "agentId"):
+        v = payload.get(key)
+        if isinstance(v, str) and v.strip():
+            agent = v.strip()
+            break
+    if base and agent and agent != base:
+        b = _sanitize_sid_part(base)
+        a = _sanitize_sid_part(agent)
+        composed = f"{b}--{a}"
+        if len(composed) > 78:
+            composed = f"{b[:44]}--{a[:32]}"
+        return composed
+    return base
 
 
 def _workspace(payload: dict[str, Any], env: dict[str, str]) -> str:
@@ -598,6 +628,37 @@ def handle_pre_tool_use(host: str, payload: dict[str, Any], cfg: dict[str, Any],
                 return {"decision": "ask", "overwrite": {"CommandLine": repaired_cmd}}
             return None
 
+        # 4. Subagent / Swarm spawn -> inject compact Terser Subagent economy brief (Antigravity 2.0)
+        if not cfg.get("shadow"):
+            if tool_name == "invoke_subagent":
+                type_name = str(args.get("TypeName") or "").strip().lower()
+                prompt = args.get("Prompt")
+                if (
+                    type_name not in _SKIP_AG_SUBAGENT_TYPES
+                    and isinstance(prompt, str)
+                    and prompt.strip()
+                    and "[Terser Subagent]" not in prompt
+                ):
+                    return {"decision": "allow", "overwrite": {"Prompt": f"{prompt.rstrip()}\n\n{_SUBAGENT_BRIEF_AG}"}}
+            elif tool_name == "swarm":
+                action = str(args.get("action") or "").strip().lower()
+                brief = args.get("brief")
+                if (
+                    action == "add"
+                    and isinstance(brief, str)
+                    and brief.strip()
+                    and "[Terser Subagent]" not in brief
+                ):
+                    return {"decision": "allow", "overwrite": {"brief": f"{brief.rstrip()}\n\n{_SUBAGENT_BRIEF_AG}"}}
+            elif tool_name == "define_subagent":
+                sys_prompt = args.get("SystemPrompt")
+                if (
+                    isinstance(sys_prompt, str)
+                    and sys_prompt.strip()
+                    and "[Terser Subagent]" not in sys_prompt
+                ):
+                    return {"decision": "allow", "overwrite": {"SystemPrompt": f"{sys_prompt.rstrip()}\n\n{_SUBAGENT_BRIEF_AG}"}}
+
         return None
 
     # --- Claude Code & Codex PreToolUse ---
@@ -866,16 +927,22 @@ def handle_subagent_start(host: str, payload: dict[str, Any], cfg: dict[str, Any
     """Inject a compact (~45-token) economy brief into spawned subagents (Claude & Codex)."""
     if cfg.get("shadow"):
         return {}
-    brief = (
-        "[Terser Subagent] Prefer `terser-index` (`order`/`route`) or ranged reads (`offset`/`limit`); "
-        "scope CLI output; return a concise summary with exact file paths and line spans—never dump raw files."
-    )
     return {
         "hookSpecificOutput": {
             "hookEventName": "SubagentStart",
-            "additionalContext": brief,
+            "additionalContext": _SUBAGENT_BRIEF_CC,
         }
     }
+
+
+def handle_subagent_stop(host: str, payload: dict[str, Any], cfg: dict[str, Any], env: dict[str, str]) -> dict[str, Any]:
+    """Clean up ephemeral per-subagent state files without touching the parent session."""
+    sid = _session_id(payload, host)
+    if sid and "--" in sid:
+        read_funnel.clear_session_cache(sid, env)
+        loop_guard.clear_session_state(sid, env)
+        cmd_delta.clear_session_state(sid, env)
+    return {}
 
 
 def handle_stop(host: str, payload: dict[str, Any], cfg: dict[str, Any], env: dict[str, str]) -> dict[str, Any]:
@@ -920,6 +987,8 @@ def dispatch(
         return handle_pre_compact(host, payload, cfg, env)
     if low == "subagentstart":
         return handle_subagent_start(host, payload, cfg, env)
+    if low == "subagentstop":
+        return handle_subagent_stop(host, payload, cfg, env)
     if low in ("stop", "sessionend", "stopfailure"):
         return handle_stop(host, payload, cfg, env)
     return {}
