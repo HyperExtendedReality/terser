@@ -967,7 +967,7 @@ def handle_post_tool_use(
             else:
                 read_funnel.invalidate_on_edit(sid, fp, env=env)
             if cfg.get("index_auto_reindex", True):
-                index_bridge.spawn_reindex_file(fp)
+                index_bridge.spawn_reindex_file(fp, env=env)
             if ws_cl and not cfg.get("shadow"):
                 from runtime import context_sandbox
 
@@ -990,13 +990,10 @@ def handle_post_tool_use(
 
         stdout = tool_resp.get("stdout")
         if isinstance(stdout, str) and len(stdout) > 300:
-            comp = stdout
-            stats = {"raw_chars": len(stdout), "served_chars": len(stdout)}
-            if len(stdout) > 1500:
-                comp, stats = output_compressor.compress_output(
-                    stdout, command=cmd, enhanced=enhanced,
-                    host=host, workspace=ws_post, env=env,
-                )
+            comp, stats = output_compressor.compress_output(
+                stdout, command=cmd, enhanced=enhanced,
+                host=host, workspace=ws_post, env=env,
+            )
             if cfg.get("cmd_delta", True):
                 comp, delta_used = cmd_delta.apply_command_delta(
                     sid, cmd, comp, returncode=1 if is_err else 0, host=host, env=env,
@@ -1031,11 +1028,22 @@ def handle_post_tool_use(
         if "terser-index" in tool_name.lower() or "terser_index" in tool_name.lower():
             _seed_reads_from_index_output(sid, _workspace(payload, env), raw_text, env)
         threshold = int(cfg.get("archive_threshold_bytes", 16384))
+        ws_mcp = _workspace(payload, env)
         if cfg.get("archive_large_outputs", True) and len(raw_text) > threshold:
             comp, stats = output_compressor.compress_output(
                 raw_text, command=tool_name, max_chars=threshold // 2,
                 enhanced=bool(cfg.get("enhanced_compression", True)),
-                host=host, workspace=_workspace(payload, env), env=env,
+                host=host, workspace=ws_mcp, env=env,
+            )
+            if stats["served_chars"] < int(stats["raw_chars"] * 0.85):
+                hso["hookEventName"] = "PostToolUse"
+                hso["updatedMCPToolOutput"] = comp
+        elif cfg.get("enhanced_compression", True) and len(raw_text) > 1500:
+            # Strictly lossless compaction for medium MCP payloads (pretty JSON, uniform arrays, tables, HTML/MD)
+            comp, stats = output_compressor.compress_output(
+                raw_text, command=tool_name,
+                enhanced=True, lossless_only=True,
+                host=host, workspace=ws_mcp, env=env,
             )
             if stats["served_chars"] < int(stats["raw_chars"] * 0.85):
                 hso["hookEventName"] = "PostToolUse"

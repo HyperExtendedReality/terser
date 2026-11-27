@@ -139,18 +139,90 @@ fn parse_int_val(val: Option<&Value>) -> Option<i64> {
     }
 }
 
+fn find_python_bin() -> Option<(String, Vec<&'static str>)> {
+    if let Ok(explicit) = env::var("TERSER_PYTHON") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() && std::path::Path::new(trimmed).is_file() {
+            return Some((trimmed.to_string(), vec![]));
+        }
+    }
+    let path_var = env::var_os("PATH").unwrap_or_default();
+    #[cfg(windows)]
+    {
+        for name in ["pythonw.exe", "python.exe"] {
+            for dir in env::split_paths(&path_var) {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    let s = cand.to_string_lossy();
+                    if !s.to_ascii_lowercase().contains("windowsapps") {
+                        return Some((s.into_owned(), vec![]));
+                    }
+                }
+            }
+        }
+        for dir in env::split_paths(&path_var) {
+            let cand = dir.join("py.exe");
+            if cand.is_file() {
+                return Some((cand.to_string_lossy().into_owned(), vec!["-3"]));
+            }
+        }
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        for abs in ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"] {
+            if std::path::Path::new(abs).is_file() {
+                return Some((abs.to_string(), vec![]));
+            }
+        }
+        for name in ["python3", "python"] {
+            for dir in env::split_paths(&path_var) {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return Some((cand.to_string_lossy().into_owned(), vec![]));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn resolve_hook_script(explicit: Option<&str>) -> Option<String> {
+    if let Some(s) = explicit {
+        if !s.trim().is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    let exe = env::current_exe().ok()?;
+    let cand = exe.parent()?.parent()?.join("runtime").join("unified_hook.py");
+    if cand.is_file() {
+        return Some(cand.to_string_lossy().into_owned());
+    }
+    None
+}
+
 fn delegate_to_python(args: &Args, raw_stdin: &[u8]) -> i32 {
-    let (Some(py), Some(script)) = (&args.python, &args.script) else {
+    let Some(script) = resolve_hook_script(args.script.as_deref()) else {
         return EXIT_DELEGATE;
     };
-    let mut cmd = Command::new(py);
+    let (py, prefix_args) = if let Some(ref p) = args.python {
+        (p.clone(), vec![])
+    } else if let Some(found) = find_python_bin() {
+        found
+    } else {
+        return EXIT_DELEGATE;
+    };
+    let mut cmd = Command::new(&py);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.args(["-E", "-s", "-X", "utf8", script]);
+    for pa in prefix_args {
+        cmd.arg(pa);
+    }
+    cmd.args(["-E", "-s", "-X", "utf8", &script]);
     if let Some(ref h) = args.host {
         cmd.args(["--host", h]);
     }
@@ -589,16 +661,18 @@ fn handle_post_tool_use(
                     let mut updated_obj = obj.clone();
                     let mut changed = false;
                     if stdout_s.len() > 300 {
-                        let mut comp = if stdout_s.len() > 1500 {
-                            compress::compress_output_with_ws(stdout_s, cmd, ws_opt)
-                        } else {
-                            stdout_s.to_string()
-                        };
+                        let mut comp = compress::compress_output_with_ws(stdout_s, cmd, ws_opt);
+                        let comp_len_before_delta = comp.len();
+                        let mut delta_used = false;
                         if is_delta_eligible_cmd(cmd) {
-                            comp = apply_native_cmd_delta(&sid, cmd, &comp, rc, host);
+                            let (delta_out, applied) = apply_native_cmd_delta(&sid, cmd, &comp, rc, host);
+                            comp = delta_out;
+                            delta_used = applied;
                         }
                         if comp.len() < (stdout_s.len() * 85) / 100 {
-                            record_savings("output_compress", stdout_s.len(), comp.len(), host, &cmd.chars().take(60).collect::<String>());
+                            if !delta_used && comp_len_before_delta < stdout_s.len() {
+                                record_savings("output_compress", stdout_s.len(), comp_len_before_delta, host, &cmd.chars().take(60).collect::<String>());
+                            }
                             updated_obj.insert("stdout".into(), Value::String(comp));
                             changed = true;
                         }
@@ -631,7 +705,9 @@ fn handle_post_tool_use(
             let approx_len = tool_resp
                 .map(|v| v.as_str().map(str::len).unwrap_or_else(|| v.to_string().len()))
                 .unwrap_or(0);
-            if cfg.archive_large_outputs && approx_len > cfg.archive_threshold_bytes {
+            if (cfg.archive_large_outputs && approx_len > cfg.archive_threshold_bytes)
+                || (cfg.enhanced_compression && approx_len > 1500)
+            {
                 return DispatchResult::Delegate;
             }
             if approx_len > 0 && !is_failure_event {
@@ -921,9 +997,9 @@ fn compact_line_diff(prev_text: &str, cur_text: &str) -> Option<String> {
     Some(diff_lines.join("\n"))
 }
 
-fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host: &str) -> String {
+fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host: &str) -> (String, bool) {
     if sid.is_empty() || output.len() < 300 {
-        return output.to_string();
+        return (output.to_string(), false);
     }
     let norm_cmd: String = cmd_str.split_whitespace().collect::<Vec<_>>().join(" ");
     let key = sha256_str(&norm_cmd)[..20].to_string();
@@ -941,6 +1017,7 @@ fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host:
         .unwrap_or_default();
 
     let mut result = output.to_string();
+    let mut applied = false;
     if let Some(prev) = store.get(&key).and_then(|v| v.as_object()) {
         let prev_ts = prev.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let prev_rc = prev.get("rc").and_then(|v| v.as_i64()).unwrap_or(-999) as i32;
@@ -971,6 +1048,7 @@ fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host:
                     "[Terser Delta] Identical output to previous `{short_cmd}` run ({elapsed}s ago, exit={rc}, {line_count} lines).{tail_part}"
                 );
                 record_savings("cmd_delta", output.len(), result.len(), host, &short_cmd);
+                applied = true;
             } else if let Some(prev_text) = prev.get("text").and_then(|v| v.as_str()) {
                 if let Some(diff_body) = compact_line_diff(prev_text, output) {
                     let mut candidate = format!(
@@ -983,6 +1061,7 @@ fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host:
                     if candidate.len() < (output.len() * 75) / 100 {
                         record_savings("cmd_delta", output.len(), candidate.len(), host, &short_cmd);
                         result = candidate;
+                        applied = true;
                     }
                 }
             }
@@ -1015,7 +1094,7 @@ fn apply_native_cmd_delta(sid: &str, cmd_str: &str, output: &str, rc: i32, host:
         store.retain(|k, _| keep.contains(k));
     }
     atomic_write_json(&path, &Value::Object(store));
-    result
+    (result, applied)
 }
 
 fn is_delta_eligible_cmd(cmd: &str) -> bool {
@@ -1073,9 +1152,9 @@ fn redact_basic_secrets(text: &str) -> String {
     out
 }
 
-fn archive_raw_sidecar(raw: &str) -> Option<String> {
+fn archive_raw_sidecar(raw: &str) -> Option<(String, String)> {
     let safe = redact_basic_secrets(raw);
-    let id = &sha256_str(&safe)[..12];
+    let id = sha256_str(&safe)[..12].to_string();
     let dir = state_home().join("raw-archives");
     fs::create_dir_all(&dir).ok()?;
     // Prune archives older than 7 days or beyond 50 files
@@ -1112,7 +1191,7 @@ fn archive_raw_sidecar(raw: &str) -> Option<String> {
     if !path.is_file() {
         fs::write(&path, safe.as_bytes()).ok()?;
     }
-    Some(path.to_string_lossy().into_owned())
+    Some((id, path.to_string_lossy().into_owned()))
 }
 
 fn run_exec_mode(raw_args: &[String]) -> i32 {
@@ -1185,16 +1264,21 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
                 stdout_str.to_string()
             };
             if served.len() > 16384 {
-                let raw_path = archive_raw_sidecar(&stdout_str);
+                let raw_arch = archive_raw_sidecar(&stdout_str);
                 served = compress::error_pinned_window(&served, 16384);
-                if let Some(rp) = raw_path {
-                    served.push_str(&format!("\n[Terser] Full raw output saved: {rp}"));
+                if let Some((aid, _rp)) = raw_arch {
+                    served.push_str(&format!(
+                        "\n[Terser] Full output archived (`terse query {aid} \"<keywords>\"` or `terse expand {aid} 1 100`)."
+                    ));
                 }
             }
+            let mut delta_used = false;
             if !sid.is_empty() {
-                served = apply_native_cmd_delta(&sid, &cmd_str, &served, code, &host);
+                let (delta_out, applied) = apply_native_cmd_delta(&sid, &cmd_str, &served, code, &host);
+                served = delta_out;
+                delta_used = applied;
             }
-            if served.len() < output.stdout.len() {
+            if !delta_used && served.len() < output.stdout.len() {
                 record_savings("bash_compress", output.stdout.len(), served.len(), &host, prog);
             }
             let _ = io::stdout().write_all(served.as_bytes());
@@ -1236,14 +1320,17 @@ fn run_exec_mode(raw_args: &[String]) -> i32 {
             compressed = stdout_str.to_string();
         }
         if compressed.len() > 12000 {
-            let raw_path = archive_raw_sidecar(&stdout_str);
+            let raw_arch = archive_raw_sidecar(&stdout_str);
             compressed = compress::error_pinned_window(&compressed, 12000);
-            if let Some(rp) = raw_path {
-                compressed.push_str(&format!("\n[Terser] Full raw output saved: {rp}"));
+            if let Some((aid, _rp)) = raw_arch {
+                compressed.push_str(&format!(
+                    "\n[Terser] Full output archived (`terse query {aid} \"<keywords>\"` or `terse expand {aid} 1 100`)."
+                ));
             }
         }
         if !sid.is_empty() {
-            compressed = apply_native_cmd_delta(&sid, &cmd_str, &compressed, 0, &host);
+            let (delta_out, _applied) = apply_native_cmd_delta(&sid, &cmd_str, &compressed, 0, &host);
+            compressed = delta_out;
         }
         let _ = io::stdout().write_all(compressed.as_bytes());
         if !compressed.ends_with('\n') {

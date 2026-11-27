@@ -23,6 +23,7 @@ pub struct Config {
     pub fail_streak: i64,
     pub nudge_cooldown_s: f64,
     pub bash_compress: bool,
+    pub enhanced_compression: bool,
     pub archive_large_outputs: bool,
     pub archive_threshold_bytes: usize,
     pub subagent_model_routing: bool,
@@ -46,6 +47,7 @@ impl Default for Config {
             fail_streak: 3,
             nudge_cooldown_s: 45.0,
             bash_compress: true,
+            enhanced_compression: true,
             archive_large_outputs: true,
             archive_threshold_bytes: 16384,
             subagent_model_routing: true,
@@ -161,6 +163,9 @@ pub fn load_config() -> Config {
             }
             if let Some(b) = map.get("bash_compress").and_then(|v| v.as_bool()) {
                 cfg.bash_compress = b;
+            }
+            if let Some(b) = map.get("enhanced_compression").and_then(|v| v.as_bool()) {
+                cfg.enhanced_compression = b;
             }
             if let Some(b) = map.get("archive_large_outputs").and_then(|v| v.as_bool()) {
                 cfg.archive_large_outputs = b;

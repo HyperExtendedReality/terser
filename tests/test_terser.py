@@ -1747,6 +1747,167 @@ class LosslessParityAndCoordinationTests(unittest.TestCase):
         self.assertEqual([s["name"] for s in syms], ["work"])
         self.assertTrue({"os", "pathlib", "Path", "json"}.issubset(imps))
 
+    def test_zero_loss_round4_upgrades(self) -> None:
+        from runtime import index_mcp
+
+        cfg = config.load_config(self.env)
+
+        # 1. Medium MCP response (1.5 KB-16 KB) gets strictly lossless compression (zero items dropped)
+        med_items = [
+            {"id": i, "state": "open", "repo": "terser", "title": f"Issue number {i}"}
+            for i in range(60)
+        ]
+        raw_mcp = json.dumps({"items": med_items}, indent=2)
+        self.assertGreater(len(raw_mcp), 1500)
+        self.assertLess(len(raw_mcp), 16384)
+        mcp_res = unified_hook.handle_post_tool_use(
+            "claude",
+            {
+                "session_id": "s-med-mcp",
+                "tool_name": "mcp__github__list_issues",
+                "tool_input": {"repo": "terser"},
+                "tool_response": raw_mcp,
+            },
+            cfg,
+            self.env,
+        )
+        comp_mcp = (mcp_res.get("hookSpecificOutput") or {}).get("updatedMCPToolOutput") or ""
+        self.assertTrue(comp_mcp)
+        self.assertLess(len(comp_mcp), len(raw_mcp) * 0.70)
+        parsed_mcp = json.loads(comp_mcp)
+        self.assertEqual(parsed_mcp["items"]["_format"], "columnar")
+        self.assertEqual(len(parsed_mcp["items"]["rows"]), 60)  # 100% lossless, zero sampling
+
+        # 2. Mixed NDJSON inside server logs is wired into output_compressor.compress_output()
+        mixed_log = (
+            "=== Server startup complete ===\n"
+            + "\n".join(
+                json.dumps({"level": "info", "service": "api-gw", "region": "us-east-1", "req_id": i, "ms": 10 + i})
+                for i in range(25)
+            )
+            + "\n=== Shutdown complete ===\n"
+        )
+        comp_mixed, _ = output_compressor.compress_output(mixed_log, command="node server.js", env=self.env)
+        self.assertIn("=== Server startup complete ===", comp_mixed)
+        self.assertIn('"_format":"columnar"', comp_mixed)
+        self.assertLess(len(comp_mixed), len(mixed_log) * 0.75)
+
+        # 3. Plain-text format_mcp_response for remaining terser-index actions
+        self.assertEqual(
+            index_mcp.format_mcp_response("search_sandbox", {"archive_id": "abc123", "result": "--- L1-L5 ---\nhello"}),
+            "--- L1-L5 ---\nhello",
+        )
+        exp_txt = index_mcp.format_mcp_response("expand_sandbox", {"archive_id": "abc123", "content": "L1: alpha\nL2: beta"})
+        self.assertNotIn("\\n", exp_txt)
+        self.assertIn("L1: alpha", exp_txt)
+        out_txt = index_mcp.format_mcp_response(
+            "get_repo_outline",
+            {"repo": "demo", "files": 2, "symbols": 4, "outline": ["a.py: foo, bar"]},
+        )
+        self.assertIn("a.py: foo, bar", out_txt)
+        self.assertFalse(out_txt.startswith("{"))
+        repos_txt = index_mcp.format_mcp_response(
+            "list_repos",
+            {"repos": [{"repo": "demo", "files": 2, "symbols": 4, "source_root": "/tmp/demo"}]},
+        )
+        self.assertIn("demo (2 files, 4 symbols)", repos_txt)
+        menu_txt = index_mcp.format_mcp_response("menu", {"actions": {"list_repos": {"args": "{}", "desc": "List repos"}}})
+        self.assertIn("list_repos {}", menu_txt)
+        exec_txt = index_mcp.format_mcp_response(
+            "execute_filtered",
+            {"returncode": 0, "filtered": True, "raw_bytes": 9000, "archive_id": "deadbeef1234", "output": "line1\nline2"},
+        )
+        self.assertIn("line1\nline2", exec_txt)
+        self.assertNotIn("\\n", exec_txt)
+
+        # 4. Claude/Codex PostToolUse Bash stdout threshold lowered to >300 chars
+        med_table = "\n".join(
+            [f"CONTAINER_{i}        nginx:latest          Up 2 hours          0.0.0.0:808{i}->80/tcp" for i in range(8)]
+        )
+        self.assertGreater(len(med_table), 300)
+        self.assertLess(len(med_table), 1500)
+        bash_res = unified_hook.handle_post_tool_use(
+            "claude",
+            {
+                "session_id": "s-med-bash",
+                "tool_name": "Bash",
+                "tool_input": {"command": "docker ps"},
+                "tool_response": {"stdout": med_table, "stderr": ""},
+            },
+            cfg,
+            self.env,
+        )
+        upd_stdout = ((bash_res.get("hookSpecificOutput") or {}).get("updatedToolOutput") or {}).get("stdout") or ""
+        self.assertTrue(upd_stdout)
+        self.assertIn("\t", upd_stdout)
+        self.assertLess(len(upd_stdout), len(med_table) * 0.85)
+
+        # 5. compact_file_list applied to shell file-listing commands (git ls-files)
+        ls_raw = "\n".join(f"src/components/widgets/widget_{i}.tsx" for i in range(12))
+        ls_comp, _ = output_compressor.compress_output(ls_raw, command="git ls-files", env=self.env)
+        self.assertIn("src/components/widgets/: ", ls_comp)
+        self.assertLess(len(ls_comp), len(ls_raw) * 0.70)
+
+        # 6. seed_after_edit shifts cached intervals on line-adding edits (exact line alignment)
+        work_dir = Path(self.env["TERSER_HOME"]) / "round4_work"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        shift_file = work_dir / "shift_demo.py"
+        orig_lines = [f"line_{i} = {i}" for i in range(1, 101)]
+        shift_file.write_text("\n".join(orig_lines) + "\n", encoding="utf-8")
+        self.assertIsNone(read_funnel.check_read("s-shift", str(shift_file), start_line=1, end_line=30, cfg=cfg, env=self.env))
+        self.assertIsNone(read_funnel.check_read("s-shift", str(shift_file), start_line=60, end_line=80, cfg=cfg, env=self.env))
+        # Insert 3 extra lines at line 10 (inside [1, 30]) -> [1, 30] becomes [1, 33], [60, 80] becomes [63, 83]
+        old_s = "line_10 = 10"
+        new_s = "line_10 = 10\nextra_1 = 1\nextra_2 = 2\nextra_3 = 3"
+        shift_file.write_text(shift_file.read_text(encoding="utf-8").replace(old_s, new_s, 1), encoding="utf-8")
+        read_funnel.seed_after_edit("s-shift", str(shift_file), old_text=old_s, new_text=new_s, env=self.env)
+        # Shifted second interval [63, 83] must hit Tier 0 unchanged!
+        hit = read_funnel.check_read("s-shift", str(shift_file), start_line=63, end_line=83, cfg=cfg, env=self.env)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["action"], "deny")
+        self.assertIn("unchanged", hit["reason"])
+        # Unread gap [35, 55] must still be allowed!
+        self.assertIsNone(read_funnel.check_read("s-shift", str(shift_file), start_line=35, end_line=55, cfg=cfg, env=self.env))
+
+        # 7. Tier 1 delta-diff updates mtime_ns and size so next unchanged re-read hits stat fastpath
+        t1_file = work_dir / "tier1_stat.py"
+        t1_file.write_text("\n".join(f"x_{i} = {i}" for i in range(60)) + "\n", encoding="utf-8")
+        self.assertIsNone(read_funnel.check_read("s-t1stat", str(t1_file), cfg=cfg, env=self.env))
+        t1_file.write_text(t1_file.read_text(encoding="utf-8").replace("x_5 = 5", "x_5 = 555", 1), encoding="utf-8")
+        t1_res = read_funnel.check_read("s-t1stat", str(t1_file), cfg=cfg, env=self.env)
+        self.assertIsNotNone(t1_res)
+        self.assertIn("Exact unified diff", t1_res["reason"])
+        store = read_funnel._load_store("s-t1stat", self.env)
+        entry = store["reads"][read_funnel._norm_path(str(t1_file))]
+        st_now = t1_file.stat()
+        self.assertEqual(entry.get("mtime_ns"), st_now.st_mtime_ns)
+        self.assertEqual(entry.get("size"), st_now.st_size)
+
+        # 8. Optional repo auto-resolution in index_mcp (sole indexed repo)
+        idx_repo = work_dir / "auto_repo"
+        idx_repo.mkdir()
+        (idx_repo / "calc.py").write_text("def multiply_values(a, b):\n    return a * b\n", encoding="utf-8")
+        idx_env = dict(self.env, TERSER_INDEX_PATH=str(work_dir / "auto-idx"))
+        index_mcp.index_folder(str(idx_repo), env=idx_env)
+        auto_res = index_mcp.dispatch_action("search_symbols", {"query": "multiply_values"}, env=idx_env)
+        self.assertEqual(len(auto_res.get("matches") or []), 1)
+        self.assertEqual(auto_res["matches"][0]["name"], "multiply_values")
+
+        # 9. context_sandbox transparently lazy-indexes Rust raw-archives/<id>.txt
+        raw_dir = Path(self.env["TERSER_HOME"]) / "raw-archives"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_id = "abcdef123456"
+        (raw_dir / f"{raw_id}.txt").write_text(
+            "build start\nerror[E0425]: cannot find value `missing_token`\nbuild end\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(context_sandbox.get_latest_archive_id(self.env), raw_id)
+        q_res = context_sandbox.query_output(raw_id, "missing_token", env=self.env)
+        self.assertIsNotNone(q_res)
+        self.assertIn("missing_token", q_res or "")
+        e_res = context_sandbox.expand_output(raw_id, start_line=2, end_line=2, env=self.env)
+        self.assertIn("L2: error[E0425]", e_res or "")
+
 
 if __name__ == "__main__":
     unittest.main()

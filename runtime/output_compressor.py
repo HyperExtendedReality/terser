@@ -781,6 +781,26 @@ def _vendor_compress(text: str, command: str, returncode: int = 0, stderr: str =
     return text
 
 
+_FILE_LIST_CMD_RE = re.compile(
+    r"(?i)^\s*(?:git\s+(?:ls-files|diff\s+.*--name-only)|rg\s+.*--files|fd\b|find\b)"
+)
+
+
+def _maybe_compact_file_listing(text: str, command: str) -> str:
+    """Losslessly group directory prefixes for path-per-line shell commands (git ls-files, rg --files, find)."""
+    if not text or not command or not _FILE_LIST_CMD_RE.match(command):
+        return text
+    if re.search(r"(?i)\s-(?:ls|exec|printf)\b", command):
+        return text
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return text
+    # Guard against error/status lines mixed in: require lines to look like plain paths
+    if any(ln.startswith((" ", "\t", "fatal:", "error:", "warning:")) or ": " in ln for ln in lines[:20]):
+        return text
+    return compact_file_list(lines)
+
+
 def compress_output(
     text: str,
     *,
@@ -789,11 +809,16 @@ def compress_output(
     stderr: str = "",
     max_chars: int = _DEFAULT_MAX_CHARS,
     enhanced: bool = True,
+    lossless_only: bool = False,
     host: str = "unknown",
     workspace: str | None = None,
     env: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Run the 5-stage quality-preserving output compression pipeline.
+
+    When `lossless_only=True`, only 100% lossless transforms (ANSI/progress stripping,
+    Markdown/HTML boilerplate & table-to-TSV compaction, lossless columnar/minified JSON,
+    and workspace path elision) are applied—never sampling, elision, or truncation.
 
     Returns ``(compressed_text, stats_dict)``.
     """
@@ -806,37 +831,47 @@ def compress_output(
     # Stage 2: lockfile diff elision + framework stack folding + compiler note dedup + base64 + web/table compaction + filters
     archive_id: str | None = None
     if enhanced:
-        cur = elide_lockfile_diffs(cur)
-        cur = compact_diff_headers(cur)
-        cur = fold_framework_stack_frames(cur)
-        cur = dedup_identical_tracebacks(cur)
-        cur = dedup_compiler_notes(cur)
-        cur, b64_aid = fold_base64_blobs(cur, command=command, env=env)
-        if b64_aid:
-            archive_id = b64_aid
+        if not lossless_only:
+            cur = elide_lockfile_diffs(cur)
+            cur = compact_diff_headers(cur)
+            cur = fold_framework_stack_frames(cur)
+            cur = dedup_identical_tracebacks(cur)
+            cur = dedup_compiler_notes(cur)
+            cur, b64_aid = fold_base64_blobs(cur, command=command, env=env)
+            if b64_aid:
+                archive_id = b64_aid
         cur = compact_web_and_markdown(cur)
         cur = compact_aligned_tables(cur)
-    if command:
+    if command and not lossless_only:
         cur = apply_stream_filters(cur, command) if enhanced else cur
         cur = _vendor_compress(cur, command, returncode=returncode, stderr=stderr)
 
-    # Stage 3: SmartCrusher statistical/columnar JSON pruning (reversible via sandbox.db)
+    # Stage 3: SmartCrusher columnar/statistical JSON pruning (or strictly lossless columnar/minify when lossless_only=True)
     if enhanced:
         crushed: str | None = None
         try:
             from runtime import smart_crusher
 
-            crushed = smart_crusher.crush_json(cur, command=command, env=env)
+            crushed = smart_crusher.crush_json(
+                cur,
+                command=command,
+                allow_sample=not lossless_only,
+                env=env,
+            )
+            if crushed is None and not lossless_only:
+                crushed = smart_crusher.crush_mixed_ndjson(cur, command=command, env=env)
         except Exception:
             crushed = fold_uniform_json(cur)
         if crushed is not None:
             cur = crushed
         else:
             cur = elide_workspace_paths(cur, workspace=workspace)
+            cur = _maybe_compact_file_listing(cur, command)
             cur = group_grep_output(cur)
-            cur = collapse_duplicate_lines(cur)
+            if not lossless_only:
+                cur = collapse_duplicate_lines(cur)
 
-    if len(cur) > max_chars:
+    if not lossless_only and len(cur) > max_chars:
         if archive_id is None:
             archive_id = _archive_full_output(text, command=command, env=env)
         cur = _error_pinned_window(cur, max_chars=max_chars, archive_id=archive_id)

@@ -6,7 +6,7 @@
           {
             "type": "command",
             "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SessionStart",
-            "commandWindows": "python -X --% -u -X utf8 -c e=__import__('os').environ;r=e.get('PLUGIN_ROOT')or(e['CLAUDE_PLUGIN_ROOT']);s=__import__('sys');s.argv[:]=[r+'/runtime/unified_hook.py','--host','codex','--event','SessionStart'];__import__('runpy').run_path(s.argv[0],run_name='__main__')",
+            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event SessionStart } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event SessionStart } }",
             "timeout": 15
           }
         ]
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SubagentStart",
-            "commandWindows": "python -X --% -u -X utf8 -c e=__import__('os').environ;r=e.get('PLUGIN_ROOT')or(e['CLAUDE_PLUGIN_ROOT']);s=__import__('sys');s.argv[:]=[r+'/runtime/unified_hook.py','--host','codex','--event','SubagentStart'];__import__('runpy').run_path(s.argv[0],run_name='__main__')",
+            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event SubagentStart } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event SubagentStart } }",
             "timeout": 10
           }
         ]
@@ -30,7 +30,7 @@
           {
             "type": "command",
             "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SubagentStop",
-            "commandWindows": "python -X --% -u -X utf8 -c e=__import__('os').environ;r=e.get('PLUGIN_ROOT')or(e['CLAUDE_PLUGIN_ROOT']);s=__import__('sys');s.argv[:]=[r+'/runtime/unified_hook.py','--host','codex','--event','SubagentStop'];__import__('runpy').run_path(s.argv[0],run_name='__main__')",
+            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event SubagentStop } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event SubagentStop } }",
             "timeout": 5
           }
         ]
@@ -42,7 +42,7 @@
           {
             "type": "command",
             "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event UserPromptSubmit",
-            "commandWindows": "python -X --% -u -X utf8 -c e=__import__('os').environ;r=e.get('PLUGIN_ROOT')or(e['CLAUDE_PLUGIN_ROOT']);s=__import__('sys');s.argv[:]=[r+'/runtime/unified_hook.py','--host','codex','--event','UserPromptSubmit'];__import__('runpy').run_path(s.argv[0],run_name='__main__')",
+            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event UserPromptSubmit } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event UserPromptSubmit } }",
             "timeout": 10
           }
         ]
@@ -54,7 +54,7 @@
           {
             "type": "command",
             "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event PreToolUse",
-            "commandWindows": "python -X --% -u -X utf8 -c e=__import__('os').environ;r=e.get('PLUGIN_ROOT')or(e['CLAUDE_PLUGIN_ROOT']);s=__import__('sys');s.argv[:]=[r+'/runtime/unified_hook.py','--host','codex','--event','PreToolUse'];__import__('runpy').run_path(s.argv[0],run_name='__main__')",
+            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event PreToolUse } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event PreToolUse } }",
             "timeout": 10
           }
         ]
@@ -66,7 +66,7 @@
           {
             "type": "command",
             "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event PostToolUse",
-            "commandWindows": "python -X --% -u -X utf8 -c e=__import__('os').environ;r=e.get('PLUGIN_ROOT')or(e['CLAUDE_PLUGIN_ROOT']);s=__import__('sys');s.argv[:]=[r+'/runtime/unified_hook.py','--host','codex','--event','PostToolUse'];__import__('runpy').run_path(s.argv[0],run_name='__main__')",
+            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event PostToolUse } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event PostToolUse } }",
             "timeout": 10
           }
         ]
@@ -78,7 +78,7 @@
           {
             "type": "command",
             "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event Stop",
-            "commandWindows": "python -X --% -u -X utf8 -c e=__import__('os').environ;r=e.get('PLUGIN_ROOT')or(e['CLAUDE_PLUGIN_ROOT']);s=__import__('sys');s.argv[:]=[r+'/runtime/unified_hook.py','--host','codex','--event','Stop'];__import__('runpy').run_path(s.argv[0],run_name='__main__')",
+            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event Stop } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event Stop } }",
             "timeout": 10
           }
         ]
@@ -90,7 +90,7 @@
           {
             "type": "command",
             "command": "\"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/terse-hook\" --host codex --event SessionEnd",
-            "commandWindows": "python -X --% -u -X utf8 -c e=__import__('os').environ;r=e.get('PLUGIN_ROOT')or(e['CLAUDE_PLUGIN_ROOT']);s=__import__('sys');s.argv[:]=[r+'/runtime/unified_hook.py','--host','codex','--event','SessionEnd'];__import__('runpy').run_path(s.argv[0],run_name='__main__')",
+            "commandWindows": "& { $r = if ($env:PLUGIN_ROOT) { $env:PLUGIN_ROOT } else { $env:CLAUDE_PLUGIN_ROOT }; $f = Join-Path $r 'bin\\terser-fast.exe'; if (Test-Path $f) { & $f --host codex --event SessionEnd } else { python -E -s -X utf8 (Join-Path $r 'runtime\\unified_hook.py') --host codex --event SessionEnd } }",
             "timeout": 3
           }
         ]

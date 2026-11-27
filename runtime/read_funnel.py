@@ -718,6 +718,8 @@ def check_read(
             diff = _compact_unified_diff(prev["snapshot"], text_snapshot, basename, start_line, end_line)
             if diff:
                 prev["sha"] = sha
+                prev["mtime_ns"] = st.st_mtime_ns
+                prev["size"] = st.st_size
                 prev["snapshot"] = text_snapshot
                 prev["soft_denies"] = soft_denies + 1
                 prev["ts"] = now
@@ -936,12 +938,12 @@ def seed_after_edit(
 
     full_covered = _intervals_cover(prev, None, None)
     if not full_covered:
-        # Check safe line-count-preserving partial-interval edit
+        # Check safe partial-interval edit inside an already-covered span (including deterministic
+        # line-number shifting when lines are inserted or deleted inside the covered span).
         if (
             not isinstance(old_text, str)
             or not isinstance(new_text, str)
             or not old_text
-            or old_text.count("\n") != new_text.count("\n")
         ):
             return
         snap = prev.get("snapshot")
@@ -950,10 +952,40 @@ def seed_after_edit(
         pos = snap.find(old_text)
         if pos < 0:
             return
+        old_nl = old_text.count("\n")
+        new_nl = new_text.count("\n")
         edit_start = snap.count("\n", 0, pos) + 1
-        edit_end = edit_start + old_text.count("\n")
+        edit_end = edit_start + old_nl
         if not _intervals_cover(prev, edit_start, edit_end):
             return
+        delta = new_nl - old_nl
+        if delta != 0:
+            raw_ivs = (
+                prev.get("intervals")
+                if isinstance(prev.get("intervals"), list) and prev.get("intervals")
+                else [[prev.get("start") or 1, prev.get("end")]]
+            )
+            shifted: list[list[int | None]] = []
+            for iv in raw_ivs:
+                if not isinstance(iv, list) or len(iv) != 2:
+                    continue
+                s = int(iv[0]) if iv[0] is not None else 1
+                e = int(iv[1]) if iv[1] is not None else None
+                if e is None:
+                    new_s = max(1, s + delta) if s > edit_end else s
+                    shifted.append([new_s, None])
+                elif e < edit_start:
+                    shifted.append([s, e])
+                elif s > edit_end:
+                    shifted.append([max(1, s + delta), max(1, e + delta)])
+                else:
+                    shifted.append([s, max(s, e + delta)])
+            if not shifted:
+                return
+            prev["intervals"] = shifted
+            if len(shifted) == 1:
+                prev["start"] = None if (shifted[0][0] == 1 and shifted[0][1] is None) else shifted[0][0]
+                prev["end"] = shifted[0][1]
 
     target = Path(file_path)
     try:

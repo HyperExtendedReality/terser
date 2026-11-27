@@ -163,10 +163,11 @@ def _crush_item_list(
     is_ndjson: bool,
     raw_for_archive: str,
     command: str,
+    allow_sample: bool = True,
     env: dict[str, str] | None,
 ) -> dict[str, Any] | None:
     total = len(items)
-    if total <= _SAMPLE_THRESHOLD:
+    if total <= _SAMPLE_THRESHOLD or not allow_sample:
         crushed = _factor_and_columnize(items)
         if crushed is None:
             return None
@@ -243,11 +244,13 @@ def crush_json(
     text: str,
     *,
     command: str = "",
+    allow_sample: bool = True,
     env: dict[str, str] | None = None,
 ) -> str | None:
     """Apply SmartCrusher columnar/statistical compression to large JSON, nested GraphQL, or NDJSON payloads.
 
-    Returns compressed JSON string if savings >= 20%, else None.
+    When `allow_sample=False`, only 100% lossless transforms (columnar factoring and JSON minification)
+    are applied—never statistical sampling. Returns compressed JSON string if savings >= 20%, else None.
     """
     stripped = (text or "").strip()
     if len(stripped) < _MIN_CHARS or stripped[:1] not in ("[", "{"):
@@ -286,6 +289,7 @@ def crush_json(
             is_ndjson=is_ndjson,
             raw_for_archive=stripped,
             command=command,
+            allow_sample=allow_sample,
             env=env,
         )
         if crushed is None:

@@ -5,6 +5,18 @@ set "HOOK_PY=%PLUGIN_ROOT%\runtime\unified_hook.py"
 set "FAST_BIN=%PLUGIN_ROOT%\bin\terser-fast.exe"
 set "PYTHONUTF8=1"
 set "PYTHONIOENCODING=utf-8"
+
+if exist "%FAST_BIN%" (
+  if defined TERSER_PYTHON (
+    if exist "%TERSER_PYTHON%" (
+      "%FAST_BIN%" --python "%TERSER_PYTHON%" --script "%HOOK_PY%" %*
+      exit /b 0
+    )
+  )
+  "%FAST_BIN%" --script "%HOOK_PY%" %*
+  exit /b 0
+)
+
 set "PY_BIN="
 
 if defined TERSER_PYTHON (
@@ -17,16 +29,6 @@ if not defined PY_BIN (
       echo %%F | findstr /I /C:"WindowsApps" >nul
       if errorlevel 1 if not defined PY_BIN set "PY_BIN=%%F"
     )
-  )
-)
-
-if exist "%FAST_BIN%" (
-  if defined PY_BIN (
-    "%FAST_BIN%" --python "%PY_BIN%" --script "%HOOK_PY%" %*
-    exit /b 0
-  ) else (
-    "%FAST_BIN%" %*
-    exit /b 0
   )
 )
 

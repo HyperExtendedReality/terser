@@ -257,16 +257,72 @@ def _prune_old(conn: sqlite3.Connection, now: float, max_bytes: int = _MAX_TOTAL
     conn.execute("DELETE FROM session_events WHERE created_at < ?", (cutoff,))
 
 
-def get_latest_archive_id(env: dict[str, str] | None = None) -> str | None:
-    """Return the most recently indexed archive ID in sandbox.db, if any."""
+def _raw_archives_dir(env: dict[str, str] | None = None) -> Path:
+    return state_home(env) / "raw-archives"
+
+
+def _ingest_raw_archive(conn: sqlite3.Connection, archive_id: str, env: dict[str, str] | None = None) -> bool:
+    """Lazy-index a Rust `terser-fast exec` raw sidecar (`~/.terser/raw-archives/<id>.txt`) into sandbox.db."""
+    if not _ID_RE.match(archive_id):
+        return False
+    p = _raw_archives_dir(env) / f"{archive_id}.txt"
+    if not p.is_file():
+        return False
     try:
-        if not _db_path(env).is_file():
-            return None
-        with closing(_connect(env)) as conn:
-            row = conn.execute("SELECT id FROM blobs ORDER BY created_at DESC LIMIT 1").fetchone()
-            return str(row[0]) if row else None
+        raw_text = p.read_text(encoding="utf-8", errors="replace")
+        mtime = p.stat().st_mtime
+    except OSError:
+        return False
+    if not raw_text:
+        return False
+    safe_text = redact_text(raw_text, is_command=False)
+    lines = safe_text.splitlines()
+    chunks = _chunk_lines(lines)
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO blobs (id, command, created_at, total_lines, total_bytes, content) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (archive_id, "terser-fast exec", mtime, len(lines), len(safe_text.encode("utf-8", errors="replace")), safe_text),
+        )
+        use_fts = _has_fts5(conn)
+        table = "chunks_fts" if use_fts else "chunks_plain"
+        if chunks:
+            conn.executemany(
+                f"INSERT INTO {table} (blob_id, start_line, end_line, body) VALUES (?, ?, ?, ?)",
+                [(archive_id, s, e, b) for s, e, b in chunks],
+            )
+    return True
+
+
+def get_latest_archive_id(env: dict[str, str] | None = None) -> str | None:
+    """Return the most recently indexed archive ID across sandbox.db and Rust raw-archives."""
+    best_id: str | None = None
+    best_ts: float = -1.0
+    try:
+        if _db_path(env).is_file():
+            with closing(_connect(env)) as conn:
+                row = conn.execute("SELECT id, created_at FROM blobs ORDER BY created_at DESC LIMIT 1").fetchone()
+                if row:
+                    best_id = str(row[0])
+                    best_ts = float(row[1] or 0.0)
     except Exception:
-        return None
+        pass
+    try:
+        rdir = _raw_archives_dir(env)
+        if rdir.is_dir():
+            for p in rdir.glob("*.txt"):
+                if not _ID_RE.match(p.stem):
+                    continue
+                try:
+                    mt = p.stat().st_mtime
+                except OSError:
+                    continue
+                if mt > best_ts:
+                    best_ts = mt
+                    best_id = p.stem
+    except OSError:
+        pass
+    return best_id
 
 
 def _resolve_id(archive_id: str, env: dict[str, str] | None = None) -> str | None:
@@ -369,6 +425,11 @@ def query_output(
                 "SELECT command, total_lines, total_bytes FROM blobs WHERE id = ?",
                 (archive_id,),
             ).fetchone()
+            if meta is None and _ingest_raw_archive(conn, archive_id, env):
+                meta = conn.execute(
+                    "SELECT command, total_lines, total_bytes FROM blobs WHERE id = ?",
+                    (archive_id,),
+                ).fetchone()
             if meta is None:
                 return None
             cmd, total_lines, total_bytes = meta
@@ -425,6 +486,8 @@ def expand_output(
     try:
         with closing(_connect(env)) as conn:
             row = conn.execute("SELECT content FROM blobs WHERE id = ?", (archive_id,)).fetchone()
+            if row is None and _ingest_raw_archive(conn, archive_id, env):
+                row = conn.execute("SELECT content FROM blobs WHERE id = ?", (archive_id,)).fetchone()
             if row is None:
                 return None
             content = str(row[0])

@@ -344,9 +344,30 @@ def _meta_path(slug: str, env: dict[str, str] | None = None) -> Path:
 
 
 def _resolve_repo_slug(repo: str, *, env: dict[str, str] | None = None) -> tuple[str, dict[str, Any]] | None:
-    """Resolve `repo` name/prefix to `(slug, meta_dict)` using tiny `.meta.json` or SQLite (O(1))."""
+    """Resolve `repo` name/prefix to `(slug, meta_dict)` using tiny `.meta.json` (O(1)).
+
+    When `repo` is empty, auto-resolves from `cwd` (matching `source_root`) or the sole indexed repo.
+    """
     idir = index_dir(env)
-    if not idir.is_dir() or not repo:
+    if not idir.is_dir():
+        return None
+    if not repo:
+        norm_cwd = normalize_workspace(os.getcwd())
+        all_metas: list[tuple[str, dict[str, Any]]] = []
+        for mp in sorted(idir.glob("*.meta.json")):
+            try:
+                m = json.loads(mp.read_text(encoding="utf-8"))
+                if not isinstance(m, dict) or not m.get("source_root"):
+                    continue
+                slug = str(m.get("repo") or mp.name[:-10])
+                sr = normalize_workspace(str(m.get("source_root") or ""))
+                if norm_cwd and sr and (norm_cwd == sr or norm_cwd.startswith(sr + "/") or sr.startswith(norm_cwd + "/")):
+                    return slug, m
+                all_metas.append((slug, m))
+            except Exception:
+                continue
+        if len(all_metas) == 1:
+            return all_metas[0]
         return None
     low = repo.lower()
     # 1. Exact or prefix match against tiny .meta.json files
@@ -717,6 +738,23 @@ def _load_repo(repo: str, *, env: dict[str, str] | None = None) -> dict[str, Any
             except sqlite3.Error:
                 pass
     # Legacy .json fallback
+    if not repo:
+        norm_cwd = normalize_workspace(os.getcwd())
+        legacy_docs: list[dict[str, Any]] = []
+        for p in sorted(idir.glob("*.json")):
+            if p.name.endswith(".meta.json"):
+                continue
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+                if not isinstance(d, dict):
+                    continue
+                sr = normalize_workspace(str(d.get("source_root") or ""))
+                if norm_cwd and sr and (norm_cwd == sr or norm_cwd.startswith(sr + "/") or sr.startswith(norm_cwd + "/")):
+                    return d
+                legacy_docs.append(d)
+            except Exception:
+                continue
+        return legacy_docs[0] if len(legacy_docs) == 1 else None
     direct = idir / f"{repo}.json"
     if direct.is_file():
         try:
@@ -998,7 +1036,9 @@ def dispatch_action(action: str, args: dict[str, Any], *, env: dict[str, str] | 
                     continue
         return {"repos": repos}
 
-    repo_name = str(args.get("repo") or "")
+    repo_name = str(args.get("repo") or "").strip()
+    if action == "invalidate_cache" and not repo_name:
+        return {"error": "Provide explicit `repo` name to invalidate."}
     # Fast SQLite-first paths (avoid loading entire repo into memory for targeted queries)
     resolved = _resolve_repo_slug(repo_name, env=env)
     if resolved is not None:
@@ -1281,7 +1321,7 @@ _MCP_TOOLS = [
     },
     {
         "name": "search_symbols",
-        "description": "Search indexed symbols by name.",
+        "description": "Search indexed symbols by name (repo optional if cwd or sole repo is indexed).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1289,16 +1329,16 @@ _MCP_TOOLS = [
                 "query": {"type": "string"},
                 "limit": {"type": "integer"},
             },
-            "required": ["repo", "query"],
+            "required": ["query"],
         },
     },
     {
         "name": "get_symbol_source",
-        "description": "Fetch exact source lines for a symbol ID.",
+        "description": "Fetch exact source lines for a symbol ID (repo optional if cwd or sole repo is indexed).",
         "inputSchema": {
             "type": "object",
             "properties": {"repo": {"type": "string"}, "symbol_id": {"type": "string"}},
-            "required": ["repo", "symbol_id"],
+            "required": ["symbol_id"],
         },
     },
 ]
@@ -1372,6 +1412,46 @@ def format_mcp_response(action: str, payload: dict[str, Any]) -> str:
                 blocks.append(f"--- {s.get('id')} ({s.get('file')} L{s.get('start_line')}-{s.get('end_line')}) ---\n{s['source']}")
         if blocks:
             return "\n".join(blocks)
+
+    if action == "search_sandbox" and isinstance(payload.get("result"), str):
+        return payload["result"]
+
+    if action == "expand_sandbox" and isinstance(payload.get("content"), str):
+        return f"[Terser Sandbox `{payload.get('archive_id', '')}`]\n{payload['content']}"
+
+    if action == "get_repo_outline" and isinstance(payload.get("outline"), list):
+        outline = payload["outline"]
+        header = f"repo={payload.get('repo','')} ({payload.get('files', 0)} files, {payload.get('symbols', 0)} symbols):"
+        return header + ("\n" + "\n".join(str(x) for x in outline) if outline else " (empty)")
+
+    if action == "list_repos" and isinstance(payload.get("repos"), list):
+        repos = payload["repos"]
+        if not repos:
+            return "No indexed repositories."
+        lines = [f"Indexed repositories ({len(repos)}):"]
+        for r in repos:
+            if isinstance(r, dict):
+                lines.append(f"  {r.get('repo','')} ({r.get('files',0)} files, {r.get('symbols',0)} symbols) -> {r.get('source_root','')}")
+        return "\n".join(lines)
+
+    if action == "menu" and isinstance(payload.get("actions"), dict):
+        actions = payload["actions"]
+        lines = [f"Terser index actions ({len(actions)}):"]
+        for k, v in actions.items():
+            if isinstance(v, dict):
+                lines.append(f"  {k} {v.get('args', '{}')} — {v.get('desc', '')}")
+        return "\n".join(lines)
+
+    if action == "execute_filtered" and isinstance(payload.get("output"), str):
+        parts = [
+            f"exit={payload.get('returncode', 0)} filtered={payload.get('filtered', False)} raw_bytes={payload.get('raw_bytes', 0)}"
+            + (f" archive_id={payload['archive_id']}" if payload.get("archive_id") else "")
+        ]
+        if payload["output"]:
+            parts.append(payload["output"])
+        if payload.get("stderr"):
+            parts.append(f"--- stderr ---\n{payload['stderr']}")
+        return "\n".join(parts)
 
     return json.dumps(payload, separators=(",", ":"))
 
